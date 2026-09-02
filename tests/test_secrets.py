@@ -412,3 +412,55 @@ def test_no_command_output_anywhere_contains_the_value(
     assert VALUE not in captured.out
     assert VALUE not in captured.err
     assert VALUE not in caplog.text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_an_unreadable_store_is_reported_not_fatal(tmp_path: Path, caplog) -> None:
+    """An advisory diagnostic must never be able to abort startup or a reload.
+
+    The same shape as the bug where an env hook raised outside
+    Supervisor.start's guard: one broken service took down every service after
+    it. Here a store directory nobody can read is logged and skipped.
+    """
+    state = StateDir(tmp_path)
+    store = store_for(state)
+    store.set("broken", "A", b"v")
+    store.set("fine", "B", b"v")
+    store.remove("fine", "B")  # 'fine' is genuinely missing its secret
+    store.service_dir("broken").chmod(0o000)
+    declarations = {
+        "broken": _decl("broken", secrets=["A"]),
+        "fine": _decl("fine", secrets=["B"]),
+    }
+    try:
+        with caplog.at_level(logging.DEBUG):
+            warned = warn_missing_secrets(state, declarations)
+    finally:
+        store.service_dir("broken").chmod(0o700)
+    # The unreadable one is reported and skipped ...
+    assert "cannot inspect the secret store for broken" in caplog.text
+    # ... and it does not suppress the warning for the service behind it.
+    assert warned == ["fine"]
+    assert "fine declares secrets with no stored value: B" in caplog.text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_build_supervisor_survives_an_unreadable_store(tmp_path: Path, caplog) -> None:
+    """`ams run` must still come up; the affected service fails at its own start."""
+    from ams.cli import build_supervisor
+
+    toml = 'id = "svc"\nsecrets = ["K"]\n[start]\nargv = ["/bin/echo", "hi"]\n'
+    state = _state_with(tmp_path, "svc", toml)
+    store = store_for(state)
+    store.set("svc", "K", b"v")
+    store.service_dir("svc").chmod(0o000)
+    try:
+        with caplog.at_level(logging.ERROR):
+            asm = build_supervisor(state, isolation=False)
+        assert asm.registered == ["svc"]
+        assert "cannot inspect the secret store for svc" in caplog.text
+        # The start is where it fails, and only for this service.
+        with pytest.raises((MissingSecret, PermissionError)):
+            asm.supervisor._extra_env_for(asm.declarations["svc"])
+    finally:
+        store.service_dir("svc").chmod(0o700)

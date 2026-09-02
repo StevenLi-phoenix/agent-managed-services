@@ -337,7 +337,25 @@ def build_supervisor(
     if not declarations:
         log.warning("no service declarations under %s", state.services_dir)
     # A heads-up, not a refusal: the other services must still come up.
-    warn_missing_secrets(state, declarations)
+    # Belt and braces. warn_missing_secrets already swallows a per-service
+    # OSError internally (an unreadable store directory is logged and skipped),
+    # so this outer guard exists for everything that is NOT that: a bug in the
+    # diagnostic itself, a corrupt state layout, anything unforeseen. A boot
+    # that dies because an *advisory* warning failed is strictly worse than a
+    # boot with no warning -- the services that can start would never start,
+    # and the one that cannot would have failed at its own start anyway with a
+    # message naming the secret. This is the same shape as the bug where an env
+    # hook raised outside Supervisor.start's guard and took down every service
+    # ordered after it.
+    try:
+        warn_missing_secrets(state, declarations)
+    except Exception as e:
+        log.warning(
+            "could not check declared secrets against the store (%s: %s); "
+            "continuing. A service whose secret is unset fails at its own start.",
+            type(e).__name__,
+            e,
+        )
 
     asm = Assembly(
         state=state,
