@@ -408,3 +408,70 @@ def test_a_service_can_reach_its_own_root_by_absolute_path(
     back = run("abspath2", ["cat", str(base / "abspath" / "written.txt")])
     assert back.exit_code == 0, back.stderr
     assert back.stdout.strip() != ""
+
+
+def test_a_stored_secret_is_injected_but_its_file_stays_unreadable(
+    spawner: IsolatedSpawner, base: Path
+) -> None:
+    """The whole security argument for the secret store (D16), in one spawn.
+
+    The service is handed the value in its environment and is simultaneously
+    denied the file it came from: the harness uid is not in the runtime uid map
+    (D4), so a 0600 harness-owned file is unreachable from inside even when the
+    path itself is traversable.
+
+    The store lives under /tmp and its *directories* are deliberately widened to
+    0711 here. In production they are 0700, which would already stop the service
+    at the directory; widening them isolates the property actually under test —
+    the file mode plus the missing uid mapping — instead of letting a directory
+    permission pass the test for the wrong reason.
+    """
+    from ams.secrets import SecretStore
+
+    value = b"pilot-value-8e21"
+    store_root = Path(f"/tmp/ams-secret-store-{os.getpid()}")
+    store = SecretStore(store_root)
+    secret_path = store.set("keeper", "K", value)
+    for d in (store_root, store.dir, store.service_dir("keeper")):
+        d.chmod(0o711)
+
+    assert stat.S_IMODE(os.stat(secret_path).st_mode) == 0o600
+    assert os.stat(secret_path).st_uid == os.getuid()  # harness-owned, not the block
+
+    decl = schema.from_dict(
+        {
+            "id": "keeper",
+            "secrets": ["K"],
+            "start": {
+                "argv": [
+                    "/usr/bin/python3",
+                    "-c",
+                    "import os, sys; print('K=' + os.environ.get('K', '<unset>'), flush=True); "
+                    "open(sys.argv[1]).read()",
+                    str(secret_path),
+                ]
+            },
+        }
+    )
+    req = SpawnRequest(
+        decl=decl,
+        root=base / "keeper",
+        ports={},
+        extra_env=store.load("keeper", decl.secrets),
+    )
+    svc = spawner.spawn(req)
+    try:
+        out, err = _drain(svc, READ_TIMEOUT_S)
+        _, status = os.waitpid(svc.pid, 0)
+    finally:
+        spawner.kill_tree(svc)
+        spawner.cleanup(svc)
+        secret_path.unlink(missing_ok=True)
+        store.service_dir("keeper").rmdir()
+        store.dir.rmdir()
+        store_root.rmdir()
+
+    assert out.strip() == "K=" + value.decode()  # injected
+    assert os.waitstatus_to_exitcode(status) != 0  # ... and the file was not
+    assert "PermissionError" in err and "Errno 13" in err, err
+    assert value.decode() not in err

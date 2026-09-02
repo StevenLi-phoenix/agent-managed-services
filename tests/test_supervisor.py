@@ -693,3 +693,94 @@ def test_always_policy_forgives_a_long_lived_run(tmp_path):
     assert st.consecutive_failures == 1
     assert st.status != "failed"
     sup.shutdown(1.0)
+
+
+# ------------------------------------------------ control-channel extension points
+
+
+def test_register_fd_dispatches_readiness_to_a_callback(tmp_path):
+    """The hook ams.control uses instead of reaching into the private selector."""
+    sup = Supervisor(RecordingSpawner())
+    r, w = os.pipe()
+    os.set_blocking(r, False)
+    seen: list[bytes] = []
+    sup.register_fd(r, lambda fd: seen.append(os.read(fd, 64)), name="probe")
+    try:
+        sup.run_once(0.01)
+        assert seen == [], "nothing written yet"
+        os.write(w, b"hello")
+        pump(sup, until=lambda _ev: bool(seen), seconds=2.0)
+        assert seen == [b"hello"]
+        sup.unregister_fd(r)
+        os.write(w, b"ignored")
+        sup.run_once(0.05)
+        assert seen == [b"hello"], "unregister_fd must stop the dispatch"
+    finally:
+        os.close(r)
+        os.close(w)
+        sup.shutdown(0.2)
+
+
+def test_a_raising_fd_callback_never_stops_the_loop(tmp_path, caplog):
+    sup = Supervisor(RecordingSpawner())
+    r, w = os.pipe()
+    os.set_blocking(r, False)
+    calls = []
+
+    def boom(fd: int) -> None:
+        calls.append(os.read(fd, 64))
+        raise RuntimeError("control bug")
+
+    sup.register_fd(r, boom, name="exploding")
+    try:
+        os.write(w, b"x")
+        with caplog.at_level(logging.ERROR, logger="ams.supervisor"):
+            pump(sup, until=lambda _ev: bool(calls), seconds=2.0)
+            sup.run_once(0.01)  # the loop is still alive
+        assert calls
+        assert "exploding" in caplog.text
+    finally:
+        os.close(r)
+        os.close(w)
+        sup.shutdown(0.2)
+
+
+def test_replace_decl_swaps_the_declaration_and_the_health_monitor(tmp_path):
+    first = decl("import time; time.sleep(30)", extra="[ports]\nmain = 20991\n")
+    sup = Supervisor(RecordingSpawner(), reset_window_min_s=0.3, eof_grace_s=0.3)
+    st = sup.add(first, tmp_path / "svc", {"main": 20991})
+    st.consecutive_failures = 3
+    second = loads(
+        'id = "svc"\n[start]\nargv = ["/bin/true"]\n[ports]\nmain = 20992\n'
+        '[health]\nkind = "tcp"\nport = "main"\n'
+    )
+    sup.replace_decl("svc", second, {"main": 20992})
+    assert st.decl is second
+    assert st.ports == {"main": 20992}
+    assert st.monitor is not None and st.monitor.spec.kind == "tcp"
+    assert st.monitor.port == 20992, "a stale monitor would probe the old port"
+    assert st.consecutive_failures == 0, "a new declaration is a fresh start"
+
+
+def test_replace_decl_rejects_a_mismatched_id(tmp_path):
+    sup, _st = make(tmp_path, decl("import time; time.sleep(30)"))
+    with pytest.raises(ValueError, match="does not match"):
+        sup.replace_decl("svc", decl("print(1)", sid="other"), {})
+
+
+def test_restart_in_the_reaped_but_undrained_window_actually_restarts(tmp_path):
+    """The process is gone but its pipes are still open; stop() correctly
+    declines to signal a dead pid, so restart() must route to start() instead
+    of leaving the service down with desired="up" and no timer."""
+    d = decl(GRANDCHILD_HOLDS_PIPE + "import sys; sys.exit(0)", extra="[stop]\ntimeout_s = 1.0\n")
+    sup, st = make(tmp_path, d, eof_grace_s=5.0)
+    sup.start("svc")
+    first = st.pid
+    pump(sup, until=lambda _ev: st.reaped and st.spawned is not None, seconds=8.0)
+    assert st.reaped and st.spawned is not None, "expected the undrained window"
+
+    sup.restart("svc")
+    pump(sup, until=lambda _ev: st.spawned is not None and st.pid != first, seconds=8.0)
+    assert st.pid not in (None, first)
+    assert st.desired == "up"
+    sup.shutdown(2.0)

@@ -18,6 +18,11 @@ Environment=PYTHONPATH=/home/harness/ams/src
 Environment=PATH=/home/harness/venv/bin:/home/harness/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Interpreter path must match deploy/apparmor/ams-harness attachment glob.
 ExecStart=/home/harness/venv/bin/python3 -m ams run
+# `systemctl reload ams-harness` rescans services/*/service.toml and adds,
+# removes or restarts only what changed (ams.reload). This exists so a
+# declaration change no longer needs a unit restart, which KillMode=control-group
+# turns into an outage for every service. Equivalent: `ams ctl reload`.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
 # Harness creates one child cgroup per service and writes memory.max / cpu.max / pids.max itself.

@@ -81,6 +81,28 @@ MAX_BACKOFF_SHIFT = 30
 
 _SELF_PIPE = "self-pipe"
 
+# SIGHUP means "re-read the declarations" (D17). It does not exist on Windows,
+# which the harness does not target, but the getattr keeps this module importable
+# there for anyone reading the code on one.
+_SIGHUP: signal.Signals | None = getattr(signal, "SIGHUP", None)
+_WATCHED_SIGNALS: tuple[signal.Signals, ...] = tuple(
+    s for s in (signal.SIGTERM, signal.SIGINT, signal.SIGCHLD, _SIGHUP) if s is not None
+)
+
+
+@dataclass(frozen=True)
+class _FdCallback:
+    """Selector payload for an fd owned by something other than the supervisor.
+
+    Wrapped in a dataclass rather than stored bare so :meth:`Supervisor.run_once`
+    can tell it apart from the ``(service_id, stream)`` tuples that pipe reads
+    use, without control-channel code ever touching ``self._sel``.
+    """
+
+    fn: Callable[[int], None]
+    name: str = ""
+
+
 # Orphans belong to no declaration, but the policy contract wants a context.
 _ORPHAN_DECL = ServiceDecl(id="orphan", start=StartSpec(argv=("<orphan>",)))
 _ORPHAN_CTX = ServiceContext(_ORPHAN_DECL)
@@ -159,6 +181,7 @@ class Supervisor:
         self._pending: list[Event] = []
         self._wakeup_r: int | None = None
         self._stop_requested = False
+        self._reload_requested = False
 
     # ----------------------------------------------------------------- table
 
@@ -177,6 +200,45 @@ class Supervisor:
             raise RuntimeError(f"service {service_id!r} is not stopped")
         del self.services[service_id]
         log.info("removed service %s", service_id)
+
+    def replace_decl(
+        self,
+        service_id: str,
+        decl: ServiceDecl,
+        ports: Mapping[str, int],
+        *,
+        reset_failures: bool = True,
+    ) -> ServiceState:
+        """Swap a registered service's declaration and ports in place (hot reload).
+
+        The *running* process keeps the old declaration -- argv, env, limits and
+        the uid map are all fixed at spawn time -- so the caller must restart the
+        service for the new declaration to take effect. Only the health monitor
+        is rebuilt here, because it is pure supervisor-side state and a stale one
+        would probe the previous port.
+
+        ``reset_failures`` clears the crash streak by default: a changed
+        declaration is the operator's fix, and carrying the old streak forward
+        would let a service that already burned ``max_retries`` give up again
+        after one attempt on brand-new code.
+        """
+        st = self._get(service_id)
+        if decl.id != service_id:
+            raise ValueError(f"declaration id {decl.id!r} does not match {service_id!r}")
+        st.decl = decl
+        st.ports = dict(ports)
+        st.monitor = HealthMonitor(decl.health, st.ports, clock=self._clock)
+        if st.spawned is None:
+            st.monitor.stop()
+        else:
+            # Keep probing the *running* process: it still serves the old ports,
+            # and _poll_timeout folds in monitor.next_due for a live service.
+            st.monitor.start(self._clock())
+        if reset_failures:
+            st.consecutive_failures = 0
+            st.reset_at = None
+        log.info("replaced declaration for %s (ports=%s)", service_id, st.ports)
+        return st
 
     def _get(self, service_id: str) -> ServiceState:
         try:
@@ -269,8 +331,18 @@ class Supervisor:
             log.warning("could not signal %s pid=%d: %s", st.id, st.spawned.pid, e)
 
     def restart(self, service_id: str) -> None:
+        """Stop-then-start a live service, or start one that is already down.
+
+        ``st.reaped`` counts as down even though ``spawned`` is still set: in
+        that window the process is gone and only the pipes are still draining,
+        so ``stop()`` correctly declines to signal a dead pid -- and then nothing
+        would ever restart it, leaving the service down with ``desired="up"``
+        and no timer. ``start()`` handles the window (it force-finalizes first),
+        so route there. Reachable from `ams ctl restart` in the couple of
+        seconds after a crash.
+        """
         st = self._get(service_id)
-        if st.spawned is None:
+        if st.spawned is None or st.reaped:
             self.start(service_id)
         else:
             self.stop(service_id, for_restart=True)
@@ -332,6 +404,8 @@ class Supervisor:
         for key, _mask in ready:
             if key.data == _SELF_PIPE:
                 self._drain_wakeup(key.fd)
+            elif isinstance(key.data, _FdCallback):
+                self._run_fd_callback(key.data, key.fd)
             else:
                 sid, stream = key.data
                 self._read_stream(sid, stream, key.fd)
@@ -345,6 +419,7 @@ class Supervisor:
         stop_event: threading.Event | None = None,
         *,
         on_iteration: Callable[[list[Event]], None] | None = None,
+        on_reload: Callable[[], Any] | None = None,
         shutdown_timeout_s: float | None = None,
     ) -> None:
         """Loop until SIGTERM/SIGINT or ``stop_event``, then stop everything.
@@ -352,15 +427,23 @@ class Supervisor:
         ``on_iteration`` is called with each iteration's events; it is the hook
         the CLI uses for periodic reporting and must not raise (it is guarded
         anyway, because a broken reporter must not take down supervision).
-        ``shutdown_timeout_s`` bounds the final graceful stop, which matters
-        under systemd where ``TimeoutStopSec`` will SIGKILL us if we overrun.
+        ``on_reload`` is called once per SIGHUP, between iterations rather than
+        from the signal handler -- the handler only writes to the wakeup pipe, so
+        the reload runs on the ordinary loop stack where it may touch the service
+        table. ``shutdown_timeout_s`` bounds the final graceful stop, which
+        matters under systemd where ``TimeoutStopSec`` will SIGKILL us if we
+        overrun.
         """
         self._stop_requested = False
+        self._reload_requested = False
         with self._signal_wakeup():
             while not self._stop_requested:
                 if stop_event is not None and stop_event.is_set():
                     break
                 events = self.run_once(LOOP_TIMEOUT_S)
+                if self._reload_requested:
+                    self._reload_requested = False
+                    self._run_reload(on_reload)
                 if on_iteration is not None:
                     try:
                         on_iteration(events)
@@ -371,6 +454,17 @@ class Supervisor:
             # window would kill the harness and orphan every service.
             log.info("shutting down")
             self.shutdown(shutdown_timeout_s)
+
+    def _run_reload(self, on_reload: Callable[[], Any] | None) -> None:
+        if on_reload is None:
+            log.warning("SIGHUP received but no reload handler is configured; ignoring")
+            return
+        try:
+            summary = on_reload()
+        except Exception as e:  # a bad declaration must never stop the loop
+            log.exception("reload handler raised: %s", e)
+            return
+        log.info("reload complete: %s", summary)
 
     def shutdown(self, timeout_s: float | None = None) -> None:
         """Stop every service gracefully, escalate to kill_tree, then clean up."""
@@ -404,9 +498,42 @@ class Supervisor:
 
     # ------------------------------------------------------------- selector
 
-    def _register(self, fd: int, data: Any) -> None:
+    def register_fd(
+        self,
+        fd: int,
+        callback: Callable[[int], None],
+        *,
+        events: int = selectors.EVENT_READ,
+        name: str = "",
+    ) -> None:
+        """Watch ``fd`` in this loop and call ``callback(fd)`` when it is ready.
+
+        The extension point the control channel (``ams.control``) uses so it can
+        live in the single-threaded loop without reaching into ``self._sel``.
+        The callback is invoked from inside :meth:`run_once` and must not block:
+        anything it raises is logged and swallowed, because a broken control
+        client must never take supervision down.
+
+        Registering an fd that is already registered replaces the previous
+        interest, which is how a connection flips from reading a request to
+        flushing a response.
+        """
+        self._unregister(fd)
+        self._register(fd, _FdCallback(callback, name), events=events)
+
+    def unregister_fd(self, fd: int) -> None:
+        """Stop watching an fd registered with :meth:`register_fd`."""
+        self._unregister(fd)
+
+    def _run_fd_callback(self, cb: _FdCallback, fd: int) -> None:
         try:
-            self._sel.register(fd, selectors.EVENT_READ, data)
+            cb.fn(fd)
+        except Exception as e:  # a control-channel bug must not stop supervision
+            log.exception("fd callback %s on fd %d raised: %s", cb.name or "?", fd, e)
+
+    def _register(self, fd: int, data: Any, *, events: int = selectors.EVENT_READ) -> None:
+        try:
+            self._sel.register(fd, events, data)
             self._registered.add(fd)
         except (KeyError, ValueError, OSError) as e:
             log.warning("could not register fd %d: %s", fd, e)
@@ -801,7 +928,7 @@ class Supervisor:
             os.set_blocking(self.w, False)
             self.sup._wakeup_r = self.r
             self.sup._register(self.r, _SELF_PIPE)
-            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGCHLD):
+            for signum in _WATCHED_SIGNALS:
                 try:
                     self.old[signum] = signal.signal(signum, _noop_handler)
                 except (ValueError, OSError) as e:  # not the main thread
@@ -834,6 +961,11 @@ class Supervisor:
         return Supervisor._SignalWakeup(self)
 
     def _drain_wakeup(self, fd: int) -> None:
+        """Read the wakeup pipe and turn signal numbers into loop intentions.
+
+        ``set_wakeup_fd`` writes one byte per delivered signal, so the byte *is*
+        the signal number; SIGCHLD needs no action beyond having woken us.
+        """
         try:
             data = os.read(fd, 4096)
         except (BlockingIOError, OSError):
@@ -842,6 +974,9 @@ class Supervisor:
             if byte in (int(signal.SIGTERM), int(signal.SIGINT)):
                 log.info("received signal %d; stopping", byte)
                 self._stop_requested = True
+            elif _SIGHUP is not None and byte == int(_SIGHUP):
+                log.info("received SIGHUP; reload requested")
+                self._reload_requested = True
 
 
 def _noop_handler(signum: int, frame: Any) -> None:

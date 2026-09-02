@@ -154,6 +154,23 @@ def test_invalid_declarations(toml, needle):
     assert needle in str(ei.value)
 
 
+def test_secrets_names_only():
+    d = loads('id="s"\nsecrets=["SVC_SECRET","API_KEY"]\n[start]\nargv=["x"]\n[env]\nMODE="prod"')
+    assert d.secrets == ("SVC_SECRET", "API_KEY")
+    assert loads(MINIMAL).secrets == ()
+    for bad, needle in [
+        ('secrets=["bad name"]', "secrets"),
+        ('secrets=["PATH"]', "reserved"),
+        ('secrets=["AMS_X"]', "reserved"),
+        ('secrets=["A","A"]', "twice"),
+        ('secrets=["A"]\n[env]\nA="v"', "also set in env"),
+        ('secrets="A"', "list"),
+    ]:
+        with pytest.raises(DeclError) as ei:
+            loads('id="s"\n' + bad + '\n[start]\nargv=["x"]')
+        assert needle in str(ei.value)
+
+
 def test_uv_sync_mode():
     d = loads(
         'id="s"\n[start]\nargv=["uvicorn"]\nworkdir="repo/svc"\n[runtime]\nkind="uv"\nsync=true'

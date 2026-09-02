@@ -5,6 +5,12 @@
 id = "timeservice"
 name = "Time Service (api pilot replica)"
 
+# The shared-secret credential. Only the NAME lives in this file; the value is
+# written once with `ams secret set <id> SVC_SECRET` (stdin, never argv) into
+# the harness-private store at <state>/secrets/<id>/SVC_SECRET (0600, harness),
+# and injected into the environment at spawn. See DECISIONS D16.
+secrets = ["SVC_SECRET"]
+
 [start]
 argv = [
   "uvicorn",
@@ -25,8 +31,6 @@ main = 0
 [env]
 SVC_NAME = "timeservice"
 SVC_AUDIENCE = "timeservice"
-# Replica secret, generated for this pilot; never leaves the box (SVC_DEV=1).
-SVC_SECRET = "REDACTED-throwaway-svc-secret"
 # timeservice runs its own lifespan that calls Registry.start() directly. Without
 # SVC_DEV=1 that is a blocking POST to REGISTRY_URL whose failure aborts startup.
 SVC_DEV = "1"

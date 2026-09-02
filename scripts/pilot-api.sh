@@ -10,8 +10,10 @@
 #   1. copies the whole api monorepo to <service root>/repo
 #   2. installs examples/api-pilot/<id>/service.toml as the declaration
 #   3. creates <service root>/data (kvservice's SQLite lives outside the repo copy)
-#   4. `ams provision <id>`  -> `uv sync --frozen` in the project, venv service-owned
-#   5. restarts ams-harness.service and verifies both services over HTTP
+#   4. generates SVC_SECRET on the box and pipes it into `ams secret set` (only
+#      if unset); the value never reaches this script's stdout or any log
+#   5. `ams provision <id>`  -> `uv sync --frozen` in the project, venv service-owned
+#   6. restarts ams-harness.service and verifies both services over HTTP
 #
 # Why the whole monorepo and not just the service directory: both projects
 # declare `sdk = { path = "../../components/sdk", editable = true }`, which uv
@@ -95,6 +97,32 @@ for id in "${IDS[@]}"; do
   ssh_ "chown -R harness:harness '$SERVICES/$id' && chmod 0751 '$SERVICES/$id'"
 done
 
+# ------------------------------------------------------------------ secrets
+
+# SVC_SECRET is declared by name only (DECISIONS D16) and the value is generated
+# here, on the box, per service. It goes straight from `openssl rand` into the
+# store over a pipe: it is never an argument, never lands in a file other than
+# <state>/secrets/<id>/SVC_SECRET (0600, harness), and is never echoed -- so it
+# appears in neither this script's output nor the journal. Nobody, including
+# whoever runs this script, ever sees it; that is the point of a write-only
+# store, and rotating it is just re-running with `ams secret rm` first.
+for id in "${IDS[@]}"; do
+  echo "==> $id: SVC_SECRET in the store (value never printed)"
+  # shellcheck disable=SC2087  # the heredoc is expanded locally on purpose
+  ssh_ "bash -s" <<REMOTE
+set -euo pipefail
+AMS_ENV="PYTHONPATH=src AMS_STATE_DIR=$STATE"
+if su -l harness -c "cd /home/harness/ams && \$AMS_ENV $REMOTE_PY -m ams secret check $id" \
+     >/dev/null 2>&1; then
+  echo "    already set; keeping the existing value"
+else
+  su -l harness -c "cd /home/harness/ams && openssl rand -hex 32 | \
+\$AMS_ENV $REMOTE_PY -m ams secret set $id SVC_SECRET"
+  echo "    generated and stored"
+fi
+REMOTE
+done
+
 # ---------------------------------------------------------------- provision
 
 for id in "${IDS[@]}"; do
@@ -148,6 +176,26 @@ for id in kvservice timeservice; do
   for f in memory.max memory.swap.max pids.max memory.current; do
     printf '%s=%s\n' "$f" "$(cat "$CG/svc-$id/$f" 2>/dev/null || echo MISSING)"
   done
+
+  # Secret delivery (D16). Every probe below prints names, modes and counts --
+  # never a value; that is deliberate and must stay that way.
+  echo -n "secret store names: "
+  su -l harness -c "cd /home/harness/ams && PYTHONPATH=src AMS_STATE_DIR=$STATE \
+/home/harness/venv/bin/python3 -m ams secret list $id" | tr '\n' ' '; echo
+  stat -c 'store file: %n mode=%a owner=%U' "$STATE/secrets/$id/SVC_SECRET" || rc=1
+  echo "declaration: secrets list = $(grep -c '^secrets = ' "$STATE/services/$id/service.toml"), \
+[env] assignments = $(grep -c '^SVC_SECRET' "$STATE/services/$id/service.toml")"
+  pid=$(ps -o pid= -u "$uid" | head -1 | tr -d ' ')
+  if [ -n "$pid" ]; then
+    # cut at the first '=' so only the NAME can ever reach this output.
+    if tr '\0' '\n' < "/proc/$pid/environ" | cut -d= -f1 | grep -qx SVC_SECRET; then
+      echo "process environ (pid $pid): SVC_SECRET= present"
+    else
+      echo "process environ (pid $pid): SVC_SECRET MISSING"; rc=1
+    fi
+  else
+    echo "no pid for uid $uid; cannot inspect environ"; rc=1
+  fi
 done
 
 tp=$(port_of timeservice)

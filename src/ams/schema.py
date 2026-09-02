@@ -148,6 +148,9 @@ class ServiceDecl:
     stop: StopSpec = StopSpec()
     limits: LimitsSpec = LimitsSpec()
     restart: RestartSpec = RestartSpec()
+    # Names of secrets the harness injects into the environment at spawn. Values
+    # live in the harness-private secret store (`ams secret set`), never here.
+    secrets: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "env", MappingProxyType(dict(self.env)))
@@ -263,6 +266,10 @@ def from_dict(data: Mapping[str, Any]) -> ServiceDecl:
     for key, value in data.items():
         if key in _NESTED:
             kwargs[key] = _build(_NESTED[key], value, key)
+        elif key == "secrets":
+            if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+                raise DeclError("secrets: expected a list of environment variable names")
+            kwargs[key] = tuple(value)
         else:
             kwargs[key] = value
     if "start" not in kwargs:
@@ -314,6 +321,17 @@ def validate(d: ServiceDecl) -> None:  # noqa: C901 - one flat checklist is clea
             raise _err(f"ports.{k}", "must be an integer (0 = auto)")
         if v != 0 and not (MIN_PORT <= v <= MAX_PORT):
             raise _err(f"ports.{k}", f"must be 0 or in [{MIN_PORT}, {MAX_PORT}] (rootless)")
+    seen: set[str] = set()
+    for name in d.secrets:
+        if not isinstance(name, str) or not ENV_NAME_RE.match(name):
+            raise _err("secrets", f"{name!r} is not a valid environment variable name")
+        if name in RESERVED_ENV or name.startswith(RESERVED_ENV_PREFIXES):
+            raise _err("secrets", f"{name!r} is reserved")
+        if name in d.env:
+            raise _err("secrets", f"{name!r} is also set in env; choose one")
+        if name in seen:
+            raise _err("secrets", f"{name!r} listed twice")
+        seen.add(name)
     for ref in sorted(port_refs(d)):
         if ref not in d.ports:
             raise _err("env", f"references ${{PORT_{ref}}} but ports.{ref} is not declared")

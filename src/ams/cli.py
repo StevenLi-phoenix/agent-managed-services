@@ -5,6 +5,8 @@ Four subcommands:
 - ``ams validate <service.toml>...`` — parse + validate declarations.
 - ``ams run`` — load every declaration in the state dir and supervise it.
 - ``ams provision [<id>...]`` — build the declared runtime for a service.
+- ``ams ctl <op> [<id>]`` — talk to a running harness over its control socket
+  (``ams.control``): ``ping``, ``status``, ``reload``, ``start|stop|restart|kill``.
 - ``ams check-host`` — host prerequisite report (delegates to ``ams.hostcheck``).
 
 ``ams run`` writes two streams deliberately: **stderr** is the harness log
@@ -24,6 +26,7 @@ absent or unimportable.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import pwd
@@ -61,6 +64,12 @@ SUMMARY_INTERVAL_S = 60.0
 # rather than letting systemd SIGKILL the harness mid-shutdown.
 SHUTDOWN_BUDGET_S = 25.0
 
+# `ams ctl` operations. Duplicated from ams.control.OPS rather than imported at
+# module import time so that building the parser (and `ams validate`) never
+# needs the control module; the client checks the two agree.
+CTL_OPS: tuple[str, ...] = ("ping", "status", "reload", "start", "stop", "restart", "kill")
+CTL_TIMEOUT_S = 10.0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ams", description="agent managed services supervisor")
@@ -89,7 +98,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_prov.add_argument("--state-dir", type=Path, default=None, help="overrides $AMS_STATE_DIR")
     p_prov.add_argument("--log-level", default="INFO")
 
+    p_ctl = sub.add_parser("ctl", help="talk to a running harness over its control socket")
+    p_ctl.add_argument("op", choices=CTL_OPS, help="operation to perform")
+    p_ctl.add_argument("id", nargs="?", default=None, metavar="service-id")
+    p_ctl.add_argument("--state-dir", type=Path, default=None, help="overrides $AMS_STATE_DIR")
+    p_ctl.add_argument(
+        "--timeout", type=float, default=CTL_TIMEOUT_S, help="seconds to wait for a reply"
+    )
+
     sub.add_parser("check-host", help="report host prerequisites")
+
+    # `ams secret set|rm|list|check`. Argument wiring and handlers live in
+    # ams.secrets so that every line that can touch a value sits in one module.
+    from ams.secrets import add_subparser as _add_secret_subparser
+
+    _add_secret_subparser(sub)
     return parser
 
 
@@ -97,10 +120,16 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "validate":
         return cmd_validate(args.paths)
+    if args.command == "secret":
+        from ams.secrets import cmd_secret
+
+        return cmd_secret(args)
     if args.command == "run":
         return cmd_run(args)
     if args.command == "provision":
         return cmd_provision(args)
+    if args.command == "ctl":
+        return cmd_ctl(args)
     if args.command == "check-host":
         return cmd_check_host()
     return EXIT_ERROR  # pragma: no cover - argparse enforces the choices
@@ -146,6 +175,15 @@ class Assembly:
     uids: UidAllocator | None = None
     isolated: bool = True
     registered: list[str] = field(default_factory=list)
+    # The runtime store, kept so a hot reload can register a new declaration
+    # through the same _register() path startup uses (ams.reload).
+    store: Any = None
+    # service id -> sha256 of its service.toml as last loaded. Change detection
+    # for `ams ctl reload` / SIGHUP; seeded by ams.reload.seed_hashes.
+    hashes: dict[str, str] = field(default_factory=dict)
+    # Ids whose declaration disappeared: stopped, awaiting a clean removal from
+    # the service table once the process is actually gone (ams.reload).
+    pending_removals: set[str] = field(default_factory=set)
 
     def start_all(self) -> None:
         for service_id in self.registered:
@@ -279,7 +317,16 @@ def build_supervisor(
             "(development only)."
         ) from e
 
-    store, extra_env_for = _load_runtime_layer(state) if isolation else (None, None)
+    store, runtime_env_for = _load_runtime_layer(state) if isolation else (None, None)
+    # Declared secrets (D16) ride the same per-start lookup as runtime
+    # activation and win over it; they are injected even without isolation,
+    # because a service's need for its credential does not depend on how it is
+    # sandboxed. A declared secret with no stored value raises MissingSecret
+    # here at start time -> spawn failure -> escalation, by design.
+    from ams.secrets import make_extra_env_for as _extra_env_with_secrets
+    from ams.secrets import warn_missing_secrets
+
+    extra_env_for = _extra_env_with_secrets(state, runtime_env_for)
 
     kwargs: dict[str, Any] = {"escalation": escalation, "extra_env_for": extra_env_for}
     if reset_window_min_s is not None:
@@ -289,6 +336,8 @@ def build_supervisor(
     declarations = state.load_declarations()
     if not declarations:
         log.warning("no service declarations under %s", state.services_dir)
+    # A heads-up, not a refusal: the other services must still come up.
+    warn_missing_secrets(state, declarations)
 
     asm = Assembly(
         state=state,
@@ -298,10 +347,14 @@ def build_supervisor(
         declarations=declarations,
         uids=uids,
         isolated=isolation,
+        store=store,
     )
     for service_id, decl in declarations.items():
         if _register(asm, service_id, decl, store=store, provision=provision):
             asm.registered.append(service_id)
+    from ams.reload import seed_hashes
+
+    seed_hashes(asm)
     return asm
 
 
@@ -510,15 +563,66 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return EXIT_UNAVAILABLE
 
+    from ams.control import ControlServer, control_socket_path
+    from ams.reload import drain_pending_removals, reload
+
     asm.start_all()
     summary = PeriodicSummary(asm.supervisor, asm.spawner)
     summary.log_now()
-    asm.supervisor.run_forever(
-        on_iteration=summary,
-        shutdown_timeout_s=shutdown_timeout_for(asm.declarations),
-    )
+
+    def on_reload() -> dict[str, Any]:
+        return reload(asm)
+
+    def on_iteration(events: list[Event]) -> None:
+        # Removals are two-phase: reload() stops the service, this finishes the
+        # drop once the process is actually gone (see ams.reload).
+        drain_pending_removals(asm)
+        summary(events)
+
+    server = ControlServer(control_socket_path(state), asm.supervisor, reload_fn=on_reload)
+    try:
+        server.open()
+    except OSError as e:
+        # A harness that cannot offer a control channel is still a working
+        # supervisor; refusing to start would be a worse failure than losing
+        # `ams ctl`. SIGHUP reload keeps working either way.
+        log.error("control socket unavailable (%s); 'ams ctl' will not work", e)
+    try:
+        asm.supervisor.run_forever(
+            on_iteration=on_iteration,
+            on_reload=on_reload,
+            shutdown_timeout_s=shutdown_timeout_for(asm.declarations),
+        )
+    finally:
+        server.close()
     log.info("stopped")
     return EXIT_OK
+
+
+# -------------------------------------------------------------------------- ctl
+
+
+def cmd_ctl(args: argparse.Namespace) -> int:
+    """Client half of the control channel: one request, one JSON line out.
+
+    Three exit codes, deliberately distinct: 0 the harness did it, 1 the harness
+    answered and refused (unknown id, a service that will not start), 2 there is
+    no harness to ask. An agent scripting against this needs to tell "the thing
+    is broken" from "the thing is not running".
+    """
+    from ams.control import OPS, ControlError, control_socket_path
+    from ams.control import request as control_request
+
+    assert set(CTL_OPS) == set(OPS), "ams.cli.CTL_OPS drifted from ams.control.OPS"
+    state = _state_dir(args.state_dir)
+    path = control_socket_path(state)
+    try:
+        response = control_request(path, args.op, args.id, timeout_s=args.timeout)
+    except ControlError as e:
+        print(str(e), file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    print(json.dumps(response, indent=2, sort_keys=True))
+    return EXIT_OK if response.get("ok") else EXIT_ERROR
 
 
 # -------------------------------------------------------------------- provision

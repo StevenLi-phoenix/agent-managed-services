@@ -355,3 +355,74 @@ class _FakeAllocator:
 
     def allocate(self, _service_id):
         return self.block
+
+
+# ------------------------------------------------------------------------- ctl
+
+
+def test_ctl_parser_defaults():
+    args = build_parser().parse_args(["ctl", "status"])
+    assert args.command == "ctl"
+    assert args.op == "status"
+    assert args.id is None
+    assert args.timeout == 10.0
+    with_id = build_parser().parse_args(["ctl", "restart", "kvservice"])
+    assert with_id.id == "kvservice"
+
+
+def test_ctl_rejects_an_unknown_op():
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(["ctl", "self-destruct"])
+    assert excinfo.value.code == 2
+
+
+def test_ctl_without_a_running_harness_exits_2(monkeypatch, capsys):
+    """Exit 2 = "nothing to talk to", distinct from 1 = "the harness said no"."""
+    import shutil
+    import tempfile
+
+    monkeypatch.delenv("AMS_STATE_DIR", raising=False)
+    # Not tmp_path: pytest's paths overflow a unix socket's 104-byte sun_path on
+    # macOS, which is a different (also handled) error. See test below.
+    state_dir = tempfile.mkdtemp(prefix="ams-cli-", dir="/tmp")
+    try:
+        assert main(["ctl", "ping", "--state-dir", state_dir, "--timeout", "1"]) == 2
+    finally:
+        shutil.rmtree(state_dir, ignore_errors=True)
+    err = capsys.readouterr().err
+    assert "no harness listening" in err
+    assert "control.sock" in err
+    assert "ams-harness" in err, "the message must name the fix"
+
+
+def test_ctl_names_a_state_dir_too_deep_for_a_unix_socket(tmp_path, monkeypatch, capsys):
+    """sun_path is ~104 bytes; "cannot connect" would send the reader hunting
+    for a stopped harness that is in fact running."""
+    monkeypatch.delenv("AMS_STATE_DIR", raising=False)
+    deep = tmp_path / ("d" * 60) / ("e" * 60)
+    deep.mkdir(parents=True)
+    assert main(["ctl", "ping", "--state-dir", str(deep), "--timeout", "1"]) == 2
+    err = capsys.readouterr().err
+    assert "too long for a unix socket" in err
+    assert "shorter path" in err
+
+
+def test_ctl_exit_code_follows_the_response_ok_flag(tmp_path, monkeypatch, capsys):
+    """The harness answered; 'ok' decides 0 vs 1, and the JSON reaches stdout."""
+    from ams import control
+
+    responses = iter([{"ok": True, "pong": True}, {"ok": False, "error": "unknown service 'x'"}])
+    monkeypatch.setattr(control, "request", lambda *a, **kw: next(responses))
+
+    assert main(["ctl", "ping", "--state-dir", str(tmp_path)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "pong": True}
+
+    assert main(["ctl", "restart", "x", "--state-dir", str(tmp_path)]) == 1
+    assert json.loads(capsys.readouterr().out)["error"] == "unknown service 'x'"
+
+
+def test_the_cli_and_the_control_module_agree_on_the_op_list():
+    from ams.cli import CTL_OPS
+    from ams.control import OPS
+
+    assert set(CTL_OPS) == set(OPS)

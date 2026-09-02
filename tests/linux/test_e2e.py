@@ -17,10 +17,12 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -362,3 +364,192 @@ def test_ams_check_host_passes_on_the_target_box() -> None:
     assert "cgroup-delegated" in proc.stdout
     assert "subuid" in proc.stdout
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------- hot reload (D17)
+
+RELOAD_STATIC_TOML = """
+id = "reload-static"
+[start]
+argv = ["/usr/bin/python3", "-c", "import time; print('static up', flush=True); time.sleep(300)"]
+[stop]
+timeout_s = 3.0
+[runtime]
+kind = "none"
+"""
+
+RELOAD_ADDED_TOML = """
+id = "reload-added"
+[start]
+argv = ["/usr/bin/python3", "-m", "http.server", "${PORT_main}", "--bind", "127.0.0.1"]
+[ports]
+main = 0
+[health]
+kind = "http"
+port = "main"
+path = "/"
+interval_s = 0.5
+timeout_s = 2.0
+start_period_s = 1.0
+[stop]
+timeout_s = 3.0
+[runtime]
+kind = "none"
+"""
+
+
+@dataclass
+class Reloaded:
+    """What a reload did to real cgroups, uids, ports and pids."""
+
+    static_pid_before: int
+    static_pid_after: int
+    static_pid_final: int
+    added_summary: dict[str, Any]
+    added_pid: int
+    added_uid: int | None
+    added_block_uid: int
+    added_cgroup: Path
+    added_cgroup_existed: bool
+    added_healthy: bool
+    added_port: int
+    removed_summary: dict[str, Any]
+    removed_cgroup_exists: bool
+    ports_after_removal: dict[str, int]
+    services_after_removal: list[str]
+    ctl_ping: dict[str, Any]
+    ctl_status: dict[str, Any]
+    socket_mode: int
+
+
+@pytest.fixture(scope="module")
+def reloaded() -> Iterator[Reloaded]:
+    """Add a service, then remove it, on a live isolated harness.
+
+    Its own state dir, so its uid blocks restart at 100000. That overlaps the
+    main scenario's blocks on the host, which is harmless here only because
+    ``observed`` has already shut every process down; two *live* harnesses would
+    need distinct subuid ranges.
+    """
+    from ams.control import ControlServer, control_socket_path, request
+    from ams.reload import drain_pending_removals, reload
+
+    base = Path(os.environ.get("AMS_STATE_DIR", str(Path.home() / "state")))
+    root = base / f"reload-{os.getpid()}"
+    static_dir = root / "services" / "reload-static"
+    static_dir.mkdir(parents=True, exist_ok=True)
+    (static_dir / "service.toml").write_text(RELOAD_STATIC_TOML, encoding="utf-8")
+
+    state = StateDir(root)
+    asm = build_supervisor(state, isolation=True)
+    sup = asm.supervisor
+    assert asm.registered == ["reload-static"], asm.registered
+
+    server = ControlServer(control_socket_path(state), sup, reload_fn=lambda: reload(asm))
+    server.open()
+    try:
+        asm.start_all()
+        static = sup.services["reload-static"]
+        assert _pump(sup, lambda: static.status == "running", SETTLE_TIMEOUT_S)
+        static_before = static.spawned.pid  # type: ignore[union-attr]
+
+        # ---- the control socket answers on the box, from the loop, unprivileged
+        sock_path = control_socket_path(state)
+        socket_mode = stat.S_IMODE(sock_path.stat().st_mode)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(request, sock_path, op, None, timeout_s=SETTLE_TIMEOUT_S)
+                for op in ("ping", "status")
+            ]
+            deadline = time.monotonic() + SETTLE_TIMEOUT_S
+            while time.monotonic() < deadline and not all(f.done() for f in futures):
+                sup.run_once(PUMP_SLICE_S)
+            ctl_ping, ctl_status = (f.result(timeout=SETTLE_TIMEOUT_S) for f in futures)
+
+        # ---- add a declaration and reload
+        added_dir = root / "services" / "reload-added"
+        added_dir.mkdir(parents=True, exist_ok=True)
+        (added_dir / "service.toml").write_text(RELOAD_ADDED_TOML, encoding="utf-8")
+        added_summary = reload(asm)
+
+        added = sup.services["reload-added"]
+        healthy = _pump(sup, lambda: added.healthy is True, SETTLE_TIMEOUT_S)
+        assert added.spawned is not None, "the added service died before becoming healthy"
+        added_cgroup = Path(str(added.spawned.cgroup))
+        measured = Reloaded(
+            static_pid_before=static_before,
+            static_pid_after=static.spawned.pid,  # type: ignore[union-attr]
+            static_pid_final=0,
+            added_summary=added_summary,
+            added_pid=added.spawned.pid,
+            added_uid=_proc_uid(added.spawned.pid),
+            added_block_uid=asm.uids.allocate("reload-added").uid_start,  # type: ignore[union-attr]
+            added_cgroup=added_cgroup,
+            added_cgroup_existed=added_cgroup.is_dir(),
+            added_healthy=healthy,
+            added_port=added.ports["main"],
+            removed_summary={},
+            removed_cgroup_exists=True,
+            ports_after_removal={},
+            services_after_removal=[],
+            ctl_ping=ctl_ping,
+            ctl_status=ctl_status,
+            socket_mode=socket_mode,
+        )
+
+        # ---- remove the declaration and reload again
+        (added_dir / "service.toml").unlink()
+        measured.removed_summary = reload(asm)
+
+        def dropped() -> bool:
+            drain_pending_removals(asm)
+            return "reload-added" not in sup.services
+
+        assert _pump(sup, dropped, SETTLE_TIMEOUT_S), f"pending: {asm.pending_removals}"
+        measured.removed_cgroup_exists = added_cgroup.exists()
+        measured.ports_after_removal = asm.ports.get("reload-added")
+        measured.services_after_removal = sorted(sup.services)
+        measured.static_pid_final = static.spawned.pid  # type: ignore[union-attr]
+        yield measured
+    finally:
+        server.close()
+        sup.shutdown(5.0)
+        if asm.uids is not None:
+            for service_id in ("reload-static", "reload-added"):
+                service_root = state.service_root(service_id)
+                if service_root.exists():
+                    remove_service_root(service_root, asm.uids.allocate(service_id))
+        subprocess.run(["rm", "-rf", str(root)], check=False)
+
+
+def test_the_control_socket_answers_on_the_box(reloaded: Reloaded) -> None:
+    assert reloaded.ctl_ping["ok"] is True
+    assert reloaded.ctl_status["ok"] is True
+    assert "reload-static" in reloaded.ctl_status["services"]
+    assert reloaded.socket_mode == 0o600, oct(reloaded.socket_mode)
+
+
+def test_reload_adds_a_service_with_its_own_cgroup_and_uid_block(reloaded: Reloaded) -> None:
+    assert reloaded.added_summary["added"] == ["reload-added"]
+    assert reloaded.added_summary["errors"] == {}
+    assert reloaded.added_healthy is True
+    assert reloaded.added_cgroup_existed, reloaded.added_cgroup
+    assert reloaded.added_cgroup.name == "svc-reload-added"
+    # A real, distinct identity -- not the harness's uid, not the other service's.
+    assert reloaded.added_uid == reloaded.added_block_uid
+    assert reloaded.added_uid is not None and reloaded.added_uid >= 100_000
+    assert reloaded.added_uid != os.getuid()
+    assert 20000 <= reloaded.added_port <= 29999
+
+
+def test_reload_does_not_disturb_the_untouched_service(reloaded: Reloaded) -> None:
+    """The whole point of D17: one declaration changes, the others do not restart."""
+    assert reloaded.static_pid_after == reloaded.static_pid_before
+    assert reloaded.static_pid_final == reloaded.static_pid_before
+
+
+def test_reload_removes_a_deleted_service_and_its_cgroup(reloaded: Reloaded) -> None:
+    assert reloaded.removed_summary["removed"] == ["reload-added"]
+    assert reloaded.services_after_removal == ["reload-static"]
+    assert not reloaded.removed_cgroup_exists, reloaded.added_cgroup
+    assert reloaded.ports_after_removal == {}, "a removed service releases its ports"
