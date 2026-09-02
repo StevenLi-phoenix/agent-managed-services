@@ -7,3 +7,8 @@ __pycache__/
 dist/
 build/
 api/
+
+# design records must be tracked despite the global .claude ignore rule
+!.claude/
+.claude/*
+!.claude/state/

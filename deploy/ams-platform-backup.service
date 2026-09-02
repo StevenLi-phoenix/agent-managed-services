@@ -1,0 +1,37 @@
+[Unit]
+Description=ams platform: daily SQLite snapshot backup of every service data dir to R2
+Documentation=file:///home/harness/ams/src/ams/platform/backup.py
+# Not bound to ams-harness.service: a backup reads files on disk and never talks
+# to the supervisor, so it must still run (and still succeed) while the harness
+# is down. That is exactly when a snapshot is most likely to be wanted.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=harness
+Group=harness
+WorkingDirectory=/home/harness/ams
+# Same environment block as ams-harness.service: the job resolves the state dir,
+# the secret store and the pinned rclone from these three variables, so a drift
+# between the two units would have it back up a different tree than the one the
+# harness runs.
+Environment=HOME=/home/harness
+Environment=AMS_STATE_DIR=/home/harness/store/state
+Environment=AMS_STORE_DIR=/home/harness/store
+Environment=PYTHONPATH=/home/harness/ams/src
+Environment=PATH=/home/harness/venv/bin:/home/harness/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Interpreter path must match deploy/apparmor/ams-harness attachment glob: the
+# snapshot step creates a user namespace (run_admin) to read service-owned
+# databases, and only this interpreter is allowed to.
+ExecStart=/home/harness/venv/bin/python3 -m ams.platform.backup run
+# Snapshot + gzip + upload for the whole fleet on one vCPU. The per-step
+# timeouts inside the job are tighter; this is the outer backstop.
+TimeoutStartSec=3600
+# Do NOT set NoNewPrivileges=yes or an empty CapabilityBoundingSet= here, for
+# the same reason as ams-harness.service: run_admin execs the setuid
+# newuidmap/newgidmap helpers to write the admin uid map.
+NoNewPrivileges=no
+# No Restart=: a failed backup is reported through the JSON-lines channel on
+# stdout and retried by the timer tomorrow. Retrying a snapshot in a tight loop
+# would hammer databases a live service is trying to write.

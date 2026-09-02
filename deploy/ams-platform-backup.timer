@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the ams platform backup daily at 04:10 UTC
+
+[Timer]
+# 04:10 UTC with 15 minutes of jitter, carried over verbatim from the schedule
+# api/bootstrap/05-db-backup.sh established: one snapshot per day, RPO 24h,
+# accepted by the owner on 2026-07-02 when litestream was decommissioned.
+OnCalendar=*-*-* 04:10:00 UTC
+RandomizedDelaySec=15min
+# A host that was off at 04:10 backs up on the next boot instead of skipping a
+# day. Missing a backup silently is the failure this whole unit exists to avoid.
+Persistent=true
+Unit=ams-platform-backup.service
+
+[Install]
+WantedBy=timers.target
