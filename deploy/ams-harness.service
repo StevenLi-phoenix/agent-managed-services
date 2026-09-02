@@ -1,0 +1,39 @@
+[Unit]
+Description=ams harness: rootless supervisor for agent-managed services
+After=network-online.target
+Wants=network-online.target
+# Backoff for a crash-looping harness lives here, not in the harness itself.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=harness
+Group=harness
+WorkingDirectory=/home/harness/ams
+Environment=HOME=/home/harness
+Environment=AMS_STATE_DIR=/home/harness/store/state
+Environment=AMS_STORE_DIR=/home/harness/store
+Environment=PYTHONPATH=/home/harness/ams/src
+Environment=PATH=/home/harness/venv/bin:/home/harness/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Interpreter path must match deploy/apparmor/ams-harness attachment glob.
+ExecStart=/home/harness/venv/bin/python3 -m ams run
+Restart=on-failure
+RestartSec=3
+# Harness creates one child cgroup per service and writes memory.max / cpu.max / pids.max itself.
+Delegate=yes
+DelegateSubgroup=harness
+# Services are direct children; a harness restart takes them all down (accepted trade-off).
+KillMode=control-group
+# Must stay above ams.cli.SHUTDOWN_BUDGET_S (25s) + ~1.5s of supervisor drain.
+# The harness clamps the graceful phase to that budget, so a declaration with a
+# large stop.timeout_s is capped rather than letting systemd SIGKILL us mid-stop.
+# Raise both together if services ever need longer than 25s to stop.
+TimeoutStopSec=30
+# Do NOT set NoNewPrivileges=yes or an empty CapabilityBoundingSet= here: the
+# harness relies on the setuid newuidmap/newgidmap helpers, which need to regain
+# CAP_SETUID/CAP_SETGID on exec to write the per-service uid/gid maps.
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+# Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor
+# (kernel.apparmor_restrict_unprivileged_userns=1): a process that creates a
+# userns is transitioned into the `unprivileged_userns` profile and loses all
+# capabilities inside the namespace, so setresuid()/chown() fail with EPERM even
+# though newuidmap succeeded. This profile grants `userns` ONLY to the harness
+# interpreter, which is a private copy (python -m venv --copies) so system
+# python stays restricted. Install to /etc/apparmor.d/ams-harness and load with
+# `apparmor_parser -r /etc/apparmor.d/ams-harness`.
+abi <abi/4.0>,
+include <tunables/global>
+profile ams-harness /home/harness/venv/bin/python* flags=(unconfined) {
+  userns,
+  include if exists <local/ams-harness>
+}

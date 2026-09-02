@@ -1,0 +1,35 @@
+[project]
+name = "ams"
+version = "0.1.0"
+description = "Agent managed services: rootless supervisor core (userns + cgroup v2)"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2", "ruff>=0.5"]
+
+[project.scripts]
+ams = "ams.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+timeout = 60
+markers = [
+  "linux: requires Linux host with userns + delegated cgroup (run via scripts/remote-test.sh)",
+]
+log_cli_level = "DEBUG"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
