@@ -17,6 +17,7 @@ Run with ``scripts/remote-test.sh ams-rt tests/linux/test_runtime_provision.py``
 from __future__ import annotations
 
 import json
+import logging
 import os
 import select
 import signal
@@ -30,7 +31,7 @@ import pytest
 
 from ams import schema
 from ams.isolated import IsolatedSpawner, make_isolated_spawner
-from ams.runtime import ProvisionError, RuntimeEnv, RuntimeStore, provision
+from ams.runtime import ProvisionError, RuntimeEnv, RuntimeStore, provision, python_venv_dir
 from ams.spawn import SpawnedService, SpawnRequest
 from ams.uidmap import UidBlock
 from ams.userns import remove_service_root
@@ -299,6 +300,141 @@ def test_second_venv_shares_extents_with_the_first(
     ran = run_service(decl2, root2, env2)
     assert ran.code == 0, ran.err
     assert ran.out.startswith("numpy ")
+
+
+# --------------------------------------------------------------------------- uv sync
+
+# A uv *project* whose only dependency is a sibling directory installed
+# editable. That is the shape the api monorepo has
+# (``sdk = { path = "../../components/sdk", editable = true }``), and it is the
+# reason the whole tree has to be copied into the service root: the source is
+# resolved relative to the project, outside the workdir but inside the root.
+_SYNC_PROJECT = """\
+[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["mylib"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+mylib = { path = "../lib", editable = true }
+"""
+
+_SYNC_LIB = """\
+[project]
+name = "mylib"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+"""
+
+
+def _write_sync_project(root: Path) -> Path:
+    """Lay the project out under ``root`` as the harness, before provisioning.
+
+    Mirrors production: the agent rsyncs a repository into the service root and
+    only then provisions, so ``_ensure_root`` finds both root and workdir
+    present and leaves the ownership to the closing chown.
+    """
+    proj = root / "proj"
+    lib = root / "lib" / "mylib"
+    lib.mkdir(parents=True)
+    proj.mkdir()
+    (proj / "pyproject.toml").write_text(_SYNC_PROJECT, encoding="utf-8")
+    (root / "lib" / "pyproject.toml").write_text(_SYNC_LIB, encoding="utf-8")
+    (lib / "__init__.py").write_text('VALUE = "from-path-dep"\n', encoding="utf-8")
+    return proj
+
+
+@pytest.mark.timeout(900)
+def test_uv_sync_project_with_editable_path_dependency(
+    store: RuntimeStore,
+    roots: Callable[[str], Path],
+    run_service: Run,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``runtime.sync``: the venv lands in the project and the path dep resolves.
+
+    Two provisions in one test on purpose. The first has no ``uv.lock``, which
+    is the case that must warn and still work; the second runs against the lock
+    the first one wrote, which is the ``--frozen`` path every subsequent restart
+    takes.
+    """
+    root = roots("sync")
+    proj = _write_sync_project(root)
+    argv = ["python", "-c", "import mylib; print('mylib', mylib.VALUE)"]
+    decl = schema.from_dict(
+        {
+            "id": "rt-sync",
+            "start": {"argv": argv, "workdir": "proj"},
+            "runtime": {"kind": "uv", "python": "3.12", "sync": True},
+        }
+    )
+    log_path = tmp_path / "provision.log"
+
+    with caplog.at_level(logging.WARNING, logger="ams.runtime"):
+        env = provision(decl, root, store, BLOCK, log_path=log_path)
+
+    venv = proj / ".venv"
+    assert python_venv_dir(decl, root) == venv
+    assert (venv / "bin" / "python").exists()
+    assert env.extra_env == {"VIRTUAL_ENV": str(venv)}
+    assert env.path_prepend == (str(venv / "bin"),)
+    # The whole tree, path dependency included, belongs to the service now.
+    assert os.stat(venv).st_uid == HOST_UID
+    assert os.stat(root / "lib" / "mylib" / "__init__.py").st_uid == HOST_UID
+
+    # No lock file existed, so provisioning resolved instead of freezing and said so.
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("uv.lock" in m and "resolving" in m for m in warnings), warnings
+    text = log_path.read_text()
+    assert "uv sync" in text and "uv sync --frozen" not in text
+
+    ran = run_service(decl, root, env)
+    assert ran.code == 0, ran.err
+    assert ran.out.strip() == "mylib from-path-dep"
+
+    # uv wrote the lock; the next provision must take the --frozen path silently.
+    assert (proj / "uv.lock").is_file()
+    caplog.clear()
+    log2 = tmp_path / "provision2.log"
+    with caplog.at_level(logging.WARNING, logger="ams.runtime"):
+        env2 = provision(decl, root, store, BLOCK, log_path=log2)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], caplog.records
+    assert "uv sync --frozen" in log2.read_text()
+    assert env2 == env
+
+    ran2 = run_service(decl, root, env2)
+    assert ran2.code == 0, ran2.err
+    assert ran2.out.strip() == "mylib from-path-dep"
+
+
+@pytest.mark.timeout(120)
+def test_uv_sync_without_a_project_names_the_missing_file(
+    store: RuntimeStore, roots: Callable[[str], Path]
+) -> None:
+    root = roots("sync-empty")
+    decl = schema.from_dict(
+        {
+            "id": "rt-sync-empty",
+            "start": {"argv": ["true"], "workdir": "proj"},
+            "runtime": {"kind": "uv", "sync": True},
+        }
+    )
+
+    with pytest.raises(ProvisionError) as excinfo:
+        provision(decl, root, store, BLOCK)
+
+    assert "pyproject.toml" in str(excinfo.value)
+    assert str(root / "proj") in str(excinfo.value)
+    assert not (root / "proj" / ".venv").exists()
 
 
 # --------------------------------------------------------------------------- node

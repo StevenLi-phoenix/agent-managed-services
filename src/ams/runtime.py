@@ -3,7 +3,8 @@
 The user namespace gives a service its own uids; it does not give it its own
 dependencies. That is this module's job (DECISIONS D8/D9/D10/D13):
 
-- every environment (``<root>/.venv``, ``<workdir>/node_modules``) lives inside
+- every environment (``<root>/.venv``, ``<workdir>/.venv`` for a uv project with
+  ``runtime.sync``, ``<workdir>/node_modules``) lives inside
   the service root, which lives on the XFS ``reflink=1`` store, next to the
   harness-owned tool caches. Same filesystem is a hard requirement: a
   cross-device clone fails and the tools silently fall back to full copies.
@@ -56,6 +57,8 @@ STDERR_TAIL_LINES = 40
 
 _VENV_DIRNAME = ".venv"
 _PACKAGE_JSON = "package.json"
+_PYPROJECT = "pyproject.toml"
+_UV_LOCK = "uv.lock"
 
 
 class ProvisionError(RuntimeError):
@@ -152,6 +155,27 @@ def venv_dir(service_root: Path) -> Path:
     return Path(service_root) / _VENV_DIRNAME
 
 
+def python_venv_dir(decl: ServiceDecl, service_root: Path) -> Path:
+    """Where this declaration's Python environment lives.
+
+    Two layouts, because uv has two modes and they disagree about the venv:
+
+    - default (``uv venv`` + ``uv pip install``): ``<service_root>/.venv``. The
+      workdir is just a place to run from; the environment belongs to the root.
+    - ``runtime.sync = true`` (the workdir is a uv *project*): ``<workdir>/.venv``,
+      which is where ``uv sync`` puts it when ``UV_PROJECT_ENVIRONMENT`` is
+      unset. We deliberately leave that variable unset rather than forcing the
+      environment back to the root: a project's ``[tool.uv.sources]`` path
+      dependencies (``../../components/sdk``) are resolved relative to the
+      project, and moving the environment out of the tree is the configuration
+      uv itself warns about. One less thing that can silently differ from what
+      ``uv run`` would do in the same directory.
+    """
+    if decl.runtime.sync:
+        return service_workdir(decl, service_root) / _VENV_DIRNAME
+    return venv_dir(service_root)
+
+
 def runtime_env(decl: ServiceDecl, service_root: Path, store: RuntimeStore) -> RuntimeEnv:
     """Pure: the env/PATH additions a provisioned service needs. No I/O.
 
@@ -163,7 +187,7 @@ def runtime_env(decl: ServiceDecl, service_root: Path, store: RuntimeStore) -> R
     if kind == "none":
         return RuntimeEnv()
     if kind in ("venv", "uv"):
-        venv = venv_dir(root)
+        venv = python_venv_dir(decl, root)
         return RuntimeEnv({"VIRTUAL_ENV": str(venv)}, (str(venv / "bin"),))
     workdir = service_workdir(decl, root)
     if kind == "pnpm":
@@ -326,6 +350,84 @@ def _ensure_root(decl: ServiceDecl, service_root: Path, workdir: Path, block: Ui
     ensure_service_root(service_root, block, subdirs=(workdir,) if inside else ())
 
 
+def _install_python_interpreter(
+    decl: ServiceDecl,
+    workdir: Path,
+    block: UidBlock,
+    env: Mapping[str, str],
+    log_path: Path | None,
+    timeout_s: float,
+) -> None:
+    """``uv python install <version>`` into the shared managed-interpreter dir.
+
+    A no-op once the version is present, so it is safe on every re-provision.
+    """
+    if not decl.runtime.python:
+        return
+    _tool(
+        ["uv", "python", "install", "-q", decl.runtime.python],
+        block,
+        workdir=workdir,
+        env=env,
+        what=f"{decl.id}: uv python install",
+        log_path=log_path,
+        timeout_s=timeout_s,
+    )
+
+
+def _provision_uv_sync(
+    decl: ServiceDecl,
+    workdir: Path,
+    block: UidBlock,
+    env: Mapping[str, str],
+    log_path: Path | None,
+    timeout_s: float,
+) -> None:
+    """``kind = "uv"`` + ``sync = true``: the workdir is a uv project.
+
+    ``uv sync`` reads ``pyproject.toml`` (and ``uv.lock`` when present) and
+    builds ``<workdir>/.venv``. This is the mode that makes a real repository
+    runnable as a service without translating its dependency metadata into a
+    declaration: workspace members and ``[tool.uv.sources]`` path dependencies
+    (``sdk = { path = "../../components/sdk", editable = true }``) resolve
+    exactly as they do for a developer running ``uv sync`` by hand, provided the
+    whole tree was copied into the service root.
+
+    ``--frozen`` is the default because a declaration that pins nothing is not a
+    reproducible service: with a lock file present, provisioning installs the
+    locked versions and never re-resolves. Without one there is nothing to
+    freeze, so we fall back to a resolving ``uv sync`` and WARN, because the
+    versions the service ends up with are then whatever the index served today.
+    The absence of ``uv.lock`` is checked directly rather than by letting
+    ``--frozen`` fail: uv's failure for a missing lock and its failure for a
+    *stale* lock are both non-zero exits, and only the first is safe to retry.
+    """
+    if not (workdir / _PYPROJECT).is_file():
+        raise ProvisionError(
+            f"{decl.id}: runtime.sync=true needs a uv project, but there is no "
+            f"{_PYPROJECT} in {workdir}"
+        )
+    argv = ["uv", "sync", "--frozen"]
+    if not (workdir / _UV_LOCK).is_file():
+        log.warning(
+            "%s: no %s in %s; falling back to a resolving 'uv sync'. "
+            "Dependency versions are not pinned by the declaration.",
+            decl.id,
+            _UV_LOCK,
+            workdir,
+        )
+        argv = ["uv", "sync"]
+    _tool(
+        argv,
+        block,
+        workdir=workdir,
+        env=env,
+        what=f"{decl.id}: {' '.join(argv)}",
+        log_path=log_path,
+        timeout_s=timeout_s,
+    )
+
+
 def _provision_python(
     decl: ServiceDecl,
     service_root: Path,
@@ -341,8 +443,17 @@ def _provision_python(
     ``uv`` says "and I know it is uv doing it"); one code path means one set of
     failure modes, and uv is the only Python tool on the box that can clone out
     of the shared cache.
+
+    ``runtime.sync`` splits off before any of that: a uv project owns its own
+    environment and dependency set, so there is no venv for us to create and no
+    package list for us to install (see :func:`_provision_uv_sync`).
     """
     rt = decl.runtime
+    if rt.sync:
+        _install_python_interpreter(decl, workdir, block, env, log_path, timeout_s)
+        _provision_uv_sync(decl, workdir, block, env, log_path, timeout_s)
+        return
+
     venv = venv_dir(service_root)
     install: list[str] = []
     if rt.requirements:
@@ -355,16 +466,7 @@ def _provision_python(
         install += ["-r", str(req)]
     install += list(rt.packages)
 
-    if rt.python:
-        _tool(
-            ["uv", "python", "install", "-q", rt.python],
-            block,
-            workdir=workdir,
-            env=env,
-            what=f"{decl.id}: uv python install",
-            log_path=log_path,
-            timeout_s=timeout_s,
-        )
+    _install_python_interpreter(decl, workdir, block, env, log_path, timeout_s)
     if not (venv / "pyvenv.cfg").exists():
         argv = ["uv", "venv", "-q"]
         if rt.python:
@@ -493,6 +595,19 @@ def provision(
     kind = decl.runtime.kind
     if kind == "nix":
         raise ProvisionError(f"{decl.id}: nix runtime not implemented")
+    # Rejected here, before an interpreter is downloaded or a root is created:
+    # the schema cannot express "these two fields are exclusive" without turning
+    # a runtime restriction into a load-time one, and this is a runtime
+    # restriction. `uv add` into a synced project would edit the repository's own
+    # pyproject.toml/uv.lock inside the service root, so the running service
+    # would no longer match the source it was copied from. Declare the
+    # dependency in the project instead.
+    if decl.runtime.sync and decl.runtime.packages:
+        raise ProvisionError(
+            f"{decl.id}: runtime.sync=true takes its dependencies from "
+            f"{_PYPROJECT}/{_UV_LOCK}; runtime.packages must be empty "
+            f"(got {list(decl.runtime.packages)})"
+        )
     result = runtime_env(decl, service_root, store)
     if kind == "none":
         log.debug("%s: runtime kind=none, nothing to provision", decl.id)

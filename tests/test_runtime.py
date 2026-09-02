@@ -24,6 +24,7 @@ from ams.runtime import (
     make_extra_env_for,
     provision,
     provisioning_env,
+    python_venv_dir,
     runtime_env,
     service_workdir,
     venv_dir,
@@ -137,6 +138,70 @@ def test_service_workdir_matches_spawn_request_rule() -> None:
 
 def test_venv_dir() -> None:
     assert venv_dir(ROOT) == ROOT / ".venv"
+
+
+# --------------------------------------------------------------------------- uv sync mode
+
+
+def test_runtime_env_sync_puts_the_venv_in_the_project() -> None:
+    """`uv sync` creates <workdir>/.venv, so that is what the service must find.
+
+    The declaration this mirrors is the api pilot: a whole monorepo copied to
+    the service root, the service being one project inside it.
+    """
+    d = decl("uv", workdir="repo/services/kvservice", sync=True, python="3.12")
+    venv = "/state/services/svc/root/repo/services/kvservice/.venv"
+    env = runtime_env(d, ROOT, STORE)
+    assert env.extra_env == {"VIRTUAL_ENV": venv}
+    assert env.path_prepend == (venv + "/bin",)
+    assert python_venv_dir(d, ROOT) == Path(venv)
+
+
+def test_runtime_env_sync_with_root_workdir_matches_the_default_layout() -> None:
+    """workdir="." is the one case where both layouts name the same directory."""
+    d = decl("uv", sync=True)
+    assert python_venv_dir(d, ROOT) == venv_dir(ROOT) == ROOT / ".venv"
+    assert runtime_env(d, ROOT, STORE) == runtime_env(decl("uv"), ROOT, STORE)
+
+
+def test_runtime_env_sync_honours_an_absolute_workdir() -> None:
+    d = decl("uv", workdir="/opt/app", sync=True)
+    assert python_venv_dir(d, ROOT) == Path("/opt/app/.venv")
+
+
+def test_python_venv_dir_without_sync_ignores_the_workdir() -> None:
+    """Without sync the environment belongs to the root, not to the workdir."""
+    assert python_venv_dir(decl("uv", workdir="app"), ROOT) == ROOT / ".venv"
+    assert python_venv_dir(decl("venv", workdir="app"), ROOT) == ROOT / ".venv"
+
+
+def test_make_extra_env_for_follows_sync_mode(tmp_path: Path) -> None:
+    """The supervisor's lookup and the provisioner must agree on the venv path."""
+    state = StateDir(tmp_path)
+    lookup = make_extra_env_for(state, STORE)
+    extra_env, path_prepend = lookup(decl("uv", workdir="repo/apps/timeservice", sync=True))
+    venv = state.service_root("svc") / "repo" / "apps" / "timeservice" / ".venv"
+    assert extra_env == {"VIRTUAL_ENV": str(venv)}
+    assert path_prepend == (str(venv / "bin"),)
+
+
+def test_provision_refuses_packages_in_sync_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`uv add` would rewrite the copied repository's own pyproject/uv.lock."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    d = decl("uv", workdir="proj", sync=True, packages=["six"])
+    with pytest.raises(ProvisionError, match="runtime.packages must be empty"):
+        provision(d, tmp_path / "root", STORE, BLOCK)
+    assert not (tmp_path / "root").exists()  # refused before touching the disk
+
+
+def test_schema_allows_sync_only_for_uv_projects() -> None:
+    """The runtime restriction is ours; these two are the schema's."""
+    with pytest.raises(schema.DeclError, match="runtime.sync"):
+        decl("venv", sync=True)
+    with pytest.raises(schema.DeclError, match="runtime.sync"):
+        decl("uv", sync=True, requirements="requirements.txt")
 
 
 # --------------------------------------------------------------------------- provisioning env

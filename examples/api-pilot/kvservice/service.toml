@@ -1,0 +1,83 @@
+# kvservice — a replica of StevenLi-phoenix/api services/kvservice run under ams.
+#
+# Generated for the api pilot (.claude/state/pilot-api.md). It is NOT the
+# production deployment: no registry, no auth, its own throw-away SVC_SECRET and
+# its own SQLite file. Install it with scripts/pilot-api.sh, which also puts the
+# monorepo at <service root>/repo.
+id = "kvservice"
+name = "KV Service (api pilot replica)"
+
+[start]
+# `uvicorn` comes from <workdir>/.venv/bin, which runtime.sync=true builds and
+# runtime_env prepends to PATH. The module is importable because `uv sync`
+# installs the project itself into that venv.
+argv = [
+  "uvicorn",
+  "kvservice.main:build_app",
+  "--factory",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "${PORT_main}",
+]
+# The whole monorepo is copied to <root>/repo so that kvservice's
+# `sdk = { path = "../../components/sdk", editable = true }` resolves.
+workdir = "repo/services/kvservice"
+
+[ports]
+main = 0
+
+[env]
+SVC_NAME = "kvservice"
+SVC_AUDIENCE = "kvservice"
+# Replica secret, generated for this pilot. The production secret lives in
+# /etc/kvservice/env on the droplet and is not used here. With SVC_DEV=1 this
+# value is never sent anywhere.
+SVC_SECRET = "REDACTED-throwaway-svc-secret"
+# The offline switch. sdk.registry.Registry.start() returns immediately: no
+# register POST (which is FATAL when it fails), no heartbeat thread, no M2M
+# client. Without it the service would not start at all here.
+SVC_DEV = "1"
+# The gateway mount prefix in production. Only used for registry metadata and
+# for sdk.fastapi._check_route_prefixes; no route starts with it, so no warning.
+SVC_ROOT_PATH = "/kv"
+# SVC_DEV does NOT gate kvservice's one-shot ACLClient.refresh(), and the SDK
+# defaults are the real https://registry.lishuyu.app / https://auth.lishuyu.app.
+# Point both at a closed local port so a replica can never talk to production.
+# Consequence: no ACL rules load, so every authenticated kv route denies. Only
+# /health and /agents.md are reachable. That is intended for a pilot.
+REGISTRY_URL = "http://127.0.0.1:1"
+AUTH_URL = "http://127.0.0.1:1"
+# Outside the repo copy so a re-rsync of the monorepo cannot clobber the data.
+KV_DB_PATH = "/home/harness/store/state/services/kvservice/root/data/kvservice.db"
+
+[runtime]
+kind = "uv"
+python = "3.12"
+# The workdir is a uv project: provisioning runs `uv sync --frozen` there
+# (services/kvservice/uv.lock is committed upstream) and the venv is
+# <workdir>/.venv. runtime.packages must stay empty in this mode.
+sync = true
+
+[health]
+kind = "http"
+port = "main"
+path = "/health"
+interval_s = 10.0
+timeout_s = 5.0
+# Importing fastapi + uvicorn[standard] and running the SQLite migrations takes
+# a few seconds on a 1 vCPU box; 60 s is generous headroom over the observed ~2 s.
+start_period_s = 60.0
+
+[stop]
+signal = "SIGTERM"
+timeout_s = 10.0
+
+[limits]
+# The upstream manifest says 100M. 150M here: the pilot box has 2 GB and an
+# OOM-killed replica teaches nothing, so headroom beats fidelity.
+memory_max = "150M"
+pids_max = 64
+
+[restart]
+policy = "on-failure"

@@ -23,7 +23,8 @@ kind = "venv"                 # none | venv | uv | pnpm | bun | nix
 python = "3.12"               # venv/uv only
 # node = "22"                 # pnpm/bun only (pnpm: system or pnpm-managed node; bun: ignored)
 requirements = "requirements.txt"   # venv/uv only, relative to workdir
-# sync = true                # uv only: workdir is a uv project; `uv sync --frozen`, venv at <workdir>/.venv
+# sync = true                # uv only: workdir is a uv project; `uv sync --frozen`, venv at <workdir>/.venv;
+#                             # `packages` must be empty in sync mode (deps come from pyproject/uv.lock)
 packages = ["uvicorn"]        # pip/uv specs (venv/uv) or npm specs (pnpm/bun); nix uses nix_packages
 # Environments live on the XFS reflink store (/home/harness/store): python venvs,
 # pnpm projects (package-import-method=clone) and bun projects (--backend=copyfile)
