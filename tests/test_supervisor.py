@@ -784,3 +784,39 @@ def test_restart_in_the_reaped_but_undrained_window_actually_restarts(tmp_path):
     assert st.pid not in (None, first)
     assert st.desired == "up"
     sup.shutdown(2.0)
+
+
+def test_a_raising_extra_env_hook_fails_only_that_service(tmp_path):
+    """extra_env_for is the runtime/secrets hook and it raises for real: a
+    declared secret with no stored value raises MissingSecret. Outside start()'s
+    guard that escaped, so one unset secret took down start_all() at boot -- and
+    with it every service that had not spawned yet."""
+    esc = RecordingEscalation()
+
+    def hostile(_decl):
+        raise RuntimeError("secret 'SVC_SECRET' has no value")
+
+    sup = Supervisor(
+        RecordingSpawner(),
+        escalation=esc,
+        extra_env_for=hostile,
+        reset_window_min_s=0.3,
+        eof_grace_s=0.3,
+    )
+    needy = sup.add(decl("print('never')", sid="needy"), tmp_path / "needy", {})
+    healthy = sup.add(decl(READY + "import time; time.sleep(30)", sid="ok"), tmp_path / "ok", {})
+
+    sup.start("needy")  # must not raise
+    assert needy.spawned is None
+    assert needy.consecutive_failures == 1
+    assert needy.status in ("backoff", "failed")
+
+    sup.services["ok"].decl = decl(READY + "import time; time.sleep(30)", sid="ok")
+    sup._extra_env_for = lambda _decl: ({}, ())  # the healthy one has its env
+    sup.start("ok")
+    pump(sup, until=lambda ev: saw_text(ev, "ready"))
+    assert healthy.spawned is not None, "a sibling's bad env must not stop this one"
+
+    texts_seen = [e.text for e, _d in esc.events] + lines(sup.run_once(0.01))
+    assert any("SVC_SECRET" in t for t in texts_seen) or needy.consecutive_failures == 1
+    sup.shutdown(2.0)

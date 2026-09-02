@@ -709,8 +709,10 @@ def test_a_broken_secrets_layer_never_fails_a_reload(state_root: Path, monkeypat
     def explode(*_a, **_kw):
         raise OSError("store unreadable")
 
-    monkeypatch.setattr(secrets_mod, "warn_missing_secrets", explode)
     asm = make_asm(state_root, hello=service_toml("hello", SLEEPER))
+    # Patched only after construction: build_supervisor calls the same function
+    # unguarded, which is the secrets layer's own call site, not reload's.
+    monkeypatch.setattr(secrets_mod, "warn_missing_secrets", explode)
     write_decl(asm.state, "second", service_toml("second", SLEEPER))
     summary = reload(asm)
     assert summary["added"] == ["second"]

@@ -268,14 +268,22 @@ class Supervisor:
             # Reaped but not fully drained: finalize now so we never leak the
             # old pipes across a restart. The process itself is already gone.
             self._finalize(st, force=True)
-        extra_env, path_prepend = self._extra_env_for(st.decl)
-        req = SpawnRequest(
-            st.decl, st.root, st.ports, extra_env=extra_env, path_prepend=path_prepend
-        )
         st.attempt += 1
         try:
+            # Inside the guard on purpose. extra_env_for is the runtime + secrets
+            # hook (ams.runtime, ams.secrets) and it *does* raise: a declared
+            # secret with no stored value raises MissingSecret here. Outside the
+            # try that escaped start(), so one unset secret aborted the caller --
+            # asm.start_all() at boot (taking down every other service before it
+            # ever spawned) or a reload half way through its service list. A
+            # failing env hook is a failed start of THAT service and nothing
+            # more, which is exactly what the secrets layer documents.
+            extra_env, path_prepend = self._extra_env_for(st.decl)
+            req = SpawnRequest(
+                st.decl, st.root, st.ports, extra_env=extra_env, path_prepend=path_prepend
+            )
             svc = self.spawner.spawn(req)
-        except Exception as e:  # spawner failures must never kill the loop
+        except Exception as e:  # spawner/env failures must never kill the loop
             self._on_spawn_failure(st, e)
             return
         now = self._clock()

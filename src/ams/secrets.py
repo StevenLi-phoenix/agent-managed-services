@@ -279,13 +279,31 @@ def warn_missing_secrets(state: StateDir, declarations: Mapping[str, ServiceDecl
     affected service fails at start with a clear escalation (see
     :func:`make_extra_env_for`), so this is a heads-up, not the enforcement.
     Returns the ids warned about, for tests and callers.
+
+    **This function never raises.** It is advisory, and an advisory diagnostic
+    that can abort ``ams run`` or a reload is worse than no diagnostic at all --
+    the same shape of bug as an env hook raising outside ``Supervisor.start``'s
+    guard, which took down every service after the failing one. An unreadable
+    store is reported and skipped: the service that needs it fails at its own
+    start, where the failure belongs. The guard is per service so one
+    unreadable directory cannot hide the warnings for the others, and it lives
+    here rather than at each call site so the contract holds for every caller.
     """
     store = store_for(state)
     warned: list[str] = []
     for service_id, decl in declarations.items():
         if not decl.secrets:
             continue
-        missing = store.missing(service_id, decl.secrets)
+        try:
+            missing = store.missing(service_id, decl.secrets)
+        except OSError as e:
+            log.error(
+                "cannot inspect the secret store for %s (%s); "
+                "the service will fail at start if a declared secret is unreadable",
+                service_id,
+                e,
+            )
+            continue
         if missing:
             log.warning(
                 "%s declares secrets with no stored value: %s (set them with "
