@@ -246,9 +246,36 @@ class UidAllocator:
     def allocate(self, service_id: str) -> UidBlock:
         """Idempotent: returns the existing block for a known id, else carves
         the lowest free block (by index) from the first uid range and the
-        first gid range. Raises ``UidExhausted`` when none is left."""
+        first gid range. Raises ``UidExhausted`` when none is left.
+
+        Idempotent **across processes**, not just within one allocator. The
+        harness holds one instance for its whole lifetime, while
+        ``ams provision`` and the platform bring-up allocate from a second
+        process; without the re-read below, the harness would carve a *different*
+        block for an id another process had already staged files under, and the
+        recursive chown in ``ensure_service_root`` then runs in a namespace with
+        no authority over those files (EPERM on every one). That is not
+        hypothetical -- it is how the first live Layer-0 bring-up failed; see
+        `.claude/state/diagnosis-layer0.md` and DECISIONS D24.
+
+        The re-read costs nothing on the warm path: a known id never reaches it.
+        It also feeds ``_lowest_free_index`` the blocks other processes carved,
+        so a fresh id cannot be handed a range that is already in use on disk.
+        This narrows the window rather than closing it -- two processes can still
+        interleave ``allocate`` and ``_save``. Making the harness the single
+        writer (an allocation op on the control socket) is Phase-B work.
+        """
         existing = self._blocks.get(service_id)
         if existing is not None:
+            return existing
+        self._load()
+        existing = self._blocks.get(service_id)
+        if existing is not None:
+            log.info(
+                "%s: block for %r was carved by another process since load; reusing it",
+                self.state_path,
+                service_id,
+            )
             return existing
         i = self._lowest_free_index()
         ur, gr = self._uid_ranges[0], self._gid_ranges[0]

@@ -375,3 +375,40 @@ def test_a_failing_admin_command_raises_source_error(
 def test_stage_refuses_a_relative_service_root(mirror: SourceMirror) -> None:
     with pytest.raises(ValueError, match="absolute"):
         mirror.stage("a" * 40, Path("relative/root"), BLOCK)
+
+
+# --------------------------------------------------------------- changed_paths
+
+
+def test_changed_paths_lists_what_a_commit_touched(tmp_path: Path, upstream) -> None:
+    src, first = upstream
+    second = _commit(src, {"svc/main.py": "print(2)\n", "docs/x.md": "hi\n"}, "second")
+    mirror = SourceMirror(tmp_path / "store2", "api", url=str(src))
+    mirror.fetch("main")
+
+    assert mirror.changed_paths(first, second) == ["docs/x.md", "svc/main.py"]
+    assert mirror.changed_paths(second, second) == []
+    assert mirror.changed_paths(second, first) == ["docs/x.md", "svc/main.py"]
+
+
+def test_changed_paths_reports_both_sides_of_a_rename(tmp_path: Path, upstream) -> None:
+    """`--no-renames`: the directory that lost the file must show as changed."""
+    src, first = upstream
+    (src / "svc" / "main.py").rename(src / "svc2.py")
+    (src / "svc").rmdir()
+    second = _commit(src, {}, "move it")
+    mirror = SourceMirror(tmp_path / "store2", "api", url=str(src))
+    mirror.fetch("main")
+
+    assert mirror.changed_paths(first, second) == ["svc/main.py", "svc2.py"]
+
+
+def test_changed_paths_rejects_a_bad_sha(tmp_path: Path, upstream) -> None:
+    src, first = upstream
+    mirror = SourceMirror(tmp_path / "store2", "api", url=str(src))
+    mirror.fetch("main")
+
+    with pytest.raises(SourceError):
+        mirror.changed_paths(first, "0" * 40)
+    with pytest.raises(SourceError, match="invalid commit sha"):
+        mirror.changed_paths(first, "not-a-sha")

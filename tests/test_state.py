@@ -123,3 +123,25 @@ def test_read_json_checked_raises_state_corrupt_on_bad_json(tmp_path: Path):
     p.write_text("{not valid json", encoding="utf-8")
     with pytest.raises(StateCorrupt, match="corrupt JSON"):
         read_json_checked(p)
+
+
+def test_ensure_preserves_a_deliberate_o_x_on_services(tmp_path: Path):
+    """`ams.cli._ensure_traversable` adds o+x to services/ so a service uid can
+    resolve its own workdir by path. `ensure()` runs again from every entry
+    point -- including `ams.platform.bootstrap` while services are running --
+    and must not take it back: the next spawn of every running service then
+    fails with PermissionError on its own interpreter. Observed live on
+    racknerd; see `.claude/state/diagnosis-layer0.md`.
+    """
+    import stat as _stat
+
+    sd = StateDir(tmp_path)
+    sd.ensure()
+    assert (sd.services_dir.stat().st_mode & 0o777) == 0o750
+
+    sd.services_dir.chmod(0o751)
+    sd.ensure()
+    mode = sd.services_dir.stat().st_mode & 0o777
+    assert mode == 0o751
+    # ...and never o+r: the directory stays unlistable by a service uid.
+    assert not mode & _stat.S_IROTH

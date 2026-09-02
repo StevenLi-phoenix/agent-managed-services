@@ -943,3 +943,288 @@ report in `JsonLinesEscalation`'s shape. Choices and what was rejected:
     A future change to any of these five services' provider wiring (a new
     optional channel, a provider swap) needs its own re-grep; this is not a
     standing guarantee the overlay stays complete.
+
+### D24 (T3.1). Sync loop: two-pass around the reload, monotonic stages, fleet-wide gateway (2026-09-02)
+- **The reload comes before the gateway render, not after.** `mount.json` carries
+  the port *name* and `gateway.resolve_ports` follows it into the live
+  allocation (D21); a service the harness has never seen has no allocated port
+  until `ams ctl reload` registers it, and `resolve_ports` raises rather than
+  rendering a `reverse_proxy` to nothing. So one tick is: declare everything →
+  one reload → render/write the gateway → `restart caddy` if any file changed →
+  registry + health gate. *Rejected:* rendering first and re-rendering after —
+  two renders and a window where the config points at the old fleet.
+  *Rejected:* allocating ports in the sync process — the allocator is the
+  harness's (`state/ports.json`) and a second writer would hand out a port the
+  supervisor is about to bind.
+- **The gateway is rendered from the mount sidecars on disk, not from the
+  services this tick processed.** The gateway is fleet state: rendering from the
+  run's own list would make `gateway.write`'s stale-snippet deletion drop
+  `sites/<id>.caddy` for every service excluded by `--only`, or for one whose
+  manifest broke this tick — taking a still-running service off the gateway
+  because of an unrelated typo. A declared service with no allocated port yet is
+  skipped with a warning rather than raised on, so one such service cannot stop
+  the gateway being rendered for the other twenty.
+- **A stage never moves backwards, and a `failed` record is never rewound.**
+  Every tick re-walks every phase, so `advance()` only writes when the new stage
+  sorts above the current one (`failed` sorts below all). Rewinding a failed
+  record to `fetched` at the top of each tick would move `stage_since` and clear
+  `escalated` every 60 s, turning "escalate once per cause" into "escalate per
+  tick" — the exact failure T3.3 exists to prevent. For the same reason
+  `set_stage` stamps `updated_at` only when `(sha, stage, error)` actually
+  changes, and `PlatformState.flush` compares against what it loaded: **a tick
+  that changes nothing writes nothing** (asserted by a whole-tree mtime snapshot).
+  The escalate-once check reads a snapshot of the record taken *before* the tick
+  touched it, not the live record, which `fail()` has already rewritten.
+- **`error` is `"<transition>: <message>"` and `stage` is `failed`.** The sidecar
+  doc says `failed` is the stage and "`error` says which", so the transition is
+  encoded in the message rather than added as a second field — the shape stays
+  the one `docs/platform-sidecars.md` documents, and the escalation record
+  carries the transition in `event.stage` for a machine reader.
+- **Provision is skipped only when the tree is already at the sha AND the venv
+  exists.** `SourceMirror.stage` no-ops on a matching `.ams-sha`, so the marker
+  is read before calling it to know whether anything moved. A missing venv with
+  a matching marker still provisions: that is the "provision crashed last tick"
+  case, and re-running `uv sync` is cheap and idempotent.
+- **`manual_restart`: a changed declaration is not written, and the service is
+  marked `failed` with `error="declare: declaration changed but manual_restart
+  is set"`.** Writing it would make the reload restart the service on its
+  declaration hash (D17), which is the one thing the flag exists to prevent. The
+  *first* declaration is still written — nothing is running yet, so there is no
+  restart to avoid. *Rejected:* writing it and recording `stage="declared"` with
+  an informational escalation — the harness would restart the service on the
+  next reload from any source (SIGHUP, another agent), so the flag would be
+  honoured only by luck. *Rejected:* leaving the stage at `translated` with a
+  note — an operator scanning for what needs attention greps `failed`, and this
+  does need attention.
+- **A run-level failure (fetch, reload) stops the tick with one escalation and
+  leaves every record at its last reached stage**, rather than marking each
+  service failed. Nothing is wrong with the services; the tick could not
+  proceed. A failed reload leaves them at `declared`, and the next tick's
+  "declared but not live" check re-issues the reload (regression-tested).
+- **`SyncConfig.__post_init__` enforces the loopback gate by constructing a
+  throwaway `TranslateContext`** rather than re-implementing the regex. There
+  must be exactly one gate (PLAN-allin risk 5) and this way it fails once,
+  before the fetch, instead of once per manifest — and the two can never
+  disagree. *Rejected:* copying `_LOOPBACK_URL_RE` into sync.py.
+- **`sync(state, store, cfg)`'s `store` is the `RuntimeStore`, and the
+  SecretStore defaults to `store_for(state)`.** `provision`, `place_jwt_key` and
+  `SourceMirror` all need the reflink store, which only `$AMS_STORE_DIR` knows;
+  D16 fixes the secret store at `<state>/secrets`, so it is derivable. Both are
+  still injectable for tests.
+- **`--only` / `--skip` match either the manifest's directory name or the
+  translated id.** The id only exists after the manifest parses, which is
+  exactly what a filter cannot rely on when the manifest is the broken thing; a
+  translate failure for a service that is not selected is silent.
+
+- **T3.4 hooks: `load_ams_overlay`, not `overlay_secret_names`.** The brief named
+  the secrets-only wrapper; the full reader is used instead because it returns
+  both halves from one read of one file, and T3.4's own docstring assigns the
+  `[env]` merge to its caller — which is this loop. `[env]` is applied with
+  `dataclasses.replace`, whose `__post_init__` re-runs `schema.validate`, so a
+  reserved or secret-colliding name fails that one service at `translate` rather
+  than at spawn. sync.py's own `service.ams.toml` parser was deleted rather than
+  left beside T3.4's: two readers of one file is how they drift.
+- **`publish_static` is a static mount's `provisioned` step**, run before the
+  gateway render and after nothing else — a published tree is what the
+  `file_server` in the rendered site block points at, so publishing after the
+  render would leave one tick where Caddy serves a directory that is not there.
+  A uid block is allocated **only** when `mount["build"]` is non-empty: the tree
+  is harness-owned and never chowned (D25), the block exists only so `run_admin`
+  can build a two-range map, and a site with no build steps should not consume
+  one of the 64 blocks.
+- **`DedupingEscalation` (T3.3) was not adopted, deliberately.** It is not a
+  drop-in: its `escalate(event, decision, ctx)` wants an `Event` and a
+  `ServiceContext` carrying a `ServiceDecl`, and a translate failure is
+  precisely the case with no declaration to put in one — synthesising placeholder
+  objects to satisfy the protocol would be ceremony, not dedupe. More
+  importantly its window is in-process wall time, and this is a one-shot process
+  that exits between ticks, so it would never observe a repeat: the cross-tick
+  dedupe is the persisted `escalated` flag on the record, which is what
+  `docs/platform-sidecars.md` specifies and what the tests pin. Within a single
+  tick a service escalates at most once by construction (every phase returns on
+  failure), so there is nothing left for a window to collapse. Revisit if the
+  sync loop ever becomes long-lived.
+
+### Open / weak signals (sync loop, 2026-09-02)
+- **`GIT_COMMIT` makes every commit restart every service.** `translate` injects
+  `GIT_COMMIT=<sha>` into every declaration (PLAN-allin Q2) and the harness
+  restarts on a declaration content hash (D17), so one unrelated commit to the
+  monorepo rewrites all 21 `service.toml` files and restarts the whole fleet.
+  Pinned by a test (`test_every_declaration_carries_the_commit_so_every_service_is_rewritten`)
+  so it cannot change silently. This is a translation-layer decision and was
+  deliberately **not** worked around here: diffing declarations modulo one key
+  would leave the file on disk disagreeing with the running process, and
+  dropping the variable is T1.2's call. Options if it bites at T4.1 scale: drop
+  `GIT_COMMIT` from the declaration and inject it at spawn from `.ams-sha`, or
+  accept a fleet restart per commit. n=0 measurements of what 21 simultaneous
+  restarts cost on one vCPU.
+- **A new sha re-stages and re-provisions every service, not just the changed
+  one.** `stage` copies the whole monorepo, so every service's tree moves on
+  every commit and `uv sync` re-runs (a commit can change a lockfile). Cheap on
+  reflink (D19: 0.01 MiB per stage) but not free in time: 20 × `uv sync` on one
+  vCPU is unmeasured (n=0). Also note the tree is swapped *under a running
+  process*; `stage`'s two-`mv` swap is atomic for the directory but a process
+  holding an open file keeps the old inode. Not observed to break anything —
+  and not tested live either.
+- The two-pass ordering, the reload, the restart and the health gate are all
+  exercised against recorders. **n=0 against a real harness or registry**; T3.2
+  and T4.1 are the live gates.
+- **A static site republishes on every commit**, because `publish_static` is
+  idempotent by sha and the sha changes with every commit to the monorepo — the
+  same shape as the `GIT_COMMIT` finding above, and unmeasured for a real
+  `bun run build` (the test fixture declares no build steps, so **n=0 static
+  builds have ever run**). If T4.1 finds this expensive, the fix is a content
+  hash of `apps/<id>` rather than the commit sha, which is T3.4's call.
+
+### D24 (T3.2). Live Layer 0: fixed Caddy port, a local mirror instead of GitHub, and two allocator/permission fixes the gate forced (2026-09-02)
+
+- **Caddy's port is fixed at 20180, not allocated.** `gateway.caddy_declaration`
+  asks for `ports.main = 0`, which is right for a gateway whose config is
+  rendered after the fact. This bring-up cannot do that: the entry site's own
+  listen address lives *inside* the Caddyfile, and the Caddyfile must exist
+  before the reload that starts Caddy. `layer0._caddy_declaration_text` rewrites
+  that one line. *Rejected:* changing `gateway.py` to take a port — T2.2 owns it,
+  its golden files pin the text, and one caller wanting a fixed port is not yet a
+  reason to change a signature (a second caller would be). *Rejected:* two
+  reloads (allocate, then render, then restart Caddy) — it starts a gateway
+  against a config that does not exist, which is a crash-loop by construction.
+  The rewrite is guarded: if `main = 0` ever leaves the generator, `layer0`
+  raises "stale" rather than shipping a gateway whose config cannot know its own
+  port.
+
+- **Source is a bare mirror pushed to `<store>/upstream/api.git`, not
+  `https://github.com/StevenLi-phoenix/api`.** The repo is private: from racknerd
+  anonymous HTTPS gets a 404 and `git ls-remote` asks for a username. The harness
+  holds no GitHub credential and none was created — `sources.validate_url` exists
+  to refuse credential-bearing URLs, and widening the harness's reach to fetch a
+  private repo is a decision for a human, not a side effect of a bring-up.
+  `validate_url` already accepts an absolute local path, so every stage after the
+  clone is the real code path. *Consequence, recorded rather than worked around:*
+  Phase A runs upstream `main`, which lacks the T1.4 SDK root-logger patch (it
+  lives on the local `ams-platform` branch, never pushed), so SDK
+  `logger.warning` is still classified INFO. *Rejected:* a deploy key on the box —
+  it makes the harness able to read a private repo forever to save one rsync.
+
+- **Order is the deliverable, and it is not the obvious one.** Identities must be
+  created *before* a Layer-1 service starts, because a translated declaration has
+  no `SVC_DEV`: the SDK registers inside the FastAPI lifespan and a 404 there is
+  a uvicorn startup failure, i.e. a crash loop. So the bring-up reloads with the
+  Layer-1 services deliberately left down and starts them only after
+  `create_identity`. And a service is stopped before its tree is re-staged,
+  because `stage()` swaps `<root>/repo` and the venv lives inside it. Both were
+  observed live when a manual restart put the services back up inside that
+  window: `RegistryError: register failed: 404` and
+  `ModuleNotFoundError: No module named 'fastapi.datastructures'`. T3.1's sync
+  loop needs the same two rules.
+
+- **`UidAllocator.allocate` now re-reads its state file on a cache miss.** The
+  harness constructs one allocator at start and keeps it; `ams provision` and the
+  platform bring-up allocate from a second process. Without the re-read the
+  harness re-carved blocks that another process had already staged files under,
+  and `ensure_service_root`'s recursive chown then ran in a namespace with no
+  authority over those files — EPERM on every one, and the service skipped. This
+  was **not** hypothetical: it is how the first live bring-up failed, and it
+  would have broken T3.1's `ams provision` → `ams ctl reload` loop identically.
+  The warm path is untouched (a known id never reaches the re-read). *Rejected:*
+  restarting the unit whenever a Layer-0 declaration changes — that defeats D17's
+  whole point. *Rejected:* having `layer0` predict the harness's numbers — it
+  moves the race rather than removing it. **Open / weak signal:** this narrows
+  the window, it does not close it. Two processes can still interleave
+  `allocate` → `_save`. The real answer is an allocation op on the control
+  socket, so the harness stays the single writer; Phase B.
+
+- **`StateDir.ensure()` treats 0750 as a floor, preserving a deliberate `o+x`.**
+  `ams.cli._ensure_traversable` adds `o+x` to `services/` so a service uid can
+  resolve its own workdir by path; `ensure()` runs from every entry point that
+  touches the state dir, including `ams.platform.bootstrap` *while services are
+  running*. Re-imposing exactly 0750 took the bit back and the next spawn of
+  every running service died with `PermissionError` on its own interpreter —
+  and `hello` began answering 404, which is what its two `HealthChanged`
+  escalations were. Only the execute bit survives, and only on a directory that
+  already existed; `o+r` is still never granted, so these directories stay
+  unlistable. *Rejected:* re-widening from `layer0` after calling `bootstrap` —
+  it fixes one caller and leaves the landmine armed for every future one.
+
+- **Both fixes are outside T3.2's named file scope** (`ams/uidmap.py`,
+  `ams/state.py`). Taken anyway: the alternative was a bring-up that only works
+  when nothing else is running, plus a defect that T3.1 would have rediscovered
+  from scratch. `cli.py` and `schema.py` were not touched (T3.1 owns the former),
+  and `bootstrap.py` needed no correction — Q4's env contract was right first
+  time.
+
+- **The M2M policy row was inserted by hand.** `service_policies` has no write
+  API upstream (by design: "managed out of band"), and production seeds it
+  through migrations. One row, `timeservice → kvservice`, was inserted into the
+  replica's `registry.db` through the admin namespace to make the token test
+  possible. Open: T4.1 needs a real answer for the fleet, and it is not obviously
+  ams's job — a policy is a statement about who may call whom, which is registry
+  data, not supervisor data (D7).
+
+### D26 (T3.1). Per-service change detection: the deployer's path-prefix rule, applied per commit range (2026-09-02)
+- **The problem.** `translate` injects `GIT_COMMIT=<sha>` into every declaration
+  (PLAN-allin Q2) and the harness restarts a service when its declaration's
+  content hash changes (D17). Translating all 21 manifests at the repo head
+  therefore rewrote all 21 `service.toml` files on *any* commit and restarted
+  the whole fleet -- 20 simultaneous uvicorn imports on one vCPU (Q8's named
+  risk) for a README typo.
+- **The fix: a service is translated at the sha it is already deployed at,
+  unless the commit range actually touched it.** `SourceMirror.changed_paths`
+  (new, T1.1's file) runs `git diff --name-only --no-renames <deployed> <head>`
+  against the bare mirror; a service is **affected** iff it has no deployed sha,
+  or the diff is unavailable, or any changed path is under its own manifest
+  directory or under a shared prefix. An unaffected service is translated at its
+  deployed sha, so its declaration is byte-identical, nothing is written, the
+  reload restarts nothing, and it is not re-staged, re-provisioned, re-registered
+  or re-probed. A docs-only commit is a whole-fleet no-op (tested).
+- **`--no-renames`** on the diff: with git's default rename detection a file
+  moved between two services' directories is reported under the destination
+  only, and the service that *lost* it would look unaffected. Listing both sides
+  cannot under-report.
+- **The rule is `changes.py`'s, and the shared-prefix set is where they differ.**
+  `api/components/deployer/src/deployer/changes.py` matches changed paths against
+  `apps/`/`services/` roots and fans out only on `shared/` -- it **removed**
+  `components/` as a shared prefix on 2026-07-02 because trust-root pushes
+  (registry/auth/sdk) restarted every service, and it can afford that because a
+  deploy rsyncs the whole work-tree onto the box, so a service picks up a new SDK
+  at its own next deploy. **ams cannot afford it**: each service has its own
+  `<root>/repo` copy, so an unaffected service keeps its old tree *entirely* and
+  would never see the new SDK until something else changed it. So the default is
+  `("shared/", "components/sdk/")` -- `shared/` verbatim from the deployer, plus
+  the one prefix whose staleness ams (and not the deployer) would silently keep.
+  `components/registry|auth|deployer` deliberately do **not** fan out, matching
+  the deployer's 2026-07-02 decision. The set is `SyncConfig.shared_prefixes`, so
+  reverting to the literal mirror is one argument, not a code change.
+  *(The task brief asked to "mirror changes.py's rule exactly" and also to treat
+  `components/sdk/` as fan-out; those two are not the same rule. This is the
+  reconciliation, and both halves are tested.)*
+- **`deployed_sha` is additive to the version-1 record**, alongside `sha` (the
+  commit the service is being *driven to*) and `prev_sha` (the last one that
+  reached `healthy`). The three genuinely differ: a service that failed at
+  `register` has `sha` = head, `deployed_sha` = head, `prev_sha` = the older
+  healthy commit; one that failed at `provision` has `deployed_sha` still at the
+  old tree. It is set when the declaration is confirmed on disk, and falls back
+  to the on-disk `.ams-sha` marker when absent, so a state file written before
+  this field existed (or restored from a backup) heals on the next tick instead
+  of redeploying the fleet. The version stays 1 because the shape only grew a
+  key and every reader (T3.3's `policy.py` included) reads records with `.get`.
+- **Two translate passes for a service that stays put**, rather than deriving the
+  id from the directory name. The affected check is keyed by the service id, and
+  the id only exists once the manifest parses; `translate` is pure and
+  sub-millisecond, so translating at the head and then re-translating at the
+  deployed sha is cheaper than the assumption that `name == dirname` -- which
+  nothing else in the module makes. A re-translate that somehow fails falls back
+  to the head rather than dropping the service.
+- *Rejected:* **dropping `GIT_COMMIT` from the declaration** (inject it at spawn
+  from `.ams-sha` instead). It removes the symptom and the signal together: the
+  declaration is the artifact an operator reads to answer "what commit is this
+  service running", and `ams validate` / a golden diff would no longer show a
+  deploy at all. It is also T1.2's field to remove, not this loop's.
+- *Rejected:* **masking it** -- comparing declarations modulo `GIT_COMMIT` and
+  writing the new file anyway. The file on disk would then disagree with the
+  running process about its own commit, and the next reload from any other source
+  (SIGHUP, an operator, another agent) would restart the service anyway, so the
+  suppression would hold only by luck.
+- *Rejected:* **content-hashing each service's subtree** instead of diffing
+  commits. It is strictly more work (hash 21 subtrees per tick vs one `git diff`)
+  and answers a narrower question -- it cannot see a shared-prefix change at all
+  without hashing those too, which is the fan-out case that matters most.

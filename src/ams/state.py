@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -102,10 +103,26 @@ class StateDir:
         service's mapped uid/gid, which only the isolation layer (running
         with the admin uid/gid map, see ``ams.uidmap.admin_map_args``) can
         set up correctly.
+
+        A directory this creates is exactly 0750. A directory that already
+        exists keeps an ``o+x`` bit someone put there on purpose:
+        ``ams.cli._ensure_traversable`` adds it to ``services/`` so a service
+        uid can resolve its own workdir by path, and ``ensure()`` runs from
+        every entry point that touches the state dir -- including
+        ``ams.platform.bootstrap``, which runs *while services are running*.
+        Re-imposing exactly 0750 there took the bit away again, and the next
+        spawn of every running service died with ``PermissionError`` on its own
+        interpreter. See `.claude/state/diagnosis-layer0.md` and DECISIONS D24.
+        Only ``o+x`` survives; ``o+r`` is never granted or preserved, so these
+        directories stay unlistable.
         """
         for d in (self.services_dir, self.runtime_state_dir, self.logs_dir):
+            existed = d.is_dir()
             d.mkdir(parents=True, exist_ok=True)
-            os.chmod(d, 0o750)  # mkdir's mode= is subject to umask; force it.
+            # mkdir's mode= is subject to the umask, so the mode is always set
+            # explicitly rather than passed to mkdir.
+            keep = stat.S_IXOTH if existed and (d.stat().st_mode & stat.S_IXOTH) else 0
+            os.chmod(d, 0o750 | keep)
 
     def list_service_ids(self) -> list[str]:
         """Sorted ids of service dirs that contain ``service.toml`` and whose

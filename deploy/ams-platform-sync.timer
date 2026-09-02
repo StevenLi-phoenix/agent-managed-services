@@ -1,0 +1,22 @@
+[Unit]
+Description=Run one ams platform sync tick every 60 seconds
+
+[Timer]
+# The 60 s poll of PLAN-allin Q1: a webhook would need an inbound port, a Caddy
+# route and an HMAC secret, and would run as a mapped uid that cannot open the
+# 0600 harness-only control socket. Polling buys the same latency for none of
+# that surface.
+OnBootSec=2min
+OnUnitActiveSec=60s
+# OnUnitActiveSec (not OnUnitInactiveSec) with AccuracySec=1s keeps the period
+# measured from the start of the last tick; a tick that runs long simply pushes
+# the next one out rather than stacking.
+AccuracySec=1s
+# Deliberately false: a missed tick is not worth catching up on. The next poll
+# is 60 s away and it re-derives everything from the repo state anyway, so a
+# host that was off has nothing to replay.
+Persistent=false
+Unit=ams-platform-sync.service
+
+[Install]
+WantedBy=timers.target

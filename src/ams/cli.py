@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any
 from ams.schema import DeclError, ServiceDecl, load
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, these are Linux-only imports
-    from ams.decision import Escalation
+    from ams.decision import DecisionPolicy, Escalation
     from ams.events import Event
     from ams.ports import PortAllocator
     from ams.spawn import Spawner
@@ -91,6 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="build each service's declared runtime before starting it",
     )
     p_run.add_argument("--escalate", choices=("jsonl", "null"), default="jsonl")
+    p_run.add_argument(
+        "--policy",
+        choices=("default", "platform"),
+        default="default",
+        help="decision policy: 'platform' adds cause dedupe, the post-sync health "
+        "gate and the Caddy/registry rules (ams.platform.policy)",
+    )
     p_run.add_argument("--log-level", default="INFO")
 
     p_prov = sub.add_parser("provision", help="build declared runtimes, then exit")
@@ -113,6 +120,13 @@ def build_parser() -> argparse.ArgumentParser:
     from ams.secrets import add_subparser as _add_secret_subparser
 
     _add_secret_subparser(sub)
+
+    # `ams platform sync|status|bootstrap`. Same pattern as `secret`: the
+    # replica platform's arguments and handlers live in ams.platform.cli so the
+    # supervisor core never imports the translation/gateway/registry layer.
+    from ams.platform.cli import add_subparser as _add_platform_subparser
+
+    _add_platform_subparser(sub)
     return parser
 
 
@@ -130,6 +144,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_provision(args)
     if args.command == "ctl":
         return cmd_ctl(args)
+    if args.command == "platform":
+        from ams.platform.cli import cmd_platform
+
+        return cmd_platform(args)
     if args.command == "check-host":
         return cmd_check_host()
     return EXIT_ERROR  # pragma: no cover - argparse enforces the choices
@@ -263,6 +281,7 @@ def build_supervisor(
     escalation: Escalation | None = None,
     provision: bool = False,
     reset_window_min_s: float | None = None,
+    policy: DecisionPolicy | None = None,
 ) -> Assembly:
     """Wire the state dir, allocators, spawner and supervisor into one loop.
 
@@ -329,6 +348,8 @@ def build_supervisor(
     extra_env_for = _extra_env_with_secrets(state, runtime_env_for)
 
     kwargs: dict[str, Any] = {"escalation": escalation, "extra_env_for": extra_env_for}
+    if policy is not None:
+        kwargs["policy"] = policy
     if reset_window_min_s is not None:
         kwargs["reset_window_min_s"] = reset_window_min_s
     sup = Supervisor(spawner, **kwargs)
@@ -570,12 +591,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         return EXIT_UNAVAILABLE
 
     escalation = JsonLinesEscalation() if args.escalate == "jsonl" else NullEscalation()
+    # Lazy, like every other optional layer here: `ams run` on a host without the
+    # platform package must still supervise.
+    platform_policy = None
+    if getattr(args, "policy", "default") == "platform":
+        from ams.platform.policy import make_policy
+
+        platform_policy = make_policy(state, escalation=escalation)
+        log.info("platform policy: cause dedupe, post-sync health gate, caddy/registry rules")
     try:
         asm = build_supervisor(
             state,
             isolation=not args.no_isolation,
             escalation=escalation,
             provision=args.provision,
+            policy=platform_policy,
         )
     except Unavailable as e:
         print(str(e), file=sys.stderr)
@@ -595,6 +625,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Removals are two-phase: reload() stops the service, this finishes the
         # drop once the process is actually gone (see ams.reload).
         drain_pending_removals(asm)
+        if platform_policy is not None:
+            # The policy's tick: close expired dedupe windows and run the
+            # post-sync health gate. It emits through `escalation` itself.
+            platform_policy.flush()
         summary(events)
 
     server = ControlServer(control_socket_path(state), asm.supervisor, reload_fn=on_reload)

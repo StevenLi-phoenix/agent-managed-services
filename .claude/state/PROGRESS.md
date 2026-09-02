@@ -675,3 +675,112 @@ Confidence: high on the static-publish mechanics (real Linux run, including
 the bun path). Medium on the overlay secret-name lists — each is a single
 2026-09-02 grep of one file per service; a future provider change in any of
 these five services needs its own re-check (flagged in DECISIONS.md).
+
+## T3.1 `ams platform sync` (2026-09-02)
+`src/ams/platform/sync.py` — one-shot tick: fetch → materialize → discover manifests
+(skipping `*.disabled`) → translate (with `service.ams.toml` extra secret names) →
+stage/`place_jwt_key`/provision → generate `SVC_SECRET` + write `service.toml` and both
+sidecars → **one** `ams ctl reload` → render the gateway from the mount sidecars on
+disk and `restart caddy` if it changed → registry identity + ACL → health gate. Progress
+is `<state>/platform/state.json` in the sidecar doc's shape; every failure is one
+`JsonLinesEscalation`-shaped record on stdout with `kind="PlatformSync"` and leaves the
+other services running. Plus `src/ams/platform/cli.py` (`ams platform sync|status|
+bootstrap`, wired into `ams.cli` with two edits) and `deploy/ams-platform-sync.{service,
+timer}` (oneshot, `OnBootSec=2min`/`OnUnitActiveSec=60s`, `Persistent=false`) — **not**
+installed on racknerd; T4.1 does that. See DECISIONS D24.
+
+Verified locally: `tests/test_platform_sync.py` **61 passed** (fake git repo with three
+commits, threaded fake registry that also answers the health probe, `stage`/`provision`/
+`place_jwt_key`/`ctl reload`/`ctl restart` recorded); whole suite **904 passed / 86
+skipped**; ruff clean on all four files. Covered transitions: fetched→…→healthy for two
+services, `declared` as the terminus for a static site, and a failure injected at fetch,
+translate, provision, register (403) and health — each leaving `stage="failed"` with an
+`error` naming the transition and exactly one escalation.
+
+T3.4 hooks wired (2026-09-02): `ams.platform.static.load_ams_overlay` is now the **only**
+`service.ams.toml` reader — sync's own copy was deleted — and both halves of it are used:
+`secrets` feeds `TranslateContext.extra_secret_names`, and `[env]` is folded into the
+declaration with `dataclasses.replace` (which re-runs `ServiceDecl.__post_init__`, so a
+name colliding with a declared secret raises `DeclError` at translate time, not at spawn).
+`publish_static` is a `kind: static` mount's `provisioned` step, called before the gateway
+render, allocating a uid block only when `mount["build"]` is non-empty. `DedupingEscalation`
+was **not** adopted — see DECISIONS D24.
+
+Unverified (n=0): **nothing here has run against a real harness, registry or repo.** The
+control socket, `SourceMirror.stage`, `place_jwt_key` and `runtime.provision` are all
+recorders in these tests; the live path is T3.2/T4.1. The 60 s timer's steady-state cost
+(one `git fetch`, no writes) is asserted in a test, not measured on racknerd. `publish_static`
+runs for real in these tests but only over a directory holding one file, on macOS, where
+`cp -a --reflink=auto` resolved to GNU coreutils — **no build step has ever executed**
+(the fixture's static manifest declares none).
+
+## T3.2 (live) — Layer-0 bring-up on racknerd (2026-09-02)
+Registry, auth and Caddy run as ams services under the live `ams-harness.service`
+beside hello/pyhello/kvservice/timeservice — **7 services, all `running`/healthy**.
+The two pilot services were re-pointed at the replica: translated from their
+manifests (no `SVC_DEV`), staged at upstream `main` `5ea3572`, registered in the
+replica registry, heartbeating (`last_seen` 11 s), gateway-routed at `/kv` and
+`/time`. Full transcript with every number: `.claude/state/platform-layer0.md`.
+
+`src/ams/platform/layer0.py` — `bring_up(state, store, repo_url=..., ref="main")`
+orchestrates 17 named stages (fetch → materialize → bootstrap → allocate →
+stage/keys/provision Layer 0 → stop/stage/translate/provision Layer 1 → gateway →
+reload → health → identities → start → health) and raises `Layer0Error(stage, …)`
+carrying the partial `Layer0Report`. Four ordering constraints are the deliverable
+and each is a test: identities before a Layer-1 start (no `SVC_DEV` ⇒ the SDK
+registers in the FastAPI lifespan and a 404 there is a uvicorn startup failure);
+uid block before the reload; fixed Caddy port 20180 because the entry site's own
+listen address is inside the Caddyfile; stop a service before re-staging the tree
+its venv lives in. `scripts/platform-bootstrap.sh` drives it.
+
+**Source: the local mirror path, not GitHub.** `StevenLi-phoenix/api` is private
+(`curl` → 404, `git ls-remote` → "could not read Username"), the harness holds no
+credential and none was made. The script pushes a bare mirror to
+`<store>/upstream/api.git` and points `SourceMirror` at that path — a shape
+`validate_url` already accepts. Phase A therefore runs upstream `main`, **without**
+the T1.4 SDK root-logger patch, so SDK `logger.warning` is still classified INFO.
+
+**The live gate found two real defects, both outside T3.2's nominal scope, both
+fixed** (diagnosis: `.claude/state/diagnosis-layer0.md`, DECISIONS D24):
+`UidAllocator.allocate` was not idempotent across processes (the harness never
+re-read `uidmap.json`, so a reload re-carved blocks another process had already
+staged files under — this would have broken T3.1's `ams provision` + `ams ctl
+reload` loop too); and `StateDir.ensure()` re-narrowed `services/` to 0750,
+removing the `o+x` `ams.cli._ensure_traversable` adds, which broke the next spawn
+of every running service with `PermissionError` on its own interpreter.
+`ams/uidmap.py` and `ams/state.py` were changed for these; `cli.py` and `schema.py`
+were not touched.
+
+**It is NOT PLAN-allin risk 4.** Registry and auth start rootless with data outside
+`/var/lib` on the first attempt; they were never executed until the harness would
+register them. Q4's env contract needed no correction — `bootstrap.py` is unchanged.
+
+Verified: local `tests/test_platform_layer0.py` 46 passed (call-sequence equality,
+failure injection at all 17 stages, the two ordering invariants, no secret in the
+report); `tests/test_uidmap.py` +3 and `tests/test_state.py` +1 regression tests;
+whole suite **897 passed / 86 skipped**; ruff clean on all changed files. Live:
+`ams ctl status` 7/7 running, `/kv/health` and `/time/now` 200 through Caddy on
+20180, registry `discover/{keyvalue,time}` 200, and a real RS256 M2M token minted
+by registry for `timeservice`→`kvservice` accepted by kvservice (204/200) where
+anonymous gets 401 and a tampered signature gets 401. 47 escalations in the window,
+all classified (§7 of the transcript): 7 Caddy start-up WARNINGs are noise for T3.3
+to suppress, the rest are real and caused by the manual repair restart.
+
+Memory: 553 → 710 MiB used (`free -m`), 157 MiB for the three new services; harness
+cgroup total 378.9 MiB for all seven. Registry 92.8 MiB and auth 94.8 MiB are
+**cold** numbers, n=1 — not planning constants.
+
+Open (n=0): auth's user-JWT path is untested (no health route, no OAuth, no account
+can exist); the gateway is loopback-only with no subdomain or static mount live;
+the registry's `endpoint` column still holds the production URL; the M2M policy row
+was inserted by hand because nothing seeds `service_policies` outside migrations.
+
+Per-service change detection added (2026-09-02, D26): `SourceMirror.changed_paths`
+(`git diff --name-only --no-renames`, 3 unit tests in `tests/test_platform_sources.py`)
+plus a `deployed_sha` on each record. A service is translated at the sha it is already
+deployed at unless the commit range touched its manifest directory or a shared prefix
+(`SyncConfig.shared_prefixes`, default `("shared/", "components/sdk/")`), so its
+declaration is byte-identical and nothing restarts it. A docs-only commit is now a
+whole-fleet no-op; a `components/sdk/` or `shared/` change fans out to everything;
+`components/registry` does not. This closes the "`GIT_COMMIT` restarts the fleet"
+finding recorded above.

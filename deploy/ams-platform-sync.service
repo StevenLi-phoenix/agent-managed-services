@@ -1,0 +1,44 @@
+[Unit]
+Description=ams platform: one sync tick (fetch, translate, provision, declare, reload, gate)
+Documentation=file:///home/harness/ams/src/ams/platform/sync.py
+# Not Requires=ams-harness.service: a tick that cannot reach the control socket
+# escalates one JSON line and leaves every record at its last reached stage, so
+# a harness that is down delays the fleet rather than failing the unit chain.
+# After= only, so a boot brings the harness up first when both are wanted.
+After=network-online.target ams-harness.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=harness
+Group=harness
+WorkingDirectory=/home/harness/ams
+# Same environment block as ams-harness.service. A drift between the two would
+# have the sync loop declare services into a different state dir than the one
+# the harness supervises, which is silent and total.
+Environment=HOME=/home/harness
+Environment=AMS_STATE_DIR=/home/harness/store/state
+Environment=AMS_STORE_DIR=/home/harness/store
+Environment=PYTHONPATH=/home/harness/ams/src
+Environment=PATH=/home/harness/venv/bin:/home/harness/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Interpreter path must match deploy/apparmor/ams-harness attachment glob: the
+# staging and provisioning steps create a user namespace (run_admin / provision)
+# and only this interpreter is allowed to.
+# Layer-0 ports are fixed, not allocated (D22, ams.platform.bootstrap.LAYER0_PORTS).
+ExecStart=/home/harness/venv/bin/python3 -m ams platform sync \
+    --repo https://github.com/StevenLi-phoenix/api \
+    --ref main \
+    --registry-url http://127.0.0.1:20100 \
+    --auth-url http://127.0.0.1:20101
+# One tick fetches, may run `uv sync` for several services and then waits on
+# each health gate. The per-step timeouts inside the job (git fetch, uv sync,
+# the health deadline) are all tighter; this is the outer backstop for a tick
+# that wedges somewhere none of them cover.
+TimeoutStartSec=1800
+# No Restart=: a failed tick is reported on stdout as JSON lines and retried by
+# the timer 60 s later. Restarting in a tight loop would re-run `git fetch` and
+# `uv sync` against a service that is failing for a reason a retry cannot fix.
+# Do NOT set NoNewPrivileges=yes or an empty CapabilityBoundingSet= here, for
+# the same reason as ams-harness.service: staging and provisioning exec the
+# setuid newuidmap/newgidmap helpers to write the admin uid map.
+NoNewPrivileges=no

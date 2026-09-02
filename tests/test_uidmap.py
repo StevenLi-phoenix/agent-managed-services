@@ -360,3 +360,55 @@ def _allocator_from_state(tmp_path: Path, state_path: Path) -> UidAllocator:
     uid_ranges = [SubidRange(100000, 65536)]
     gid_ranges = [SubidRange(100000, 65536)]
     return UidAllocator(uid_ranges, gid_ranges, state_path)
+
+
+def test_allocate_sees_a_block_another_process_carved_after_load(tmp_path: Path) -> None:
+    """The bug that broke the first live Layer-0 bring-up.
+
+    The harness holds one allocator for its whole lifetime; `ams provision` and
+    the platform bring-up allocate from a second process against the same file.
+    Before the fix, the long-lived instance answered from a cache read at
+    startup, carved a *different* block for an id the other process had already
+    staged files under, and `ensure_service_root`'s recursive chown then ran in a
+    namespace with no authority over those files. See
+    `.claude/state/diagnosis-layer0.md`.
+    """
+    state_path = tmp_path / "uidmap.json"
+    harness = _allocator_from_state(tmp_path, state_path)
+    harness.allocate("hello")  # the harness's view is now warm
+
+    other_process = _allocator_from_state(tmp_path, state_path)
+    theirs = other_process.allocate("registry")
+
+    assert harness.get("registry") is None, "precondition: the cache is stale"
+    assert harness.allocate("registry") == theirs
+
+
+def test_allocate_does_not_reuse_a_range_another_process_took(tmp_path: Path) -> None:
+    """The re-read must also inform the free-block search, or a brand-new id
+    gets handed a range that is already in use on disk."""
+    state_path = tmp_path / "uidmap.json"
+    harness = _allocator_from_state(tmp_path, state_path)
+    harness.allocate("hello")
+
+    other_process = _allocator_from_state(tmp_path, state_path)
+    taken = other_process.allocate("registry")
+
+    fresh = harness.allocate("caddy")
+    assert not _intervals_overlap(fresh.uid_start, fresh.size, taken.uid_start, taken.size)
+    assert not _intervals_overlap(fresh.gid_start, fresh.size, taken.gid_start, taken.size)
+
+
+def test_allocate_does_not_reread_for_a_known_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warm path stays free of I/O: every spawn calls allocate()."""
+    state_path = tmp_path / "uidmap.json"
+    alloc = _allocator_from_state(tmp_path, state_path)
+    first = alloc.allocate("hello")
+
+    def explode() -> None:
+        raise AssertionError("allocate() re-read state for an id it already knew")
+
+    monkeypatch.setattr(alloc, "_load", explode)
+    assert alloc.allocate("hello") == first

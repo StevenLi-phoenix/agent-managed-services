@@ -277,6 +277,45 @@ class SourceMirror:
         log.info("%s: %s -> %s", self.name, ref, sha)
         return sha
 
+    def changed_paths(
+        self, old_sha: str, new_sha: str, timeout_s: float = DEFAULT_FETCH_TIMEOUT_S
+    ) -> list[str]:
+        """Repo-relative paths that differ between two commits, sorted.
+
+        ``git diff --name-only <old> <new>`` against the bare mirror. This is
+        what lets the sync loop redeploy only the services a commit actually
+        touched (D26) instead of the whole fleet.
+
+        ``--no-renames`` on purpose: with rename detection (git's default since
+        2.9) a file moved from one service's directory to another's is reported
+        under the destination only, and the service that *lost* it would not be
+        seen as changed. Listing both sides costs nothing and cannot under-report.
+
+        Raises :class:`SourceError` if either commit is unknown to the mirror --
+        which is a real answer, not a detail to swallow: a caller that cannot
+        diff must treat every service as affected rather than assume none is.
+        """
+        old = _check_sha(old_sha)
+        new = _check_sha(new_sha)
+        if old == new:
+            return []
+        out = self._git(
+            [
+                "--git-dir",
+                str(self.mirror_dir),
+                "diff",
+                "--name-only",
+                "--no-renames",
+                old,
+                new,
+            ],
+            what=f"{self.name}: git diff {old[:12]}..{new[:12]}",
+            timeout_s=timeout_s,
+        )
+        paths = sorted({line.strip() for line in out.splitlines() if line.strip()})
+        log.info("%s: %s..%s touched %d path(s)", self.name, old[:12], new[:12], len(paths))
+        return paths
+
     # ------------------------------------------------------------- materialise
 
     def materialize(self, sha: str, *, timeout_s: float = DEFAULT_ARCHIVE_TIMEOUT_S) -> Path:
