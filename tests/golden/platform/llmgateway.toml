@@ -1,0 +1,47 @@
+id = "llmgateway"
+secrets = ["SVC_SECRET"]
+
+[start]
+argv = ["uvicorn", "llmgateway.main:build_app", "--factory", "--host", "127.0.0.1", "--port", "${PORT_main}"]
+workdir = "repo/services/llmgateway"
+
+[env]
+AUTH_URL = "http://127.0.0.1:19101"
+GIT_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+LLMGW_DB_PATH = "/home/harness/state/services/llmgateway/root/data/llmgateway.db"
+PORT = "${PORT_main}"
+REGISTRY_URL = "http://127.0.0.1:19100"
+SVC_AUDIENCE = "llmgateway"
+SVC_CAPABILITIES = "llm-gateway"
+SVC_HEALTH_PATH = "/health"
+SVC_M2M_PUBLIC_KEY_PATH = "/home/harness/state/services/llmgateway/root/etc/jwt-rs256.pub"
+SVC_NAME = "llmgateway"
+SVC_OWNER = "steven"
+SVC_ROOT_PATH = "/llm"
+
+[ports]
+main = 0
+
+[runtime]
+kind = "uv"
+python = "3.12"
+sync = true
+
+[health]
+kind = "http"
+port = "main"
+path = "/health"
+start_period_s = 120.0
+
+[stop]
+signal = "SIGTERM"
+timeout_s = 10.0
+
+[limits]
+memory_max = "150M"
+cpu_max = "40%"
+pids_max = 64
+
+[restart]
+policy = "on-failure"
+backoff_s = 5.0

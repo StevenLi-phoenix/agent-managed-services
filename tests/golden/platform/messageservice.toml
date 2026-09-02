@@ -1,0 +1,47 @@
+id = "messageservice"
+secrets = ["SVC_SECRET"]
+
+[start]
+argv = ["uvicorn", "messageservice.main:build_app", "--factory", "--host", "127.0.0.1", "--port", "${PORT_main}"]
+workdir = "repo/services/messageservice"
+
+[env]
+AUTH_URL = "http://127.0.0.1:19101"
+GIT_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+MESSAGE_DB_PATH = "/home/harness/state/services/messageservice/root/data/messageservice.db"
+PORT = "${PORT_main}"
+REGISTRY_URL = "http://127.0.0.1:19100"
+SVC_AUDIENCE = "messageservice"
+SVC_CAPABILITIES = "messages,notify"
+SVC_HEALTH_PATH = "/health"
+SVC_M2M_PUBLIC_KEY_PATH = "/home/harness/state/services/messageservice/root/etc/jwt-rs256.pub"
+SVC_NAME = "messageservice"
+SVC_OWNER = "lishuyu"
+SVC_ROOT_PATH = "/message"
+
+[ports]
+main = 0
+
+[runtime]
+kind = "uv"
+python = "3.12"
+sync = true
+
+[health]
+kind = "http"
+port = "main"
+path = "/health"
+start_period_s = 120.0
+
+[stop]
+signal = "SIGTERM"
+timeout_s = 10.0
+
+[limits]
+memory_max = "120M"
+cpu_max = "40%"
+pids_max = 64
+
+[restart]
+policy = "on-failure"
+backoff_s = 5.0

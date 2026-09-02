@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "id": "locationservice",
+  "audience": "locationservice",
+  "display_name": "Location Service",
+  "owner": "lishuyu",
+  "capabilities": [
+    "location",
+    "gps",
+    "tracking"
+  ],
+  "health_path": "/health",
+  "acl": [
+    {
+      "action": "read",
+      "principal": "user:*",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "user:*",
+      "effect": "allow"
+    },
+    {
+      "action": "read",
+      "principal": "admin",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "admin",
+      "effect": "allow"
+    }
+  ]
+}

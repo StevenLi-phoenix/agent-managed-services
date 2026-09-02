@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "id": "files-web",
+  "kind": "static",
+  "gateway": "file.lishuyu.app",
+  "path": null,
+  "subdomain": "file",
+  "port_name": null,
+  "static_root": "files-web",
+  "build": [
+    "bun install",
+    "bun run build",
+    "find . -mindepth 1 -maxdepth 1 ! -name dist -exec rm -rf {} +",
+    "cp -a dist/. .",
+    "rm -rf dist"
+  ],
+  "headers": {}
+}

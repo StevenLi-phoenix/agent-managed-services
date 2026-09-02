@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "displayservice",
+  "kind": "service",
+  "gateway": "display.lishuyu.app",
+  "path": null,
+  "subdomain": "display",
+  "port_name": "main",
+  "static_root": null,
+  "build": [],
+  "headers": {}
+}

@@ -619,7 +619,7 @@ class Supervisor:
         buf.extend(tail)
 
     def _emit_line(self, st: ServiceState, stream: Stream, raw: bytes) -> None:
-        line = LogLine.from_raw(st.id, stream, raw)
+        line = LogLine.from_raw(st.id, stream, raw, st.decl.logging.format)
         if st.monitor is not None and st.monitor.observe_log(line.text):
             self._set_health(st, True, f"log pattern {st.decl.health.pattern!r} matched")
         self._emit(line, st)
@@ -669,6 +669,10 @@ class Supervisor:
         st.healthy = None
         if st.monitor is not None:
             st.monitor.stop()
+        # The only place operator intent is known: stop()/kill()/shutdown set
+        # desired="down", and the stop half of restart()/reload sets
+        # restart_pending. Carried on the event so downstream policies do not
+        # have to re-derive it from supervisor state they cannot see.
         expected = st.desired == "down" or st.restart_pending
         ok = exit_code == 0
         if not expected and uptime >= max(self._reset_window_min_s, st.decl.health.start_period_s):
@@ -692,7 +696,7 @@ class Supervisor:
             uptime,
             st.consecutive_failures,
         )
-        self._emit(ServiceExited(st.id, pid, exit_code, signum, uptime), st)
+        self._emit(ServiceExited(st.id, pid, exit_code, signum, uptime, expected=expected), st)
         if st.restart_pending:
             # operator-initiated restart wins over whatever the policy decided
             st.restart_pending = False

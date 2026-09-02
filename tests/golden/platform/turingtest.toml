@@ -1,0 +1,55 @@
+id = "turingtest"
+name = "Turing Test"
+secrets = ["SVC_SECRET"]
+
+[start]
+argv = ["uvicorn", "turingtest.main:build_app", "--factory", "--host", "127.0.0.1", "--port", "${PORT_main}"]
+workdir = "repo/apps/turingtest"
+
+[env]
+AUTH_URL = "http://127.0.0.1:19101"
+BOT_LLM_API_BASE = "https://api.deepseek.com"
+BOT_LLM_MODEL = "deepseek-chat"
+GIT_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+PORT = "${PORT_main}"
+REGISTRY_URL = "http://127.0.0.1:19100"
+SVC_AUDIENCE = "turingtest"
+SVC_CAPABILITIES = "game,chat,turingtest"
+SVC_DISPLAY_NAME = "Turing Test"
+SVC_ENDPOINT = "https://turning-test.lishuyu.app"
+SVC_HEALTH_PATH = "/health"
+SVC_M2M_PUBLIC_KEY_PATH = "/home/harness/state/services/turingtest/root/etc/jwt-rs256.pub"
+SVC_NAME = "turingtest"
+SVC_OWNER = "lishuyu"
+TT_BOT_WAIT_MAX_SEC = "20"
+TT_BOT_WAIT_MIN_SEC = "12"
+TT_MATCH_DURATION_SEC = "300"
+TT_WARMUP_SEC = "30"
+TURINGTEST_DB_PATH = "/home/harness/state/services/turingtest/root/data/turingtest.db"
+
+[ports]
+main = 0
+
+[runtime]
+kind = "uv"
+python = "3.12"
+sync = true
+
+[health]
+kind = "http"
+port = "main"
+path = "/health"
+start_period_s = 120.0
+
+[stop]
+signal = "SIGTERM"
+timeout_s = 10.0
+
+[limits]
+memory_max = "250M"
+cpu_max = "40%"
+pids_max = 64
+
+[restart]
+policy = "on-failure"
+backoff_s = 5.0

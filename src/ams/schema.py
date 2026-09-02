@@ -24,6 +24,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
+# ams.events imports nothing from this module (and nothing else from ams), so
+# the log-format Literal lives there with the classifier that implements it and
+# is re-used here rather than restated.
+from ams.events import LogFormat
+
 SERVICE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 PORT_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,15}$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -127,6 +132,19 @@ class LimitsSpec:
 
 
 @dataclass(frozen=True)
+class LoggingSpec:
+    """How this service marks the severity of a log line.
+
+    A level the process never printed cannot be recovered by any heuristic, so
+    the honest fix is at the source (the api SDK configures a level prefix).
+    This hint exists for the processes we do not own -- Caddy logs JSON -- and
+    for turning the guessing off entirely (``plain``).
+    """
+
+    format: LogFormat = "auto"
+
+
+@dataclass(frozen=True)
 class RestartSpec:
     policy: RestartPolicy = "on-failure"
     max_retries: int = 5  # consecutive failures before giving up (= N starts, not N+1)
@@ -148,6 +166,7 @@ class ServiceDecl:
     stop: StopSpec = StopSpec()
     limits: LimitsSpec = LimitsSpec()
     restart: RestartSpec = RestartSpec()
+    logging: LoggingSpec = LoggingSpec()
     # Names of secrets the harness injects into the environment at spawn. Values
     # live in the harness-private secret store (`ams secret set`), never here.
     secrets: tuple[str, ...] = ()
@@ -252,6 +271,7 @@ _NESTED = {
     "stop": StopSpec,
     "limits": LimitsSpec,
     "restart": RestartSpec,
+    "logging": LoggingSpec,
 }
 
 
@@ -403,6 +423,9 @@ def validate(d: ServiceDecl) -> None:  # noqa: C901 - one flat checklist is clea
         raise _err("limits.cpu_max", str(e)) from None
     if lim.pids_max is not None and lim.pids_max < 1:
         raise _err("limits.pids_max", "must be >= 1")
+
+    if d.logging.format not in get_args(LogFormat):
+        raise _err("logging.format", f"{d.logging.format!r} not one of {list(get_args(LogFormat))}")
 
     r = d.restart
     if r.policy not in ("always", "on-failure", "never"):

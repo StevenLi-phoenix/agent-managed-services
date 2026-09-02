@@ -54,7 +54,29 @@ policy = "on-failure"         # always | on-failure | never
 max_retries = 5               # consecutive failures before giving up = at most 5 starts (escalated)
 backoff_s = 1
 backoff_max_s = 60
+
+[logging]
+format = "auto"               # auto | level-prefix | json | plain
 ```
+
+## Log severity (`[logging] format`)
+
+Every line a service writes is classified before the policy sees it. A level the
+process never printed cannot be recovered by any heuristic, so this hint tells
+the harness how *this* service marks severity:
+
+| value | what is read |
+|---|---|
+| `level-prefix` | a leading `LEVEL name:` token (`%(levelname)s %(name)s: %(message)s`), case-insensitive |
+| `json` | `level` or `severity` from the line parsed as one JSON object (Caddy's `debug\|info\|warn\|error\|panic\|fatal` included) |
+| `plain` | text heuristics only (`ERROR`, `Traceback`, `WARNING`, …) |
+| `auto` (default) | level prefix, then JSON, then the heuristics |
+
+A stated level always beats the message body: an `INFO` line whose text contains
+the word `ERROR` stays INFO. A line that carries no level at all (a traceback
+body, a framework banner printed before logging was configured) falls back to
+the heuristics rather than being silently downgraded. Only `level`/`severity`
+are ever read out of a JSON line; the rest of the object is data.
 
 ## Runtime contract for the service process
 
@@ -65,8 +87,19 @@ backoff_max_s = 60
 - `PORT_<name>` is exported for every declared port; `${PORT_<name>}` is
   expanded in `argv` and `env` values.
 - `AMS_SERVICE_ID` is exported.
+- `AMS_DATA_DIR` = `<service root>/data`, created before every start, mode 0750
+  and owned by the service uid. It is the **only** directory a service should
+  treat as persistent: put databases, uploads and caches there. A re-provision
+  rewrites the runtime and the source tree; `data/` is left alone. The harness
+  uid cannot read it (that is the point), so anything that has to touch it from
+  the outside — the backup job, for instance — goes through the admin
+  namespace.
 - stdout/stderr are pipes held by the harness. Lines longer than 64 KiB are
   truncated. Write logs to stderr; do not daemonize.
+- The harness's own health probe is not noise: an access-log line for
+  `health.path` from `127.0.0.1` answering 2xx/3xx is dropped by
+  `DefaultPolicy` (`suppress_self_probes=False` turns that off). A 500 on the
+  same path is kept.
 
 ## Secrets
 

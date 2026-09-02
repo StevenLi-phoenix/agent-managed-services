@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "id": "emailservice",
+  "audience": "emailservice",
+  "display_name": null,
+  "owner": "lishuyu",
+  "capabilities": [
+    "email",
+    "notify"
+  ],
+  "health_path": "/health",
+  "acl": [
+    {
+      "action": "read",
+      "principal": "service:*",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "service:*",
+      "effect": "allow"
+    },
+    {
+      "action": "read",
+      "principal": "admin",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "admin",
+      "effect": "allow"
+    }
+  ]
+}

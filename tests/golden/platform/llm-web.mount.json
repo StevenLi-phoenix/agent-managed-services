@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "id": "llm-web",
+  "kind": "static",
+  "gateway": "llm.lishuyu.app",
+  "path": null,
+  "subdomain": "llm",
+  "port_name": null,
+  "static_root": "llm-web",
+  "build": [
+    "rm -f service.yaml README.md lib.test.js package.json"
+  ],
+  "headers": {}
+}

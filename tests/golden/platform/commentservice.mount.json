@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "commentservice",
+  "kind": "service",
+  "gateway": "api.lishuyu.app",
+  "path": "/comments",
+  "subdomain": null,
+  "port_name": "main",
+  "static_root": null,
+  "build": [],
+  "headers": {}
+}

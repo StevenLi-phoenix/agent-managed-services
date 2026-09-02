@@ -1,0 +1,46 @@
+schema_version: 1
+kind: service
+name: emailservice
+audience: emailservice
+owner: lishuyu
+
+deploy:
+  source:
+    type: git
+    repo: StevenLi-phoenix/api
+    branch: main
+  install:
+    - cd services/emailservice && /usr/local/bin/uv sync
+  target_dir: /srv/emailservice
+  user: emailservice
+
+process:
+  exec: /srv/emailservice/services/emailservice/.venv/bin/uvicorn emailservice.main:build_app --factory --host 127.0.0.1 --port ${PORT}
+  working_dir: /srv/emailservice/services/emailservice
+  environment:
+    SVC_ROOT_PATH: /email
+    EMAIL_DB_PATH: /var/lib/emailservice/emailservice.db
+    EMAIL_PROVIDER: resend
+    # EMAIL_FROM lives in /etc/emailservice/env (EnvironmentFile), not here.
+    # The deployer's Environment= lines now quote multi-word values fine
+    # (issue #60 fix), so this is a placement choice, not a workaround.
+    # SVC_M2M_PUBLIC_KEY_PATH is injected by the deployer unit template for
+    # every service.
+  restart: on-failure
+  restart_sec: 5
+  memory_max: 100M
+
+mount:
+  gateway: api.lishuyu.app
+  path: /email
+  port: 9212
+
+acl:
+  - {action: read,  principal: "service:*", effect: allow}
+  - {action: write, principal: "service:*", effect: allow}
+  - {action: read,  principal: admin,       effect: allow}
+  - {action: write, principal: admin,       effect: allow}
+
+registry:
+  capabilities: [email, notify]
+  health_path: /health

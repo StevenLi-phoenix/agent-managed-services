@@ -1,0 +1,49 @@
+schema_version: 1
+kind: service
+name: llmgateway
+audience: llmgateway
+owner: steven
+
+deploy:
+  source:
+    type: git
+    repo: StevenLi-phoenix/api
+    branch: main
+  install:
+    - cd services/llmgateway && /usr/local/bin/uv sync
+  target_dir: /srv/llmgateway
+  user: llmgateway
+
+process:
+  exec: /srv/llmgateway/services/llmgateway/.venv/bin/uvicorn llmgateway.main:build_app --factory --host 127.0.0.1 --port ${PORT}
+  working_dir: /srv/llmgateway/services/llmgateway
+  environment:
+    SVC_ROOT_PATH: /llm
+    LLMGW_DB_PATH: /var/lib/llmgateway/llmgateway.db
+  restart: on-failure
+  restart_sec: 5
+
+# Upstream provider keys (LLMGW_ANTHROPIC_API_KEY / LLMGW_OPENAI_API_KEY /
+# LLMGW_DEEPSEEK_API_KEY) are hand-added to /etc/llmgateway/env — same
+# convention as wechatservice's appid/secret. A provider with no key set is
+# simply not routable (404 model_not_found), so partial config is fine.
+
+# API backend -> path mount on the API gateway. The human-facing display
+# page lives separately at llm.lishuyu.app (apps/llm-web, kind: static) —
+# user decision on issue #80: backend on api.lishuyu.app, frontend on the
+# subdomain.
+mount:
+  gateway: api.lishuyu.app
+  path: /llm
+  port: 9219
+
+# The /v1/* proxy surface authenticates with gateway-issued keys (llmgw_...),
+# not platform principals — so no anon/user ACL rules here. The /api/* admin
+# surface is @require_admin (platform PAT/JWT).
+acl:
+  - {action: read,  principal: admin, effect: allow}
+  - {action: write, principal: admin, effect: allow}
+
+registry:
+  capabilities: [llm-gateway]
+  health_path: /health

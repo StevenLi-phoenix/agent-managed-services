@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -62,23 +63,65 @@ class Escalation(Protocol):
     def escalate(self, event: Event, decision: Decision, ctx: ServiceContext) -> None: ...
 
 
+# One HTTP access-log line, in the two shapes the services we supervise emit:
+#   uvicorn:     INFO:     127.0.0.1:54312 - "GET /health HTTP/1.1" 200 OK
+#   http.server: 127.0.0.1 - - [02/Sep/2026 10:11:12] "GET /health HTTP/1.1" 200 -
+# Anchored on the loopback address so a request from anywhere else never matches.
+_LOOPBACK_ACCESS_RE = re.compile(
+    r"\b127\.0\.0\.1(?::\d+)?\s+-\s+(?:-\s+)?(?:\[[^\]]*\]\s+)?"
+    r'"(?P<method>GET|HEAD)\s+(?P<path>\S+)\s+HTTP/\d(?:\.\d)?"\s+(?P<status>\d{3})'
+)
+
+
+def is_self_probe(event: LogLine, ctx: ServiceContext) -> bool:
+    """True for an access-log line produced by the harness's own health probe.
+
+    Narrow on purpose: the request must come from loopback, use GET/HEAD, hit
+    exactly the declared ``health.path`` and have answered 2xx/3xx. A 500 on the
+    health path is the single most interesting line the service can emit and is
+    never suppressed.
+
+    This is noise control, not a security boundary: the log text is written by
+    the service, so a service could forge a line to have it dropped -- but a
+    service that wants to hide output can simply not print it.
+    """
+    health = ctx.decl.health
+    if health.kind != "http":
+        return False
+    m = _LOOPBACK_ACCESS_RE.search(event.text)
+    if m is None:
+        return False
+    if m.group("path").split("?", 1)[0] != health.path:
+        return False
+    return 200 <= int(m.group("status")) < 400
+
+
 @dataclass
 class DefaultPolicy:
     """Rule-based stub.
 
     - Log lines at or above ``escalate_at`` are escalated, the rest are logged.
-    - Service exits follow the declaration's restart policy (RESTART or STOP).
-      The supervisor escalates terminal states (retry exhaustion, stop after a
-      crash) itself, so the agent always sees them regardless of the policy.
+    - The harness's own health-probe access lines are dropped entirely
+      (``suppress_self_probes``): the probe interval otherwise makes every HTTP
+      service a steady log source that says nothing the ``HealthChanged`` events
+      do not already say.
+    - Service exits follow the declaration's restart policy (RESTART or STOP),
+      except an ``expected`` one -- an exit the harness asked for is a fact to
+      record, not a decision to make. The supervisor escalates terminal states
+      (retry exhaustion, stop after a crash) itself, so the agent always sees
+      them regardless of the policy.
     - Everything else is logged.
     """
 
     escalate_at: Severity = Severity.WARNING
+    suppress_self_probes: bool = True
 
     def decide(self, event: Event, ctx: ServiceContext) -> Decision:
         if isinstance(event, ServiceExited):
             return self._decide_exit(event, ctx)
         if isinstance(event, LogLine):
+            if self.suppress_self_probes and is_self_probe(event, ctx):
+                return Decision(Action.SUPPRESS, "harness health probe access log")
             if event.severity >= self.escalate_at:
                 return Decision(Action.ESCALATE, f"{event.severity.name} on {event.stream}")
             return Decision(Action.LOG)
@@ -88,6 +131,14 @@ class DefaultPolicy:
 
     @staticmethod
     def _decide_exit(event: ServiceExited, ctx: ServiceContext) -> Decision:
+        if event.expected:
+            # stop / kill / shutdown / the stop half of a restart. The
+            # supervisor already knows what happens next (``desired`` and
+            # ``restart_pending``), and it ignores a policy RESTART for a
+            # service an operator stopped anyway. Returning LOG keeps a routine
+            # reload out of the escalation channel for policies that escalate
+            # exits, without touching the unexpected-exit path below.
+            return Decision(Action.LOG, "expected exit (harness-initiated)")
         policy = ctx.decl.restart
         if policy.policy == "never":
             return Decision(Action.STOP, "restart.policy=never")

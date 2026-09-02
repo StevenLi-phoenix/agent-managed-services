@@ -7,13 +7,16 @@ input: this module only classifies text, it never interprets it as commands.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Literal
+from typing import Any, Literal
 
 Stream = Literal["stdout", "stderr"]
+# Per-declaration hint (``[logging] format``) for how a service marks severity.
+LogFormat = Literal["auto", "level-prefix", "json", "plain"]
 
 
 class Severity(IntEnum):
@@ -38,17 +41,98 @@ _SEVERITY_PATTERNS: tuple[tuple[re.Pattern[str], Severity], ...] = (
 )
 
 
-def classify(text: str, stream: Stream) -> Severity:
-    """Heuristic severity of one log line.
+# Level names a service may use, mapped to our five. Everything is matched
+# case-insensitively; the keys below are the union of the Python logging names
+# and Caddy's (debug|info|warn|error|panic|fatal).
+_LEVEL_NAMES: dict[str, Severity] = {
+    "DEBUG": Severity.DEBUG,
+    "TRACE": Severity.DEBUG,
+    "INFO": Severity.INFO,
+    "NOTICE": Severity.INFO,
+    "WARN": Severity.WARNING,
+    "WARNING": Severity.WARNING,
+    "ERROR": Severity.ERROR,
+    "ERR": Severity.ERROR,
+    "CRITICAL": Severity.CRITICAL,
+    "FATAL": Severity.CRITICAL,
+    "PANIC": Severity.CRITICAL,
+}
 
-    Deliberately conservative: an unknown line on stderr is INFO, not WARNING,
-    because most servers log everything to stderr. Only explicit markers raise
-    the level. The decision policy can always re-classify.
-    """
+# `%(levelname)s %(name)s: %(message)s` -- what the api SDK's basicConfig emits.
+# The logger name must be there: without it "ERROR: connection refused" would be
+# read as a level token, which is the heuristics' job, not this one's.
+_LEVEL_PREFIX_RE = re.compile(
+    r"^(?P<level>[A-Za-z]+)[ \t]+(?P<name>[^\s:]+):",
+)
+# JSON is only *considered* for a line that already looks like an object.
+_JSON_START_RE = re.compile(r"^\s*\{")
+# The severity keys we are willing to read out of a JSON log line. Nothing else
+# in the object is ever interpreted (D: the object is attacker-influenced data).
+_JSON_LEVEL_KEYS = ("level", "severity")
+
+
+def _heuristic(text: str) -> Severity:
     for pattern, sev in _SEVERITY_PATTERNS:
         if pattern.search(text):
             return sev
     return Severity.INFO
+
+
+def _from_level_prefix(text: str) -> Severity | None:
+    m = _LEVEL_PREFIX_RE.match(text)
+    if m is None:
+        return None
+    return _LEVEL_NAMES.get(m.group("level").upper())
+
+
+def _from_json(text: str) -> Severity | None:
+    """Severity of a structured log line, or None if there is nothing to trust.
+
+    The line is data: it is parsed with ``json.loads`` (which executes nothing)
+    and only ``level``/``severity`` are read. A malformed line, a non-object, a
+    missing key or an unknown level name all mean "no answer", never a guess.
+    """
+    if not _JSON_START_RE.match(text):
+        return None
+    try:
+        obj: Any = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    for key in _JSON_LEVEL_KEYS:
+        value = obj.get(key)
+        if isinstance(value, str):
+            sev = _LEVEL_NAMES.get(value.strip().upper())
+            if sev is not None:
+                return sev
+    return None
+
+
+def classify(text: str, stream: Stream, fmt: LogFormat = "auto") -> Severity:
+    """Severity of one log line, given the declaration's ``[logging] format``.
+
+    - ``level-prefix``/``json``: read the level the service itself printed, and
+      fall back to the heuristics only when the line does not carry one (a
+      traceback body, a framework banner printed before logging was configured).
+      A level the service stated wins over anything in the message text, which
+      is the whole point: an INFO line quoting the word "ERROR" is INFO.
+    - ``plain``: heuristics only.
+    - ``auto``: level prefix, then JSON, then heuristics.
+
+    The heuristics are deliberately conservative: an unknown line on stderr is
+    INFO, not WARNING, because most servers log everything to stderr. The
+    decision policy can always re-classify.
+    """
+    if fmt in ("auto", "level-prefix"):
+        sev = _from_level_prefix(text)
+        if sev is not None:
+            return sev
+    if fmt in ("auto", "json"):
+        sev = _from_json(text)
+        if sev is not None:
+            return sev
+    return _heuristic(text)
 
 
 MAX_LINE_BYTES = 64 * 1024
@@ -64,10 +148,12 @@ class LogLine:
     truncated: bool = False
 
     @classmethod
-    def from_raw(cls, service_id: str, stream: Stream, raw: bytes) -> LogLine:
+    def from_raw(
+        cls, service_id: str, stream: Stream, raw: bytes, fmt: LogFormat = "auto"
+    ) -> LogLine:
         truncated = len(raw) > MAX_LINE_BYTES
         text = raw[:MAX_LINE_BYTES].decode("utf-8", errors="replace").rstrip("\r\n")
-        return cls(service_id, stream, text, classify(text, stream), truncated=truncated)
+        return cls(service_id, stream, text, classify(text, stream, fmt), truncated=truncated)
 
 
 @dataclass(frozen=True)
@@ -85,6 +171,11 @@ class ServiceExited:
     exit_code: int | None  # None when killed by a signal
     signal: int | None  # None on normal exit
     uptime_s: float
+    # True when this exit follows something the harness asked for: stop(),
+    # kill(), shutdown, or the stop half of a restart/reload. Set by the
+    # supervisor, which is the only component that knows operator intent -- an
+    # exit code of 143 looks identical to a crash from the outside.
+    expected: bool = False
     ts: float = field(default_factory=time.time)
 
     @property
@@ -93,7 +184,7 @@ class ServiceExited:
 
     @property
     def severity(self) -> Severity:
-        return Severity.INFO if self.ok else Severity.ERROR
+        return Severity.INFO if (self.ok or self.expected) else Severity.ERROR
 
 
 @dataclass(frozen=True)

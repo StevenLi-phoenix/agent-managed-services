@@ -219,3 +219,19 @@ def test_load_from_file(tmp_path):
     p = tmp_path / "service.toml"
     p.write_text(MINIMAL)
     assert schema.load(p).id == "demo"
+
+
+def test_logging_format_defaults_to_auto_and_accepts_the_four_hints():
+    assert loads(MINIMAL).logging.format == "auto"
+    for fmt in ("auto", "level-prefix", "json", "plain"):
+        d = loads(MINIMAL + f'[logging]\nformat = "{fmt}"\n')
+        assert d.logging.format == fmt
+
+
+def test_logging_format_rejects_unknown_values_and_keys():
+    with pytest.raises(DeclError) as bad_format:
+        loads(MINIMAL + '[logging]\nformat = "syslog"\n')
+    assert "logging.format" in str(bad_format.value)
+    with pytest.raises(DeclError) as bad_key:
+        loads(MINIMAL + "[logging]\nlevel = 3\n")
+    assert "logging" in str(bad_key.value)

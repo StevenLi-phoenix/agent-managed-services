@@ -91,3 +91,24 @@ def test_plain_spawner_leaks_no_fds_on_failed_spawn(tmp_path):
         with pytest.raises(OSError):
             spawner.spawn(SpawnRequest(d, tmp_path, {}))
     assert len(os.listdir("/dev/fd")) == before
+
+
+def test_spawn_request_exports_the_data_dir(tmp_path):
+    d = loads('id="svc"\n[start]\nargv=["prog"]')
+    env = SpawnRequest(d, tmp_path, {}).env()
+    assert env["AMS_DATA_DIR"] == str(tmp_path / "data")
+
+
+def test_plain_spawner_creates_a_writable_data_dir(tmp_path):
+    code = (
+        "import os, pathlib; p = pathlib.Path(os.environ['AMS_DATA_DIR']) / 'f'; "
+        "p.write_text('ok'); print(p)"
+    )
+    d = loads(f'id="svc"\n[start]\nargv=["{sys.executable}", "-c", "{code}"]')
+    spawner = PlainSpawner()
+    svc = spawner.spawn(SpawnRequest(d, tmp_path, {}))
+    out = _read_all(svc.stdout_fd)
+    os.waitpid(svc.pid, 0)
+    spawner.cleanup(svc)
+    assert out.strip() == str(tmp_path / "data" / "f").encode()
+    assert (tmp_path / "data" / "f").read_text() == "ok"

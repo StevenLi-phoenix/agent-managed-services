@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-from ams.spawn import INNER_GID, INNER_UID
+from ams.spawn import DATA_DIRNAME, INNER_GID, INNER_UID
 from ams.uidmap import UidBlock
 
 log = logging.getLogger("ams.userns")
@@ -396,6 +396,12 @@ def ensure_service_root(
 ) -> None:
     """Create the service root (and ``subdirs``) and give it to the service uid.
 
+    ``<root>/data`` (``AMS_DATA_DIR``) is always part of the root: it is the one
+    directory a service may treat as persistent, so it must exist before the
+    first start rather than after the first service learns to mkdir it. Mode
+    0750 -- inside the namespace only the service uid exists, and on the host it
+    keeps a service's databases out of a `find`-able world-readable tree.
+
     The harness can only create the top directory: once it is chowned to the
     block, the harness has no write access to it, so everything below is made
     through the admin namespace.
@@ -419,6 +425,23 @@ def ensure_service_root(
     if created:
         root.mkdir(parents=True, mode=0o755)
         log.info("created service root %s", root)
+    # While the root is still ours the data dir costs no fork; the admin ns is
+    # only needed for an existing root that has already been handed over (an
+    # upgrade of a service created before AMS_DATA_DIR existed). Doing it the
+    # cheap way keeps the "warm path forks nothing" invariant intact.
+    data_dir = root / DATA_DIRNAME
+    made_data = not data_dir.exists()
+    if made_data:
+        if os.stat(root).st_uid == (os.getuid() if harness_uid is None else harness_uid):
+            data_dir.mkdir(mode=0o750)
+            data_dir.chmod(0o750)  # mkdir's mode is masked by the umask
+        else:
+            run_admin(
+                ["mkdir", "-m", "750", "-p", str(data_dir)],
+                block,
+                harness_uid=harness_uid,
+                harness_gid=harness_gid,
+            ).check()
     # Made through the admin ns as inner root, so they land on the harness uid
     # and always need the chown below.
     missing = [str(p) for p in subdirs if not Path(p).exists()]
@@ -431,7 +454,7 @@ def ensure_service_root(
         ).check()
 
     owner = os.stat(root).st_uid
-    if created or missing or owner != block.uid_start:
+    if created or made_data or missing or owner != block.uid_start:
         run_admin(
             ["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(root)],
             block,

@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "id": "files",
+  "audience": "files",
+  "display_name": "Files Service",
+  "owner": "steven",
+  "capabilities": [
+    "filestorage"
+  ],
+  "health_path": "/health",
+  "acl": [
+    {
+      "action": "read",
+      "principal": "anon",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "anon",
+      "effect": "allow"
+    },
+    {
+      "action": "read",
+      "principal": "user:*",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "user:*",
+      "effect": "allow"
+    },
+    {
+      "action": "read",
+      "principal": "admin",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "admin",
+      "effect": "allow"
+    }
+  ]
+}

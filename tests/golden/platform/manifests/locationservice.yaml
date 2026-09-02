@@ -1,0 +1,51 @@
+schema_version: 1
+
+name: locationservice
+display_name: Location Service
+audience: locationservice
+owner: lishuyu
+
+deploy:
+  source:
+    type: git
+    repo: StevenLi-phoenix/api
+    branch: main
+    # No `path:` — stage rsyncs the whole monorepo into target_dir so
+    # apps/locationservice/pyproject.toml's relative `path = "../../components/sdk"`
+    # source resolves on the droplet exactly as it does on dev machines.
+  install:
+    - cd apps/locationservice && /usr/local/bin/uv sync
+  target_dir: /srv/locationservice
+  user: locationservice
+
+process:
+  exec: /srv/locationservice/apps/locationservice/.venv/bin/uvicorn locationservice.main:build_app --factory --host 127.0.0.1 --port ${PORT}
+  working_dir: /srv/locationservice/apps/locationservice
+  environment:
+    # Subdomain mount: no SVC_ROOT_PATH (no prefix to strip). Endpoint set
+    # explicitly so Registry doesn't derive the api.lishuyu.app default.
+    SVC_ENDPOINT: https://location.lishuyu.app
+    LOCATION_DB_PATH: /var/lib/locationservice/locationservice.db
+  restart: on-failure
+  restart_sec: 5
+  memory_max: 200M
+
+# api.lishuyu.app is for pure-API services; UI-bearing services get their own
+# subdomain (displayservice precedent — user decision 2026-06-11).
+mount:
+  gateway: location.lishuyu.app
+  subdomain: location
+  port: 9208
+
+# Location data is private: no anon access. Reads are additionally scoped
+# in-app (own points only; admin may widen; LOCATION_VIEW_TOKEN is the
+# read-only browser capability and bypasses ACL by design).
+acl:
+  - {action: read,  principal: "user:*", effect: allow}
+  - {action: write, principal: "user:*", effect: allow}
+  - {action: read,  principal: admin,    effect: allow}
+  - {action: write, principal: admin,    effect: allow}
+
+registry:
+  capabilities: [location, gps, tracking]
+  health_path: /health

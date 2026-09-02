@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "id": "turingtest",
+  "audience": "turingtest",
+  "display_name": "Turing Test",
+  "owner": "lishuyu",
+  "capabilities": [
+    "game",
+    "chat",
+    "turingtest"
+  ],
+  "health_path": "/health",
+  "acl": [
+    {
+      "action": "read",
+      "principal": "anon",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "anon",
+      "effect": "allow"
+    },
+    {
+      "action": "read",
+      "principal": "user:*",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "user:*",
+      "effect": "allow"
+    },
+    {
+      "action": "read",
+      "principal": "admin",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "admin",
+      "effect": "allow"
+    }
+  ]
+}

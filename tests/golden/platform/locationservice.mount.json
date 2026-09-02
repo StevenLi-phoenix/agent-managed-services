@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "locationservice",
+  "kind": "service",
+  "gateway": "location.lishuyu.app",
+  "path": null,
+  "subdomain": "location",
+  "port_name": "main",
+  "static_root": null,
+  "build": [],
+  "headers": {}
+}

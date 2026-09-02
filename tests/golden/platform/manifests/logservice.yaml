@@ -1,0 +1,42 @@
+schema_version: 1
+kind: service
+name: logservice
+audience: logservice
+owner: steven
+
+deploy:
+  source:
+    type: git
+    repo: StevenLi-phoenix/api
+    branch: main
+  install:
+    - cd services/logservice && /usr/local/bin/uv sync
+  target_dir: /srv/logservice
+  user: logservice
+
+process:
+  exec: /srv/logservice/services/logservice/.venv/bin/uvicorn logservice.main:build_app --factory --host 127.0.0.1 --port ${PORT}
+  working_dir: /srv/logservice/services/logservice
+  environment:
+    SVC_ROOT_PATH: /logs
+    LOG_DB_PATH: /var/lib/logservice/logservice.db
+  restart: on-failure
+  restart_sec: 5
+  memory_max: 200M
+
+mount:
+  gateway: api.lishuyu.app
+  path: /logs
+  port: 9202
+
+acl:
+  - {action: write, principal: "user:*",    effect: allow}
+  - {action: write, principal: "service:*", effect: allow}
+  - {action: read,  principal: admin,       effect: allow}
+  - {action: write, principal: admin,       effect: allow}
+
+registry:
+  capabilities: [logs, aggregation]
+  health_path: /health
+
+# redeployed 3d34ed8

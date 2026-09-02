@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "pages",
+  "kind": "service",
+  "gateway": "pages.shuyuli.com",
+  "path": null,
+  "subdomain": "pages",
+  "port_name": "main",
+  "static_root": null,
+  "build": [],
+  "headers": {}
+}

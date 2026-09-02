@@ -1,0 +1,30 @@
+schema_version: 1
+kind: static
+name: files-web
+display_name: "Files Web UI"
+owner: steven
+
+deploy:
+  source:
+    type: git
+    repo: StevenLi-phoenix/api
+    branch: main
+    # Stage ONLY this app. The repo is PRIVATE and Caddy's file_server serves
+    # target_dir directly — whole-monorepo staging exposed CLAUDE.md, bootstrap
+    # scripts and component sources at https://file.lishuyu.app/<path>.
+    path: apps/files-web
+  install:
+    - bun install
+    - bun run build
+    # Keep ONLY built artifacts under the served root: purge sources +
+    # node_modules, then lift dist/ contents to target_dir itself.
+    - find . -mindepth 1 -maxdepth 1 ! -name dist -exec rm -rf {} +
+    - cp -a dist/. .
+    - rm -rf dist
+  target_dir: /srv/files-web
+
+mount:
+  gateway: file.lishuyu.app
+  subdomain: file
+
+# deployed a666826 (atomic static flow verification)

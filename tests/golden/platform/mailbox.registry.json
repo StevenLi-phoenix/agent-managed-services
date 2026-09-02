@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "id": "mailbox",
+  "audience": "mailbox",
+  "display_name": "Mailbox",
+  "owner": "lishuyu",
+  "capabilities": [
+    "mailbox",
+    "email",
+    "inbox"
+  ],
+  "health_path": "/health",
+  "acl": [
+    {
+      "action": "read",
+      "principal": "admin",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "admin",
+      "effect": "allow"
+    }
+  ]
+}

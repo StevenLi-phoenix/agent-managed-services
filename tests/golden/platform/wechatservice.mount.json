@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "wechatservice",
+  "kind": "service",
+  "gateway": "api.lishuyu.app",
+  "path": "/wechat",
+  "subdomain": null,
+  "port_name": "main",
+  "static_root": null,
+  "build": [],
+  "headers": {}
+}

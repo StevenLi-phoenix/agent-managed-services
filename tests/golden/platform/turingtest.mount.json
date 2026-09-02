@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "turingtest",
+  "kind": "service",
+  "gateway": "turning-test.lishuyu.app",
+  "path": null,
+  "subdomain": "turning-test",
+  "port_name": "main",
+  "static_root": null,
+  "build": [],
+  "headers": {}
+}

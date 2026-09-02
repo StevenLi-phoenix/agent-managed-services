@@ -1,0 +1,67 @@
+schema_version: 1
+kind: service
+name: pages
+display_name: "Pages"
+audience: pages
+owner: steven
+
+deploy:
+  source:
+    type: git
+    repo: StevenLi-phoenix/api
+    branch: main
+    # No `path:` — whole-monorepo rsync so the SDK's relative path source
+    # resolves on the droplet exactly as it does on dev machines.
+  install:
+    - cd apps/pages && /usr/local/bin/uv sync
+  target_dir: /srv/pages
+  user: pages
+
+process:
+  exec: /srv/pages/apps/pages/.venv/bin/uvicorn pages.main:build_app --factory --host 127.0.0.1 --port ${PORT}
+  working_dir: /srv/pages/apps/pages
+  environment:
+    # Subdomain mount: no SVC_ROOT_PATH (no prefix to strip). Endpoint set
+    # explicitly so Registry doesn't derive the api.lishuyu.app default.
+    SVC_ENDPOINT: https://pages.shuyuli.com
+    PAGES_DB_PATH: /var/lib/pages/pages.db
+    PAGES_MAX_SIZE_MB: "10"
+    PAGES_MAX_PER_USER: "200"
+    PAGES_ANON_RATE_LIMIT: "10"
+    PAGES_ANON_EXPIRY_DAYS: "30"
+    PAGES_ANON_MAX_PAGES: "500"
+  restart: on-failure
+  restart_sec: 5
+  memory_max: 200M
+
+# Hosts UNTRUSTED user HTML: it gets its own hostname (never a path under
+# api.lishuyu.app), the Caddy csp_map pins a site-wide sandbox CSP, and
+# pages.shuyuli.com must never appear in the gateway's credentialed CORS regex
+# (bootstrap/04-caddy-init.sh; note the regex DOES contain the bare apex
+# shuyuli.com — exact match only, subdomains don't match; keep it that way).
+# Moved off page.lishuyu.app to pages.shuyuli.com 2026-08-30 (owner decision).
+# The management API (and ONLY it) is additionally proxied at
+# api.lishuyu.app/pages/api/* (bootstrap/04-caddy-init.sh, hand-managed —
+# outside the Deployer's one-mount model) so the admin SPA's .lishuyu.app
+# phm_jwt cookie can reach it; hosted HTML is never served via that handle.
+# See the isolation notes in src/pages/main.py.
+mount:
+  gateway: pages.shuyuli.com
+  subdomain: pages
+  port: 9216
+
+acl:
+  # Public page views are un-decorated in-app; the anon read rule documents
+  # intent and keeps the read surface open if it ever moves behind require_acl.
+  # Anon write = anonymous publishing (files-service model: claim token,
+  # per-IP rate limit, expiry, global anon cap — all enforced in-app).
+  - {action: read,  principal: anon,     effect: allow}
+  - {action: write, principal: anon,     effect: allow}
+  - {action: read,  principal: "user:*", effect: allow}
+  - {action: write, principal: "user:*", effect: allow}
+  - {action: read,  principal: admin,    effect: allow}
+  - {action: write, principal: admin,    effect: allow}
+
+registry:
+  capabilities: [pagehosting, statichosting]
+  health_path: /health

@@ -53,3 +53,84 @@ def test_other_event_severities():
     assert severity_of(HealthChanged("svc", healthy=False)) == Severity.WARNING
     assert severity_of(HealthChanged("svc", healthy=True)) == Severity.INFO
     assert severity_of(OrphanReaped(4242, 0, None)) == Severity.INFO
+
+
+# ------------------------------------------------------- per-declaration formats
+
+
+def test_level_prefix_format_reads_the_leading_level_token():
+    def c(text: str) -> Severity:
+        return classify(text, "stderr", "level-prefix")
+
+    assert c("DEBUG ams.svc: tick") == Severity.DEBUG
+    assert c("INFO kvservice: started") == Severity.INFO
+    assert c("WARNING kvservice: disk almost full") == Severity.WARNING
+    assert c("warn ams.sdk: lower case is accepted") == Severity.WARNING
+    assert c("ERROR kvservice: boom") == Severity.ERROR
+    assert c("CRITICAL kvservice: boom") == Severity.CRITICAL
+    assert c("FATAL kvservice: boom") == Severity.CRITICAL
+
+
+def test_level_prefix_beats_the_heuristics_on_the_message_body():
+    # The heuristics call both of these ERROR ("uvicorn.error", "Traceback");
+    # the declared format says the service already told us the level.
+    def c(text: str) -> Severity:
+        return classify(text, "stderr", "level-prefix")
+
+    assert c("INFO uvicorn.error: request served") == Severity.INFO
+    assert c("INFO svc: Traceback (most recent call last) in a docstring") == Severity.INFO
+    # A line without the prefix (uvicorn's own banner, a traceback body) still
+    # gets the heuristics rather than being silently downgraded.
+    assert c("Traceback (most recent call last):") == Severity.ERROR
+
+
+def test_json_format_trusts_level_or_severity_and_nothing_else():
+    def c(text: str) -> Severity:
+        return classify(text, "stderr", "json")
+
+    assert c('{"level":"debug","msg":"x"}') == Severity.DEBUG
+    assert c('{"level":"info","msg":"x"}') == Severity.INFO
+    assert c('{"level":"warn","msg":"x"}') == Severity.WARNING  # caddy spells it warn
+    assert c('{"level":"error","msg":"x"}') == Severity.ERROR
+    assert c('{"level":"panic","msg":"x"}') == Severity.CRITICAL
+    assert c('{"level":"fatal","msg":"x"}') == Severity.CRITICAL
+    assert c('{"severity":"WARNING","message":"x"}') == Severity.WARNING
+    # the message body is data, never a severity source
+    assert c('{"level":"info","msg":"ERROR: connection refused"}') == Severity.INFO
+    assert c('{"level":"info","logger":"Traceback"}') == Severity.INFO
+
+
+def test_json_format_falls_back_to_the_heuristics_when_unusable():
+    def c(text: str) -> Severity:
+        return classify(text, "stderr", "json")
+
+    assert c('{"level": ') == Severity.INFO  # truncated json
+    assert c('{"msg":"ERROR here"}') == Severity.ERROR  # object with no level
+    assert c('{"level":42}') == Severity.INFO  # level is not a name we know
+    assert c('["level","error"]') == Severity.ERROR  # not an object
+    assert c("plain WARNING line") == Severity.WARNING  # not json at all
+
+
+def test_auto_tries_prefix_then_json_then_heuristics():
+    assert classify("INFO uvicorn.error: served", "stderr") == Severity.INFO
+    assert classify('{"level":"info","msg":"ERROR: nope"}', "stderr") == Severity.INFO
+    assert classify("plain ERROR line", "stderr") == Severity.ERROR
+    # plain never looks at structure at all
+    assert classify('{"level":"info","msg":"ERROR: nope"}', "stderr", "plain") == Severity.ERROR
+    assert classify("INFO uvicorn.error: served", "stderr", "plain") == Severity.ERROR
+
+
+def test_logline_from_raw_honours_the_format_hint():
+    raw = b'{"level":"info","msg":"ERROR: nope"}'
+    assert LogLine.from_raw("svc", "stderr", raw).severity == Severity.INFO  # auto
+    assert LogLine.from_raw("svc", "stderr", raw, "json").severity == Severity.INFO
+    assert LogLine.from_raw("svc", "stderr", raw, "plain").severity == Severity.ERROR
+
+
+def test_an_expected_exit_is_informational():
+    crashed = ServiceExited("svc", 1, exit_code=None, signal=15, uptime_s=3.0)
+    stopped = ServiceExited("svc", 1, exit_code=None, signal=15, uptime_s=3.0, expected=True)
+    assert not crashed.ok and not stopped.ok
+    assert severity_of(crashed) == Severity.ERROR
+    assert severity_of(stopped) == Severity.INFO
+    assert stopped.severity == Severity.INFO

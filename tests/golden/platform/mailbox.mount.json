@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "mailbox",
+  "kind": "service",
+  "gateway": "mail.lishuyu.app",
+  "path": null,
+  "subdomain": "mail",
+  "port_name": "main",
+  "static_root": null,
+  "build": [],
+  "headers": {}
+}

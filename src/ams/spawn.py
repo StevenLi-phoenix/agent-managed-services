@@ -31,6 +31,12 @@ log = logging.getLogger("ams.spawn")
 INNER_UID = 1000
 INNER_GID = 1000
 
+# The one directory under the service root that is meant to survive a
+# re-provision: databases, uploads, anything the service owns. Exported as
+# ``AMS_DATA_DIR`` and created by ``userns.ensure_service_root`` (0750, owned by
+# the service uid) so a service never has to guess where it may write.
+DATA_DIRNAME = "data"
+
 
 @dataclass(frozen=True)
 class SpawnRequest:
@@ -45,6 +51,10 @@ class SpawnRequest:
         wd = Path(self.decl.start.workdir)
         return wd if wd.is_absolute() else self.root / wd
 
+    @property
+    def data_dir(self) -> Path:
+        return self.root / DATA_DIRNAME
+
     def argv(self) -> list[str]:
         return [expand_ports(a, self.ports) for a in self.decl.start.argv]
 
@@ -57,6 +67,7 @@ class SpawnRequest:
             "LANG": "C.UTF-8",
             "PYTHONUNBUFFERED": "1",
             "AMS_SERVICE_ID": self.decl.id,
+            "AMS_DATA_DIR": str(self.data_dir),
         }
         for name, port in self.ports.items():
             env[f"PORT_{name}"] = str(port)
@@ -112,6 +123,11 @@ class PlainSpawner:
         # survives a failed spawn (the supervisor retries spawn failures).
         argv, env = req.argv(), req.env()
         req.workdir.mkdir(parents=True, exist_ok=True)
+        # No namespace here, so no admin ns is needed: create the data dir the
+        # same way the isolated spawner does, so AMS_DATA_DIR is never a
+        # dangling path under `ams run --no-isolation`.
+        req.data_dir.mkdir(parents=True, exist_ok=True)
+        req.data_dir.chmod(0o750)
         fds: list[int] = []
         try:
             out_r, out_w = _pipe_nonblocking_read_end()

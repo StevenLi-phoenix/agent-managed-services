@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "id": "oss",
+  "audience": "oss",
+  "display_name": "Object Storage Service",
+  "owner": "steven",
+  "capabilities": [
+    "objectstorage",
+    "r2"
+  ],
+  "health_path": "/health",
+  "acl": [
+    {
+      "action": "read",
+      "principal": "user:*",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "user:*",
+      "effect": "allow"
+    },
+    {
+      "action": "read",
+      "principal": "service:*",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "service:*",
+      "effect": "allow"
+    },
+    {
+      "action": "read",
+      "principal": "admin",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "admin",
+      "effect": "allow"
+    }
+  ]
+}

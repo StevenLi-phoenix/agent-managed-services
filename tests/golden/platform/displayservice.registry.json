@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "id": "displayservice",
+  "audience": "displayservice",
+  "display_name": "TRMNL Display Service",
+  "owner": "lishuyu",
+  "capabilities": [
+    "display",
+    "eink",
+    "trmnl"
+  ],
+  "health_path": "/health",
+  "acl": [
+    {
+      "action": "read",
+      "principal": "anon",
+      "effect": "allow"
+    },
+    {
+      "action": "read",
+      "principal": "user:*",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "user:*",
+      "effect": "allow"
+    },
+    {
+      "action": "write",
+      "principal": "admin",
+      "effect": "allow"
+    }
+  ]
+}

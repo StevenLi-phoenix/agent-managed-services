@@ -1,0 +1,65 @@
+schema_version: 1
+kind: service
+
+name: turingtest
+display_name: Turing Test
+audience: turingtest
+owner: lishuyu
+
+deploy:
+  source:
+    type: git
+    repo: StevenLi-phoenix/api
+    branch: main
+    # No `path:` — whole-monorepo rsync so pyproject's relative
+    # `path = "../../components/sdk"` resolves on the droplet as on dev.
+  install:
+    - cd apps/turingtest && /usr/local/bin/uv sync
+  target_dir: /srv/turingtest
+  user: turingtest
+
+process:
+  exec: /srv/turingtest/apps/turingtest/.venv/bin/uvicorn turingtest.main:build_app --factory --host 127.0.0.1 --port ${PORT}
+  working_dir: /srv/turingtest/apps/turingtest
+  environment:
+    # Subdomain mount: NO SVC_ROOT_PATH. Caddy renders a full site block with
+    # no handle_path for subdomain mounts, so nothing is stripped and routes
+    # carry no prefix (locationservice/pages/displayservice precedent).
+    SVC_ENDPOINT: https://turning-test.lishuyu.app
+    TURINGTEST_DB_PATH: /var/lib/turingtest/turingtest.db
+    BOT_LLM_API_BASE: https://api.deepseek.com
+    BOT_LLM_MODEL: deepseek-chat
+    # BOT_LLM_API_KEY is NOT set here — hand-added to /etc/turingtest/env
+    # (the commentservice DEEPSEEK_API_KEY precedent). Absent key => StubBot
+    # (canned replies, no network) — matching still works end-to-end.
+    TT_WARMUP_SEC: "30"
+    TT_MATCH_DURATION_SEC: "300"
+    TT_BOT_WAIT_MIN_SEC: "12"
+    TT_BOT_WAIT_MAX_SEC: "20"
+  restart: on-failure
+  restart_sec: 5
+  memory_max: 250M
+
+# UI-bearing service -> own subdomain (api.lishuyu.app is API-only).
+# Note the hyphen: the DNS name is turning-test, the Python package is
+# turingtest (identifiers can't contain hyphens).
+mount:
+  gateway: turning-test.lishuyu.app
+  subdomain: turning-test
+  port: 9217
+
+acl:
+  # Play is anonymous by design (guest tokens are app-local, not SDK
+  # principals) — these rules document intent in the Registry, as apps/pages
+  # does for its own un-decorated anon surface. Not actually enforced here
+  # (this app never calls setup_sdk with an acl_client — see main.py).
+  - { action: read, principal: anon, effect: allow }
+  - { action: write, principal: anon, effect: allow }
+  - { action: read, principal: "user:*", effect: allow }
+  - { action: write, principal: "user:*", effect: allow }
+  - { action: read, principal: admin, effect: allow }
+  - { action: write, principal: admin, effect: allow }
+
+registry:
+  capabilities: [game, chat, turingtest]
+  health_path: /health

@@ -1,0 +1,48 @@
+schema_version: 1
+kind: service
+name: notificationservice
+audience: notificationservice
+owner: lishuyu
+
+deploy:
+  source:
+    type: git
+    repo: StevenLi-phoenix/api
+    branch: main
+  install:
+    - cd services/notificationservice && /usr/local/bin/uv sync
+  target_dir: /srv/notificationservice
+  user: notificationservice
+
+process:
+  exec: /srv/notificationservice/services/notificationservice/.venv/bin/uvicorn notificationservice.main:build_app --factory --host 127.0.0.1 --port ${PORT}
+  working_dir: /srv/notificationservice/services/notificationservice
+  environment:
+    SVC_ROOT_PATH: /notify
+    NOTIFY_DB_PATH: /var/lib/notificationservice/notificationservice.db
+    BARK_SERVER_URL: https://api.day.app
+    # BARK_DEVICE_KEY (optional default device) lives in
+    # /etc/notificationservice/env (EnvironmentFile), added by the operator.
+    # notify's normal caller is messageservice (the bus) over M2M.
+    # SVC_M2M_PUBLIC_KEY_PATH is injected by the deployer unit template.
+  restart: on-failure
+  restart_sec: 5
+  memory_max: 100M
+
+mount:
+  gateway: api.lishuyu.app
+  path: /notify
+  port: 9213
+
+acl:
+  # POST /send (and reads): M2M services + admin. Anonymous/ordinary users are
+  # rejected — this is an M2M/admin sink, same shape as emailservice. Device
+  # CRUD endpoints are narrowed to admin in-app via _require_admin.
+  - {action: read,  principal: "service:*", effect: allow}
+  - {action: write, principal: "service:*", effect: allow}
+  - {action: read,  principal: admin,       effect: allow}
+  - {action: write, principal: admin,       effect: allow}
+
+registry:
+  capabilities: [notify, push]
+  health_path: /health

@@ -30,6 +30,7 @@ from ams.events import (
     ServiceExited,
     ServiceStarted,
     Severity,
+    severity_of,
 )
 from ams.schema import ServiceDecl, loads
 from ams.spawn import PlainSpawner, SpawnedService, SpawnRequest
@@ -820,3 +821,62 @@ def test_a_raising_extra_env_hook_fails_only_that_service(tmp_path):
     texts_seen = [e.text for e, _d in esc.events] + lines(sup.run_once(0.01))
     assert any("SVC_SECRET" in t for t in texts_seen) or needy.consecutive_failures == 1
     sup.shutdown(2.0)
+
+
+# ------------------------------------------------- expected exits / log formats
+
+
+def test_an_operator_stop_is_not_reported_as_an_error(tmp_path):
+    """`ams ctl stop`/reload/shutdown produced one ERROR-severity exit each."""
+    esc = RecordingEscalation()
+    d = decl("import time; time.sleep(30)", extra='[restart]\npolicy = "never"\n')
+    sup, st = make(tmp_path, d, escalation=esc)
+    sup.start("svc")
+    sup.run_once(0.05)
+    sup.stop("svc")
+    events = pump(sup, until=lambda ev: st.status == "stopped")
+    exits = of_type(events, ServiceExited)
+    assert len(exits) == 1 and exits[0].expected is True
+    assert severity_of(exits[0]) == Severity.INFO
+    assert esc.events == [], f"a stop we asked for must not escalate: {esc.events}"
+    sup.shutdown(1.0)
+
+
+def test_a_restart_is_expected_but_a_crash_is_not(tmp_path):
+    d = decl(READY + "import time; time.sleep(30)", extra="[restart]\nbackoff_s = 0.05\n")
+    sup, st = make(tmp_path, d)
+    sup.start("svc")
+    pump(sup, until=lambda ev: saw_text(ev, "ready"))
+    sup.restart("svc")
+    events = pump(sup, until=lambda ev: len(of_type(ev, ServiceStarted)) == 1)
+    assert [e.expected for e in of_type(events, ServiceExited)] == [True]
+    assert st.consecutive_failures == 0
+    sup.shutdown(1.0)
+
+
+def test_a_crash_is_still_an_error_and_still_reaches_the_agent(tmp_path):
+    esc = RecordingEscalation()
+    d = decl("import sys; sys.exit(3)", extra='[restart]\npolicy = "never"\n')
+    sup, st = make(tmp_path, d, escalation=esc)
+    sup.start("svc")
+    events = pump(sup, until=lambda ev: st.status in ("failed", "stopped"))
+    exits = of_type(events, ServiceExited)
+    assert exits and exits[0].expected is False
+    assert severity_of(exits[0]) == Severity.ERROR
+    assert st.status == "failed"
+    assert esc.events, "a crash we decline to restart must be escalated"
+    sup.shutdown(1.0)
+
+
+def test_the_declared_log_format_reaches_the_log_lines(tmp_path):
+    code = (
+        "import json, sys\n"
+        "print(json.dumps({'level': 'info', 'msg': 'ERROR: not really'}), flush=True)\n"
+    )
+    d = decl(code, extra='[logging]\nformat = "json"\n')
+    sup, st = make(tmp_path, d)
+    sup.start("svc")
+    events = pump(sup, until=lambda ev: saw_text(ev, "not really"))
+    line = next(e for e in of_type(events, LogLine) if "not really" in e.text)
+    assert line.severity == Severity.INFO
+    sup.shutdown(1.0)

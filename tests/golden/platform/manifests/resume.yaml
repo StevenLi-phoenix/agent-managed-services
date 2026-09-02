@@ -1,0 +1,43 @@
+schema_version: 1
+
+name: resume
+display_name: Resume Service
+audience: resume
+owner: lishuyu
+
+deploy:
+  source:
+    type: git
+    repo: StevenLi-phoenix/api
+    branch: main
+    # No `path:` — stage rsyncs the whole monorepo into target_dir so
+    # apps/resume/pyproject.toml's relative `path = "../../components/sdk"`
+    # source resolves on the droplet exactly as it does on dev machines.
+  install:
+    - cd apps/resume && /usr/local/bin/uv sync
+  target_dir: /srv/resume
+  user: resume
+
+process:
+  exec: /srv/resume/apps/resume/.venv/bin/uvicorn resume.main:app --host 127.0.0.1 --port ${PORT}
+  working_dir: /srv/resume/apps/resume
+  environment:
+    # Caddy handle_path strips /resume before proxying, but FastAPI still
+    # needs the external root path so /resume/docs loads /resume/openapi.json.
+    SVC_ROOT_PATH: /resume
+  restart: on-failure
+  restart_sec: 5
+
+mount:
+  gateway: api.lishuyu.app
+  path: /resume
+  port: 9201
+
+acl:
+  - {action: read,  principal: anon,    effect: allow}
+  - {action: read,  principal: "user:*", effect: allow}
+  - {action: write, principal: admin,   effect: allow}
+
+registry:
+  capabilities: [resume]
+  health_path: /health
