@@ -464,3 +464,34 @@ def test_build_supervisor_survives_an_unreadable_store(tmp_path: Path, caplog) -
             asm.supervisor._extra_env_for(asm.declarations["svc"])
     finally:
         store.service_dir("svc").chmod(0o700)
+
+
+def test_build_supervisor_survives_a_raising_warn_hook(tmp_path: Path, caplog, monkeypatch) -> None:
+    """The outer guard: even a broken diagnostic must not abort `ams run`.
+
+    Distinct from test_build_supervisor_survives_an_unreadable_store, which
+    exercises the guard *inside* warn_missing_secrets. This one makes the
+    function itself raise -- standing in for a bug in the diagnostic or a
+    corrupt state layout -- and asserts the boot still produces a supervisor
+    with the service registered.
+    """
+    import ams.secrets as secrets_module
+    from ams.cli import build_supervisor
+
+    toml = 'id = "svc"\nsecrets = ["K"]\n[start]\nargv = ["/bin/echo", "hi"]\n'
+    state = _state_with(tmp_path, "svc", toml)
+    store_for(state).set("svc", "K", VALUE.encode())
+
+    def boom(*_a: object, **_kw: object) -> list[str]:
+        raise OSError("state dir vanished mid-check")
+
+    monkeypatch.setattr(secrets_module, "warn_missing_secrets", boom)
+    with caplog.at_level(logging.WARNING):
+        asm = build_supervisor(state, isolation=False)
+    assert asm.registered == ["svc"]  # the harness came up anyway
+    assert "could not check declared secrets against the store" in caplog.text
+    assert "OSError" in caplog.text
+    # The secret itself is still delivered: only the advisory check was broken.
+    extra, _ = asm.supervisor._extra_env_for(asm.declarations["svc"])
+    assert extra["K"] == VALUE
+    assert VALUE not in caplog.text
