@@ -159,3 +159,41 @@ principal outside the registry's regex.
 keys sorted, so the goldens are byte-stable. `schema.loads(emit_toml(d)) == d`
 holds for every service, asserted per manifest in
 `tests/test_platform_translate.py`.
+
+## `service.ams.toml`: extra secret names (T3.4)
+
+`TranslateContext.extra_secret_names` exists so a manifest can pull in a
+secret it has no field for, but `translate()` never populates it -- the
+manifest format has no such key and adding one would blur the same line D7
+already draws (a manifest describes the service, not the harness's secret
+store). Instead, `ams.platform.static.load_ams_overlay(manifest_dir)` reads an
+optional `service.ams.toml` file beside `service.yaml`:
+
+```toml
+secrets = ["DEEPSEEK_API_KEY"]
+[env]
+FEATURE_X = "on"
+```
+
+`secrets` is a list of **names only** -- exactly what `extra_secret_names`
+wants, one call site turns straight into the other: `ams.platform.
+static.overlay_secret_names(manifest_dir)` returns `list[str]`, and the sync
+loop (T3.1) passes it as `TranslateContext(..., extra_secret_names=tuple(...))`
+before calling `translate()`. Values are never in this file; they go into the
+SecretStore with `ams secret set <id> <NAME>` (D16). `[env]` is for the rarer
+case of a non-secret value the manifest cannot express either (a tunable, a
+feature flag); T3.1 folds it into the declaration's `[env]` itself, after
+`translate()` returns -- `load_ams_overlay` only parses and validates it.
+
+Both `secrets` entries and `env` keys are validated against the same
+uppercase-only pattern `TranslateContext.__post_init__` itself enforces on
+`extra_secret_names` (not the looser, mixed-case `ams.schema.ENV_NAME_RE`):
+validating against the looser pattern here would let an overlay pass
+`load_ams_overlay` only to fail later inside `translate()` with a less
+specific error naming `ctx.extra_secret_names` instead of the overlay file.
+Reserved names (`ams.schema.RESERVED_ENV`/`RESERVED_ENV_PREFIXES`) are
+rejected here too, for the same reason. `docs/platform-sidecars.md` is
+unaffected: these names still end up in the declaration's `secrets = [...]`
+field exactly like `SVC_SECRET` (D16), never in a sidecar.
+
+See `DECISIONS.md` for which of the 21 manifests actually need one, and why.

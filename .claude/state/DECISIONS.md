@@ -718,3 +718,228 @@ report in `JsonLinesEscalation`'s shape. Choices and what was rejected:
   only. The transport is T4.2's live drill. Do not treat "backups work" as
   covering the network hop yet — what is proven is that a service-owned database
   can be snapshotted through the admin namespace and restored with its rows.
+
+### D24 (T3.3). Platform policy: dedupe by normalized cause, recommend-only rollback (2026-09-02)
+- **The cause key is `(service_id, kind, normalized text)`, not the raw line.**
+  `normalize_cause_text` replaces ISO/CLF/clock timestamps, ipv4(:port),
+  `pid=<n>`, 32–64-char hex ids, shorter hex ids containing a letter, and any
+  remaining number of three digits or more. Two lines that differ only in which
+  request, which pid or which ephemeral port are one *cause*; the whole module is
+  worthless if they are two. Numbers of one or two digits are left alone ("3
+  retries", "5xx") — collapsing them loses more than it gains. `kind` is in the
+  key so an exit and a log line that normalize to the same string stay distinct,
+  and `service_id` is in it so one noisy service cannot silence the same symptom
+  in another. *Rejected:* hashing the whole line — a per-request id makes every
+  occurrence unique and the deduper never fires. *Rejected:* a fixed
+  rate limit per service (n lines per minute) — it drops real bursts and hides a
+  crash loop's output, which D19 already rejected for self-probe suppression.
+  *Rejected:* dedupe by `(service_id, severity)` — one ERROR then silence for the
+  next, different, ERROR.
+- **The 32–64-char hex rule does not require a letter; the 7+ rule does.** A git
+  sha that happens to be all digits (~1e-8 of commits) must still collapse
+  against one that is not, or that commit escalates twice. Below 32 chars the
+  letter requirement keeps a plain 7-digit decimal out of `<hex>` so it gets one
+  placeholder rather than two depending on its digits. Found by a test, not by
+  reasoning: the first version had one rule and the all-digit sha case failed.
+- **`window_s = 600`, `health_grace_s = 300`.** 10 minutes is longer than the
+  10 s health-probe interval and the 1 s restart backoff can refill, and short
+  enough that a condition still true afterwards gets said again rather than going
+  quiet forever. 5 minutes of grace sits above the fleet's `start_period_s = 120`
+  (PLAN-allin Q8) with room for a slow first start plus one restart. Both are
+  guesses against the *plan's* numbers, **n=0 against a running fleet** — see the
+  open section below.
+- **A closed window emits one summary escalation, not silence.** "Escalate once
+  and drop the rest" loses the fact that it happened 300 times, which is the
+  difference between a blip and an outage. A window with a single occurrence
+  emits nothing: "repeated 1 times" is not news.
+- **The health gate measures from `stage_since`, not `updated_at`.** The brief
+  said `updated_at`; the sidecar contract says `updated_at` is touched on *every*
+  write, so a service the sync loop retries every 60 s would have a fresh
+  `updated_at` forever and a gate keyed on it would never fire. `updated_at` is
+  the fallback for a record written before `stage_since` existed. The crash-loop
+  rule does use `updated_at`, because there the question is "did we touch this
+  service recently", not "how long has it been stuck".
+- **The gate recommends a rollback; it never performs one.** `rollback(id)` is
+  T4.3. A policy that acted would be making an irreversible fleet decision from
+  inside a single-threaded supervisor loop, on the strength of one state file
+  written by another process — and PLAN-allin Q7 puts "whether a crash-looping
+  service is rolled back or left failing loudly" explicitly on the agent's side
+  of the mechanical/policy line. What the escalation adds over the supervisor's
+  own retry-exhaustion record is the **sha pair**: "this started when you moved
+  it from X to Y" is the sentence that makes the fix obvious.
+- **Health-gate and crash-loop escalations are queued, not returned.** One event
+  yields one `Decision`, and the crash-loop case must still return the `RESTART`
+  the supervisor needs — returning `ESCALATE` instead would silently stop
+  restarting a service to reduce log volume, a far worse bug than the noise.
+  They are drained by `flush(now)`, which `ams run --policy platform` wires into
+  `run_forever(on_iteration=...)`. `flush` also returns what it emitted, so a
+  caller driving the supervisor directly (and every test here) needs no sink.
+- **The health gate uses a `(service_id, sha, stage)` marker, not the deduper.**
+  The requirement is "escalate ONCE", and the condition re-arms when the sync
+  loop moves the service to a new sha or stage, not when a clock runs out. The
+  deduper's window would have re-escalated a permanently-failed service every 10
+  minutes forever. It also deliberately ignores the record's own `escalated`
+  flag: that belongs to the sync loop's per-transition dedupe, and a policy that
+  read it would go quiet because a *different* component had already spoken.
+- **Caddy access lines carry the status in the cause `kind`, not the text.** The
+  normalizer turns any three-digit number into `<n>`, so `502` and `503` on one
+  path would have been one cause. Only the path is normalized, which is what we
+  want: `/files/1234567` collapses. Found by a test.
+- **The TLS suppression matches the logger *and* the message.** Caddy names the
+  subsystem in `logger` (`tls`, `tls.issuance`) and does not always repeat it in
+  `msg` ("stapling OCSP: no OCSP server specified"). Warn-level only, and only in
+  Phase A where `auto_https off` means there are no certificates to get (D21). A
+  malformed or non-JSON Caddy line falls through to `DefaultPolicy` untouched
+  rather than being guessed at.
+- **Registry-heartbeat suppression latches on the registry's own
+  `HealthChanged(healthy=True)`.** A policy is handed only the context of the
+  service the event belongs to, so there is no way to ask "is the registry up?";
+  the one registry fact that passes through `decide` is its own health
+  transition. Latched on purpose: a registry that flaps *later* does not re-open
+  the window, because by then 20 services failing to heartbeat is real news.
+  *Rejected:* reading the registry's `start_period_s` — it is in another
+  service's declaration, which the policy cannot see. *Rejected:* reading the
+  registry's state from `state.json` — that file describes the *sync* stage, not
+  whether the process is answering.
+- **`state.json` is read with an mtime+size cache, and absence is normal.** The
+  read happens on the supervisor's thread, so the common case must cost one
+  `stat`. A missing file is the state before the first sync, not an error. A
+  corrupt file or an unknown `version` logs once at ERROR and yields an empty
+  document: the sidecar contract says fail loudly rather than guess, and loudly
+  *here* cannot mean raising — that would take down supervision of every service
+  to complain about a file nobody had asked for yet.
+- **`EscalationDeduper` is standalone so the sync loop can adopt it.** T3.1's
+  `PlatformSync` records never pass through a `DecisionPolicy` (they are JSONL on
+  stdout from a one-shot process), so its repeated translate/provision failures
+  need the same treatment from the other direction. `DedupingEscalation` wraps
+  any `Escalation` sink with it. Provided, not wired: T3.1 owns that call site.
+
+### Open / weak signals (platform policy, 2026-09-02)
+- **`window_s=600` and `health_grace_s=300` are n=0 against a running fleet.**
+  They are derived from the plan's `start_period_s=120` and the 10 s probe
+  interval, not measured. The failure mode to watch in T4.1 is a fleet start
+  where 14 uvicorns on one core take longer than 300 s to go healthy and the gate
+  fires on services that were merely slow. Expect to raise `health_grace_s`
+  rather than to have confirmed it.
+- **The Caddy rules have never seen a real Caddy log line.** Every payload in the
+  tests was written by hand from the documented shape (`logger`,
+  `http.log.access`, `status`, `request.uri`, `level`, `msg`). D19 flagged the
+  same gap for the `json` format hint and it is still open. The first live fleet
+  logs are the check; do not add speculative shapes before then.
+- **The heartbeat patterns are guesses at the SDK's wording** (`heartbeat`,
+  `acl-refresh`, plus the requests/urllib connection-refused phrasings), n=0
+  observed lines. A miss is benign — the line escalates as it does today — so
+  this stays a pattern list, not a parser.
+
+### D25 (T3.4). Static publishing runs entirely as the harness; extra secret names via `service.ams.toml` (2026-09-02)
+
+- **Static builds run inside the admin ns (`ams.userns.run_admin`), never as
+  the bare harness process, but never chown to a service uid either.**
+  `kind: static` produces no ams service (`docs/platform-sidecars.md`), so
+  there is no eventual owner to chown to -- unlike `sources.SourceMirror.stage`
+  (D19) and `runtime.provision` (D9), which both run in the admin ns *because*
+  the tree ends up service-owned. Here the reason is different and narrower:
+  `deploy.install` executes manifest/repo-controlled code (`bun install`
+  postinstall scripts, `bun run build`), and that is untrusted input in the
+  same sense D1 already treats log text as untrusted at the decision boundary
+  -- it must not run with the harness's own ambient process identity. The
+  admin ns's inner-root exec (mapped to the harness uid) gives `no_new_privs`
+  + a scoped capability set for the same host uid, which is the containment
+  this buys; it does **not** hide files from the process (same numeric uid,
+  same DAC checks). Consequence: `publish_static`'s `block: UidBlock | None`
+  is required only when `mount["build"]` is non-empty, and **any** `UidBlock`
+  works there -- it is never chowned to, so T3.1 does not need a per-static-id
+  allocation and can pass one shared placeholder block for every static
+  publish. `_copy_reflink` (the source -> scratch-dir copy) and the final
+  atomic rename both run directly as the harness with no admin ns at all: they
+  execute no repo-supplied code, only `cp -a --reflink=auto` and `os.rename`
+  over paths this module built itself.
+  *Rejected:* running builds directly as the harness (no namespace) -- the
+  team brief's explicit instruction, and the reasoning above backs it:
+  provisioning (D9) already establishes "harness never execs repo-controlled
+  tooling directly" as the platform's convention; a second, unconfined code
+  path for exactly the same category of command (an npm-ecosystem install +
+  build) would be the inconsistency, not the ns wrapping.
+  *Rejected:* chowning the scratch dir to a per-static-id `UidBlock` so the
+  build "belongs" to something -- there is nothing for it to belong to (no
+  service, no registry record), and it would force T3.1 to allocate and
+  persist a uid block for an id that will never appear in `state.
+  list_service_ids()`, for zero benefit (the published tree is harness-owned
+  either way, per D4/D21's file_server requirement).
+- **The static site's source directory is assumed to be `checkout/apps/<id>`,
+  not read from `deploy.source.path`.** Checked, not assumed: `translate.
+  _translate_static` (`src/ams/platform/translate.py:441`) never reads
+  `deploy.source.path` at all -- it is accepted by the YAML-subset table
+  validator (`_SOURCE_KEYS` includes `path`) but silently dropped, while
+  `_translate_service` explicitly rejects it (`sub-tree staging is only
+  supported for kind=static`). So `mount.json` (the only sidecar T3.4 is
+  handed) carries no field for it. Both real static manifests set
+  `deploy.source.path: apps/<name>` verbatim (`api/apps/files-web/service.yaml`,
+  `api/apps/llm-web/service.yaml`), matching `mount["id"]` exactly, so
+  `checkout / "apps" / id` is not a guess against the two manifests that
+  exist -- but it is a convention this module owns, not something the
+  translator promises. `publish_static` raises `StaticError` naming the
+  missing directory if a future static manifest's app does not live there,
+  rather than silently publishing nothing.
+  *Rejected:* teaching `translate._translate_static` to read and forward
+  `deploy.source.path` into `mount.json` -- that is T1.2's module, mid-wave
+  edits to it would churn the 21 golden files another agent's tests already
+  pin, and the plan gave T3.4 exactly the five fields in `docs/
+  platform-sidecars.md`'s `mount.json` table, `static_root` and `build`
+  included, `source.path` deliberately not.
+- **Build steps run through an argv allowlist
+  (`bun`/`pnpm`/`find`/`cp`/`rm`/`mv`/`mkdir`), not an exact per-command
+  regex like T1.2's `_INSTALL_RE`.** Checked: none of the five real
+  `deploy.install` lines across both manifests need a shell -- no `&&`, `|`,
+  `;`, `>`, or `$()` -- `shlex.split` tokenizes every one into a plain argv a
+  direct `execve` runs unmodified (verified against the golden manifests via
+  `translate()`, not hand-copied). `_INSTALL_RE`'s single recognised shape
+  exists because the *service* form genuinely uses `&&` (`cd <rel> && uv
+  sync`) and needs a real shell to mean what it says; the static form is a
+  YAML list of already-separate commands, so there is no chaining to
+  disambiguate. Any token that is a shell metacharacter or contains `$(`/`` ` ``
+  still raises `StaticError` naming it, so a future manifest that *does* need
+  shell semantics fails loudly instead of running with the wrong meaning.
+  *Rejected:* exact full-string matching per the two real commands (as
+  `_INSTALL_RE` does for the one service form) -- the five static commands
+  share no common structure to regex against, so this would be five brittle
+  regexes standing in for what the allowlist does in one pass, for no extra
+  safety (the allowlist already rejects everything else).
+  *Rejected:* no allowlist at all, just "reject shell metacharacters" -- would
+  let any coreutils/PATH binary run as a build step (e.g. `curl` in a future
+  manifest, quietly succeeding as a no-op fetch-and-discard rather than
+  failing loudly), which is a worse failure mode than a `StaticError` naming
+  an unexpected tool.
+- **`service.ams.toml` overlays exist for commentservice, wechatservice,
+  notificationservice, emailservice, oss** -- all five checked against
+  source, cited by file:line in each overlay and in the commit that adds
+  them (`api/` branch `ams-platform`, not pushed):
+  - commentservice: `DEEPSEEK_API_KEY` (`main.py:527`, required once the
+    moderation loop starts; `main.py:515` makes the loop itself optional --
+    listed anyway because without it the feature the manifest exists to
+    provide silently never runs, which is a worse failure than a set-but-
+    unused name).
+  - wechatservice: `WECHAT_MP_APPID`, `WECHAT_MP_APPSECRET` (`main.py:212-213`,
+    both `os.environ[...]`, no fallback). `WECHAT_MP_APPID` is not itself
+    sensitive, but its value is WeChat-account-specific and this translator
+    has no source for it, so it goes through the SecretStore like the appsecret
+    rather than being invented as an `[env]` literal.
+  - notificationservice: `BARK_DEVICE_KEY` (`main.py:355`, `.get(...) or
+    None` -- optional in code, load-bearing for the feature). `BARK_SERVER_URL`
+    (`main.py:354`) keeps its public default and is not listed.
+  - emailservice: `RESEND_API_KEY` (`providers/resend.py:23`, no fallback;
+    reached because `main.py:377` defaults `EMAIL_PROVIDER` to `"resend"`).
+  - oss: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`
+    (`r2.py:16-21`, all `os.environ[...]`, no fallback; reached
+    unconditionally from `create_app`'s default `r2_client=None` path,
+    `main.py:151-152`).
+  - **llmgateway gets no overlay.** The brief speculated it would need one;
+    `grep -n "os\.environ\[" -e "os\.environ\.get(" services/llmgateway`
+    (n=1 service, every result read) shows only `SVC_ROOT_PATH` and five
+    `LLMGW_*` numeric tunables, all with defaults, none third-party. Do not
+    add one speculatively -- the pattern to watch for is a *new* provider
+    integration landing in that service later.
+  - Open / weak signal: **n=1 file per service, read once, on 2026-09-02.**
+    A future change to any of these five services' provider wiring (a new
+    optional channel, a provider swap) needs its own re-grep; this is not a
+    standing guarantee the overlay stays complete.

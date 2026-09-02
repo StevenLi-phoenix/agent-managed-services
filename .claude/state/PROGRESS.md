@@ -577,3 +577,101 @@ the `plat-bk-test` tree removed; live state dir untouched.
 Unverified (n=0): **the R2 upload and the retention sweep have never run.** No
 credentials were available; `upload`/`prune` are pinned by argv equality only. The
 real round trip is T4.2.
+
+## T3.3 platform policy + escalation — done (2026-09-02)
+
+`src/ams/platform/policy.py` (~640 lines) + `tests/test_platform_policy.py`
+(66 tests) + one minimal `src/ams/cli.py` edit (`ams run --policy default|platform`).
+
+`PlatformPolicy(DecisionPolicy)` wraps `DefaultPolicy` — always delegates first,
+then refines, and never changes a RESTART or a STOP. Four rules:
+1. **Cause dedupe.** Key = `(service_id, kind, normalize_cause_text(text))`; the
+   normalizer strips ISO/CLF/clock timestamps, ipv4(:port), `pid=`, 32–64-char hex
+   ids, shorter hex ids with a letter, and numbers ≥3 digits. One escalation per
+   cause per `window_s` (600 s); repeats become `LOG` with
+   `reason="deduped (n=k)"`; a closed window emits one
+   `"repeated k times in window"` summary.
+2. **Post-sync health gate.** Reads `<state>/platform/state.json` (T3.1's file,
+   absence tolerated, mtime-cached). A service not at `healthy` for more than
+   `health_grace_s` (300 s) past `stage_since` escalates **once** per
+   `(id, sha, stage)` with both `sha` and `prev_sha` and
+   `"suggested action: rollback to prev_sha"`. Crash loops
+   (`consecutive_failures ≥ 2`) within the grace of a sync's `updated_at` escalate
+   with the sha pair too. Recommendation only — the rollback is T4.3.
+3. **Caddy.** Guarded `json.loads` on `event.text` for `service_id == "caddy"`
+   only: access lines <500 SUPPRESS, ≥500 ESCALATE once per (path, status),
+   warn-level TLS/certificate lines SUPPRESS (Phase A is plain HTTP, D21),
+   malformed JSON falls through to `DefaultPolicy`.
+4. **Registry heartbeat noise.** Until a `HealthChanged(registry, healthy=True)`
+   passes through the policy, other services' heartbeat/acl-refresh
+   connection-refused lines are downgraded to LOG.
+
+`EscalationDeduper` and `DedupingEscalation` are standalone so T3.1's sync loop
+can wrap them around its own JSONL sink (its `PlatformSync` records never reach a
+`DecisionPolicy`). Provided, not wired — T3.1 owns that call site.
+
+`flush(now)` is the tick: health gate + expired windows + queued records. It emits
+through the policy's `escalation` sink when one is set and returns what it emitted.
+`cmd_run` calls it from `run_forever(on_iteration=...)`.
+
+Verified: `tests/test_platform_policy.py` 66 passed; whole suite **813 passed /
+83 skipped**; ruff check + ruff format clean on both new files and on `cli.py`.
+Live wiring proven by hand — `ams run --policy platform --no-isolation` against a
+tmp state dir with a `sleep` service and a synthetic `state.json` at `stage=failed`
+produced **exactly one** stdout JSONL escalation carrying both shas and the
+rollback recommendation, over ~3 s of loop iterations, then shut down clean (rc 0).
+The same run is pinned by two tests (`build_supervisor(policy=...)` and a
+subprocess `ams run --policy platform`).
+
+Unverified: the Caddy payloads and the SDK heartbeat wording are hand-written from
+documented shapes, **n=0 real log lines**; `window_s`/`health_grace_s` are derived
+from PLAN-allin Q8, **n=0 against a running fleet**. See DECISIONS D24 open section.
+
+## T3.4 static sites + third-party secret names (2026-09-02)
+
+`src/ams/platform/static.py`: `publish_static(mount, checkout, state, store,
+block)` stages a `kind: static` mount's built output at
+`<state>/platform/static/<id>/`, atomically and idempotently by sha (`.ams-sha`
+marker), harness-owned 0755/0644. Source is copied from `checkout/apps/<id>`
+(reflink, direct as the harness); `mount["build"]` (deploy.install verbatim)
+runs, argv-only, inside the admin ns via `ams.userns.run_admin` +
+`ams.runtime.provisioning_env` (never as the bare harness process — D25); an
+argv allowlist (`bun`/`pnpm`/`find`/`cp`/`rm`/`mv`/`mkdir`, no shell tokens)
+covers exactly what `files-web`/`llm-web` need and rejects anything else.
+`load_ams_overlay(manifest_dir)` / `overlay_secret_names(manifest_dir)` read an
+optional `service.ams.toml` beside `service.yaml` for third-party secret NAMES
+`TranslateContext.extra_secret_names` has nowhere else to come from
+(`docs/manifest-translation.md` new section). See D25 for the full reasoning
+and the rejected alternatives.
+
+Overlays committed on `api/`'s `ams-platform` branch (not pushed):
+commentservice (`DEEPSEEK_API_KEY`), wechatservice (`WECHAT_MP_APPID`,
+`WECHAT_MP_APPSECRET`), notificationservice (`BARK_DEVICE_KEY`), emailservice
+(`RESEND_API_KEY`), oss (`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
+`R2_SECRET_ACCESS_KEY`) — each cites its `os.environ[...]` source line.
+llmgateway investigated, needs none (n=1 grep, no third-party key).
+
+Verified: `tests/test_platform_static.py` 23 passed (portable; `run_admin`
+faked for the bun/pnpm-form test, real `cp -a --reflink=auto` for the no-build
+path); whole local suite 836 passed / 83 skipped, ruff clean. Live:
+`scripts/remote-test.sh ams-static tests/linux/test_platform_static_live.py
+tests/test_platform_static.py` → 26 passed on racknerd, including a real
+`bun install && bun build` inside the admin ns (bun is installed there) with
+the published `index.js` read back as a genuinely different mapped uid
+(`setpriv --reuid 1000`, proving world-readability, not same-uid access).
+Remote scratch (`/home/harness/ams-static`, `/home/harness/state/ams-static`,
+`/home/harness/store/state/plat-static-test`) cleaned after the run.
+
+Hooks for T3.1 (sync loop), not wired by this task:
+1. Before calling `translate()` for a manifest at `manifest_dir`: `ctx =
+   TranslateContext(..., extra_secret_names=tuple(ams.platform.static.
+   overlay_secret_names(manifest_dir)))`.
+2. For a `kind: static` `Translation` (`t.decl is None`): `ams.platform.
+   static.publish_static(t.mount, checkout, state, store, block)` — `block`
+   may be `None` unless `t.mount["build"]` is non-empty, and when it is
+   required any allocated `UidBlock` works (never chowned to, see D25).
+
+Confidence: high on the static-publish mechanics (real Linux run, including
+the bun path). Medium on the overlay secret-name lists — each is a single
+2026-09-02 grep of one file per service; a future provider change in any of
+these five services needs its own re-check (flagged in DECISIONS.md).
