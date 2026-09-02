@@ -1,0 +1,16 @@
+# docs-web — static on api.lishuyu.app/docs
+handle_path /docs/* {
+	header X-Frame-Options "DENY"
+	header Content-Security-Policy "frame-ancestors 'none'"
+	header X-Content-Type-Options "nosniff"
+	root * /srv/ams/static/docs-web
+	# index.html fallback ONLY for extensionless paths (SPA routes like
+	# /f/<id>). Missing paths WITH an extension (/xxx.php scanner probes)
+	# fall through to file_server and 404 instead of 200 + index page.
+	@spa_fallback {
+		not file
+		not path *.*
+	}
+	rewrite @spa_fallback /index.html
+	file_server
+}

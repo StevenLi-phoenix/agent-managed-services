@@ -1,0 +1,32 @@
+# pages — service on subdomain pages (pages.shuyuli.com)
+pages.shuyuli.com {
+	log {
+		format json
+	}
+	header X-Frame-Options "DENY"
+	header Content-Security-Policy "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads; frame-ancestors 'none'; base-uri 'none'"
+	header X-Content-Type-Options "nosniff"
+	header Referrer-Policy "strict-origin-when-cross-origin"
+	@admin_cors_preflight {
+		method OPTIONS
+		path /api/*
+		header Origin "https://admin.lishuyu.app"
+	}
+	handle @admin_cors_preflight {
+		header Access-Control-Allow-Origin "https://admin.lishuyu.app"
+		header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+		header Access-Control-Allow-Headers "Authorization, Content-Type"
+		header Access-Control-Allow-Credentials "true"
+		header Access-Control-Max-Age "86400"
+		header Vary "Origin"
+		respond 204
+	}
+	@admin_cors {
+		path /api/*
+		header Origin "https://admin.lishuyu.app"
+	}
+	header @admin_cors Access-Control-Allow-Origin "https://admin.lishuyu.app"
+	header @admin_cors Access-Control-Allow-Credentials "true"
+	header @admin_cors Vary "Origin"
+	reverse_proxy 127.0.0.1:9216
+}

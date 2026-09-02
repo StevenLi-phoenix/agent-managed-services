@@ -1,0 +1,20 @@
+# files-web — static on subdomain file (file.lishuyu.app)
+http://file.lishuyu.app:8080 {
+	log {
+		format json
+	}
+	header X-Frame-Options "DENY"
+	header Content-Security-Policy "frame-ancestors 'none'"
+	header X-Content-Type-Options "nosniff"
+	header Referrer-Policy "strict-origin-when-cross-origin"
+	root * /srv/ams/static/files-web
+	# index.html fallback ONLY for extensionless paths (SPA routes like
+	# /f/<id>). Missing paths WITH an extension (/xxx.php scanner probes)
+	# fall through to file_server and 404 instead of 200 + index page.
+	@spa_fallback {
+		not file
+		not path *.*
+	}
+	rewrite @spa_fallback /index.html
+	file_server
+}

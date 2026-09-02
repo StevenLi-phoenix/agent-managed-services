@@ -52,6 +52,33 @@ su -l "$HARNESS_USER" -c "test -x $STORE_MNT/pnpm-home/bin/pnpm || (curl -fsSL h
 su -l "$HARNESS_USER" -c 'test -x ~/.bun/bin/bun || (curl -fsSL https://bun.sh/install | BUN_INSTALL=$HOME/.bun bash) >/dev/null'
 command -v node >/dev/null || echo "WARNING: no system node; pnpm runtimes need one (pnpm env use --global 22 as $HARNESS_USER)"
 
+# 4c. Pinned static Caddy binary for the gateway (PLAN-allin Q3 / T2.2).
+# NOT `apt install caddy`: the package brings a root systemd unit, a `caddy`
+# system user and 80/443 binding, none of which Phase A wants. This is one
+# static binary in the store, run as an ordinary ams service on an
+# ams-allocated high port. Version and hashes are pinned; bumping means
+# updating all three constants together (upstream publishes sha512 in
+# caddy_<ver>_checksums.txt — CADDY_TGZ_SHA256 is derived from that verified
+# tarball, CADDY_BIN_SHA256 from the file it extracts).
+CADDY_VERSION=${CADDY_VERSION:-2.11.4}
+CADDY_TGZ_SHA256=527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9
+CADDY_BIN_SHA256=b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9
+CADDY_BIN=$STORE_MNT/bin/caddy
+install -d -o "$HARNESS_USER" -g "$HARNESS_USER" -m 0755 "$STORE_MNT/bin"
+if [ -x "$CADDY_BIN" ] && [ "$(sha256sum "$CADDY_BIN" | cut -d' ' -f1)" = "$CADDY_BIN_SHA256" ]; then
+  echo "caddy $CADDY_VERSION already installed at $CADDY_BIN"
+else
+  CADDY_TMP=$(mktemp -d)
+  curl -fsSL -o "$CADDY_TMP/caddy.tar.gz" \
+    "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+  echo "$CADDY_TGZ_SHA256  $CADDY_TMP/caddy.tar.gz" | sha256sum -c -
+  tar -xzf "$CADDY_TMP/caddy.tar.gz" -C "$CADDY_TMP" caddy
+  echo "$CADDY_BIN_SHA256  $CADDY_TMP/caddy" | sha256sum -c -
+  install -o "$HARNESS_USER" -g "$HARNESS_USER" -m 0755 "$CADDY_TMP/caddy" "$CADDY_BIN"
+  rm -rf "$CADDY_TMP"
+  echo "installed caddy $CADDY_VERSION to $CADDY_BIN"
+fi
+
 # 5. State dir + systemd unit.
 install -d -o "$HARNESS_USER" -g "$HARNESS_USER" -m 0755 "$STORE_MNT/state"
 install -m 0644 "$REPO_DIR/deploy/ams-harness.service" /etc/systemd/system/ams-harness.service

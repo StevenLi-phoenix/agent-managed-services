@@ -1,0 +1,7 @@
+# files — service on api.lishuyu.app/files
+handle_path /files/* {
+	header X-Frame-Options "DENY"
+	header Content-Security-Policy "frame-ancestors 'none'"
+	header X-Content-Type-Options "nosniff"
+	reverse_proxy 127.0.0.1:9206
+}
