@@ -589,32 +589,52 @@ Taken before step 3 and after step 9, same method
 (`systemd-cgls`/`memory.current` per service, `free -m`, `ps` RSS), n=3
 samples 60 s apart, fleet idle at both ends.
 
-| metric | before | after | target |
-| --- | --- | --- | --- |
-| Python processes | 18 (n=3) | *(T10 — blocked)* | — |
-| pool cgroup `memory.current` MiB | n/a | *(T10 — blocked)* | ≤ 150 MiB |
-| — reference: T0, 6 apps serving, one loop | n/a | 66 MiB (n=3) | extrapolates to ~85–100 MiB at N=15 |
-| sum of Layer-1 cgroups MiB | 712 (n=3) | *(T10 — blocked)* | ≤ 300 MiB |
-| all-services cgroup total MiB | 866–867 (n=3) | *(T10 — blocked)* | ≤ 600 MiB |
-| `free -m` available | 653–657 (n=3) | *(T10 — blocked)* | ≥ 1200 MiB |
-| pool thread count | n/a | *(T10 — blocked; do not reuse T0's number)* | < `pids_max` |
-| p50 latency, `/time/health` via Caddy | 2.9 ms (n=3, 2.2–3.0) | *(T10 — blocked)* | no regression |
-| cold start to all-members-healthy, s | 120–150 (n=1, 30 s polling) | *(T10 — blocked)* | < `start_period_s` |
+| metric | before | after | target | met |
+| --- | --- | --- | --- | --- |
+| Python processes | 18 (n=3) | 5 (n=3) | — | — |
+| pool cgroup `memory.current` MiB | n/a | 133–134 (n=3) | ≤ 150 MiB | yes |
+| — reference: T0, 6 apps serving, one loop | n/a | 66 MiB (n=3) | extrapolates to ~85–100 MiB at N=15 | under by ~30% |
+| sum of Layer-1 cgroups MiB | 712 (n=3) | 275 (n=3) | ≤ 300 MiB | yes |
+| all-services cgroup total MiB | 866–867 (n=3) | 464–465 (n=3) | ≤ 600 MiB | yes |
+| `free -m` available | 653–657 (n=3) | 1146–1147 (n=3) | ≥ 1200 MiB | **no**, short by 54 |
+| pool thread count | n/a | 27 (n=3) | < `pids_max` (288) | yes |
+| p50 latency, `/time/health` via Caddy | *(no valid number — see below)* | 5.39 ms (n=20) | no regression | yes vs control |
+| cold start to all-members-healthy, s | 120–150 (n=1) | **21** (n=1) | < `start_period_s` (240) | yes |
 
-The **before** column was re-taken on 2026-09-03 at 07:57–07:59 UTC with an
-archived script, `.claude/state/evidence/ams-measure.sh`, because the script
-behind `evidence/pool-before-2026-09-03.txt` was not kept and its definitions
-of `python_processes` and the two memory sums could not be restated. That
-archived file reads 40–100 MiB higher on the same unchanged fleet three hours
-earlier; the gap is method plus reclaim drift, not a real change. Use the row
-above, and the same script, for the "after".
+Measured on racknerd 2026-09-03, before at 07:57–07:59 and after at
+08:53–08:55, with the archived script `.claude/state/evidence/ams-measure.sh`.
+The script behind `evidence/pool-before-2026-09-03.txt` was not kept and its
+definitions could not be restated, so the before column was re-taken; that
+older file reads 40–100 MiB higher on the same unchanged fleet three hours
+earlier, which is method plus reclaim drift, not a real change. Full cutover
+log in `.claude/state/pool-migration.md`.
 
-**The "after" column is blocked, not pending.** `ams platform pool adopt core`
-fails on the live host before it moves anything — an unguarded
-`Path.is_dir()` in `_list_dir` (`src/ams/platform/pool.py:335`) re-raises
-`EACCES` on the pool root's 0750 `data/`, which the harness cannot traverse.
-The fleet is undamaged. See `.claude/state/diagnosis-pool-cutover.md` for the
-reproduction and `.claude/state/pool-migration.md` for the full cutover log.
+**The latency row has no valid "before".** That script sent
+`Host: api.lishuyu.app`, which matches no site block in the rendered Caddyfile
+(the entry site is `http://127.0.0.1:20180`), so Caddy answered an empty 200
+and both the before and after numbers timed Caddy's fallthrough handler rather
+than a service. The after figure above is a corrected measurement with no Host
+override. The control for it is `llmgateway`, a **non-pooled** service measured
+in the same minute: p50 5.82 ms against the pool members' 5.39 and 5.46 ms. A
+pooled member is not slower than a standalone one on an idle fleet. This says
+nothing about the shared-event-loop coupling risk under concurrent load, which
+was not tested.
+
+**Both sizing formulas are far more generous than the fleet needs.** At N=15
+the pool holds 130 MiB against a 600 MiB limit (22 %) and 27 pids against 288
+(9 %) — about 1.8 threads per member, not the 3 that `pids_per_member = 16`
+budgets for. The runbook's instruction is to re-derive the constants only when
+the measurement lands materially *above* the formula, so they are left alone
+and the measurement is recorded in D29's Open section instead. T0's 66 MiB at
+N=6 was, as predicted, an under-estimate: it ran with `SVC_DEV=1` and so omitted
+the per-member heartbeat, M2M-refresh and CLS-forwarder threads.
+
+**Cost the migration adds.** A sync tick now takes about 3 minutes, because
+`resume` and `secretsservice` are known-dead pool members that each burn a 90 s
+health gate on every tick, and the 60 s timer runs ticks back to back. The
+`--only` escape hatch the sync unit's comment relies on for `oss` does not work
+here: naming any member selects the whole pool, so a dead member cannot be
+dropped from a tick.
 
 **The thread count is the one T0 number that must not be carried over.** T0
 ran with `SVC_DEV=1`, which disables the SDK's registry calls, so its 3–4

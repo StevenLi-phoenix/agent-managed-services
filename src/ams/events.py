@@ -60,9 +60,13 @@ _LEVEL_NAMES: dict[str, Severity] = {
 
 # `%(levelname)s %(name)s: %(message)s` -- what the api SDK's basicConfig emits.
 # The logger name must be there: without it "ERROR: connection refused" would be
-# read as a level token, which is the heuristics' job, not this one's.
+# read as a level token, which is the heuristics' job, not this one's. An
+# optional `[<member>]` tag between the level and the logger name is the pool
+# runner's shape (`LEVEL [<member>] <logger>: <msg>`, e.g.
+# "INFO [kvservice] kvservice.main: started") -- several pooled services'
+# lines multiplexed onto one stream, tagged with which member emitted them.
 _LEVEL_PREFIX_RE = re.compile(
-    r"^(?P<level>[A-Za-z]+)[ \t]+(?P<name>[^\s:]+):",
+    r"^(?P<level>[A-Za-z]+)[ \t]+(?:\[(?P<tag>[a-z0-9][a-z0-9_-]*)\][ \t]+)?(?P<name>[^\s:]+):",
 )
 # JSON is only *considered* for a line that already looks like an object.
 _JSON_START_RE = re.compile(r"^\s*\{")
@@ -83,6 +87,20 @@ def _from_level_prefix(text: str) -> Severity | None:
     if m is None:
         return None
     return _LEVEL_NAMES.get(m.group("level").upper())
+
+
+def member_tag(text: str) -> str | None:
+    """The pool member tag of a ``LEVEL [<member>] <logger>: ...`` line, if any.
+
+    ``None`` when the line does not have this shape at all: no leading level
+    token, no bracketed tag, or no logger name before the colon. The level
+    token itself is not checked against the known severity names here --
+    that is ``classify``'s job, not this one's.
+    """
+    m = _LEVEL_PREFIX_RE.match(text)
+    if m is None:
+        return None
+    return m.group("tag")
 
 
 def _from_json(text: str) -> Severity | None:

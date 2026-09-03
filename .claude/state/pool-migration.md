@@ -512,3 +512,345 @@ marked blocked, not pending.
 | `commentservice` | stopped and restarted during the failed adopt; healthy |
 | pool root | staged, provisioned venv, 15 empty `data/<member>` dirs, no declaration, never started |
 | data snapshot | `/var/lib/ams/pre-pool-data-20260903080517.tgz`, still unused |
+
+---
+
+## Step 5, third attempt — ADOPTED (2026-09-03 08:41–08:43 UTC)
+
+`436d86b` deployed at ~08:41. Fleet back to 20 running + healthy at **125 s**
+after the restart (25 s polling), same 4 not healthy as always. `pool plan core`
+unchanged: 15 members, 65 planned actions.
+
+`ams platform pool adopt core` — **succeeded**:
+
+```
+pool-core: adopted 15 member(s); moved=10 secrets=20 declarations removed=15
+```
+
+The action list runs `pool-data`, then per member
+`stop → data-out → data → secrets → undeclare` (the five members with no
+database skip the two data steps). No error, no partial state.
+
+### Verification of the move
+
+`<pool-root>/data/<member>/`, listed as root:
+
+| member | contents |
+| --- | --- |
+| commentservice, emailservice, kvservice, locationservice, logservice, mailbox, messageservice, notificationservice, pages, turingtest | `<member>.db` |
+| llmpricing, resume, secretsservice, timeservice, wechatservice | *(empty — they never had one)* |
+
+The `-shm`/`-wal` sidecars are correctly **absent**: SQLite checkpointed them
+away on the clean stop, which is exactly the fact the previous attempt tripped
+over.
+
+`<state>/secrets/pool-core/` — 20 files, **names only**, no value read or
+printed:
+
+```
+BARK_DEVICE_KEY__NOTIFICATIONSERVICE   RESEND_API_KEY__EMAILSERVICE
+DEEPSEEK_API_KEY__COMMENTSERVICE       WECHAT_MP_APPID__WECHATSERVICE
+WECHAT_MP_APPSECRET__WECHATSERVICE
+SVC_SECRET__{COMMENTSERVICE, EMAILSERVICE, KVSERVICE, LLMPRICING,
+             LOCATIONSERVICE, LOGSERVICE, MAILBOX, MESSAGESERVICE,
+             NOTIFICATIONSERVICE, PAGES, RESUME, SECRETSSERVICE,
+             TIMESERVICE, TURINGTEST, WECHATSERVICE}
+```
+
+All 15 member `service.toml` declarations removed; the legacy roots are left in
+place, as the runbook requires.
+
+## Step 6 — sync, declare, start (08:42:48 → 08:50:01, 7 min 13 s)
+
+One `ams platform sync` by hand with the timer's own arguments minus `--only`.
+
+```
+INFO ams.platform.sync: sync done: sha=c8b1fff30428 services=22 unchanged=1 failed=4 reloaded=True gateway_changed=16
+```
+
+16 gateway sites re-rendered onto the pool's ports. Registry identities all
+returned **409 = success**; ACL upserts 200.
+
+### The pool process
+
+```
+08:43:37 INFO ams.supervisor: registered service pool-core (ports={commentservice:20021 … wechatservice:20036, pool:20031})
+08:43:37 INFO ams.cgroup: limits for pool-core: {'memory.max': '629145600', 'pids.max': '288', 'cpu.max': '100000 100000'}
+08:43:37 INFO ams.isolated: spawned pool-core pid=2129805 cgroup=…/svc-pool-core block=127648+1024
+```
+
+**Cold start: 21 s.** Spawn at 08:43:37, the last member (`wechatservice`,
+port 20036) and the admin server (20031) both serving at 08:43:58. Well under
+`start_period_s = 240`. Members came up sequentially at roughly one per
+0.5–1 s, in the order the runner swaps identity env.
+
+`ams ctl status` now lists **10 declarations** where there were 24:
+`auth, caddy, displayservice, files, hello, llmgateway, oss, pool-core,
+pyhello, registry`.
+
+### Members
+
+`ams platform status` (nested under `pool-core healthy c8b1fff30428 (15)`):
+13 healthy, 2 failed.
+
+| healthy (13) | failed (2) |
+| --- | --- |
+| commentservice, emailservice, kvservice, llmpricing, locationservice, logservice, mailbox, messageservice, notificationservice, pages, timeservice, turingtest, wechatservice | resume, secretsservice |
+
+**Identical to the pre-migration set.** No member that worked standalone
+stopped working in the pool.
+
+`/_pool/health` on 127.0.0.1:20031, verbatim:
+
+```json
+{
+  "pool": "core",
+  "ok": ["commentservice","emailservice","kvservice","llmpricing","locationservice",
+         "logservice","mailbox","messageservice","notificationservice","pages",
+         "timeservice","turingtest","wechatservice"],
+  "failed": {"secretsservice": "build failed", "resume": "startup failed"}
+}
+```
+
+The two failures name their real causes in the runner log, and both are the
+pre-existing ones:
+
+```
+ERROR [secretsservice] pool: build failed: KeyError: 'SECRETS_MASTER_KEY'
+ERROR [resume] pool: startup failed: SystemExit: 3
+  PermissionError: [Errno 13] Permission denied: '/var/lib/resume'
+```
+
+**This is the live confirmation of spike finding #3.** `resume`'s uvicorn
+startup called `sys.exit(3)` inside the shared event loop; the runner caught
+the `SystemExit` per member and the other 14 members were unaffected. Before
+the runner had that guard, one member's `SystemExit` would have taken the whole
+process down.
+
+### Pool resource use
+
+| metric | measured | declared limit | source of the limit |
+| --- | --- | --- | --- |
+| `memory.current` | 130 MiB (133–134 at rest, n=3) | 600 MiB | `150M + 30M × 15` |
+| `memory.peak` | 130 MiB | — | |
+| `pids.current` | 27 | 288 | `48 + 16 × 15` |
+| thread count of pid 2129805 | 27 | — | |
+| RSS | 127 MiB | — | |
+
+Both formulas are **far** more generous than the measurement needs: memory
+landed at 22 % of the limit and pids at 9 %. T0's 66 MiB at N=6 without
+`SVC_DEV` extrapolated to 85–100 MiB at N=15; the real figure with heartbeat,
+M2M-refresh and CLS-forwarder threads running is 130 MiB, so T0 was an
+under-estimate by ~30 %, in the direction the runbook predicted. 27 threads for
+15 members is roughly 1.8 per member, not the 3 the `pids_per_member = 16`
+constant budgets for. Recorded here rather than acted on: the doc's instruction
+is to re-derive only when the measurement lands *above* the formula.
+
+### Escalations since the reload — 14 from `pool-core`, classified
+
+| # | text | verdict |
+| --- | --- | --- |
+| 1 | `ERROR [secretsservice] pool: build failed: KeyError: 'SECRETS_MASTER_KEY'` | **genuine**, pre-existing |
+| 4 | `ERROR [resume] pool: startup failed: SystemExit: 3` + `PermissionError: /var/lib/resume` + 2 uvicorn traceback lines | **genuine**, pre-existing |
+| 1 | `WARNING [pool] sdk.fastapi: route '/comments/{comment_id}' starts with mount prefix '/comments'` | **genuine**, pre-existing api warning |
+| 4 | `WARNING [mailbox]` / `WARNING [pages] … failed to ensure oss bucket at startup` + 2 `httpx 401 … /oss/…` | **genuine**, caused by `oss` being down (not a pool member) |
+| 3 | `INFO [pool] uvicorn.error: {Waiting for application startup, Application startup complete, Uvicorn running on …}` | **MISCLASSIFIED — new** |
+| 1 | `pool-core: stuck at stage=declared for 300s after a sync` | **false alarm — new** |
+
+Nothing new and genuine. Two new *noise* sources, both worth fixing:
+
+**(a) `[logging] format = "level-prefix"` does not match the runner's own
+format.** The declaration sets it, but `_LEVEL_PREFIX_RE` in
+`src/ams/events.py:64` is `^(?P<level>[A-Za-z]+)[ \t]+(?P<name>[^\s:]+):` —
+`LEVEL name:`. The runner emits `LEVEL [tag] name:`, e.g.
+`INFO [pool] uvicorn.error: …`. The bracketed tag breaks the match, so
+`_from_level_prefix` returns `None` for **every** line the pool prints and
+everything falls through to the text heuristic — which then matches `\bERROR\b`
+inside the *logger name* `uvicorn.error` and escalates an INFO banner as ERROR.
+Verified locally: `_from_level_prefix` returns `None` for all four sample runner
+lines. Consequence today is three spurious escalations per pool start; the
+deeper cost is that the level-prefix contract the pool was given is inert.
+
+**(b) the post-sync health gate fires while the gate is still running.** The
+policy escalated `pool-core: stuck at stage=declared for 300s` at ~08:48 even
+though the pool had been healthy since 08:43:58. The sync walks its members'
+health gates sequentially and two of them burn 90 s each, so the run outlives
+the policy's 300 s window. Same line fired for 15 other services in the same
+tick.
+
+Neither was patched. `src/` is out of T10's scope.
+
+## Step 7 — external verification through Caddy
+
+`caddy fmt` round-trip on the rendered config: **identical**, byte for byte
+(`caddy fmt <state>/gateway/Caddyfile | cmp -s` against the file). 21 site files
+rendered; the pool members' `reverse_proxy` lines point at the pool's ports
+(kvservice → 20023, timeservice → 20034, pages → 20030, mailbox → 20027).
+
+### A correction to method, recorded because it changes the numbers
+
+The first pass sent `Host: api.lishuyu.app`. The entry site block is literally
+`http://127.0.0.1:20180 { … }`, so that Host matches **no** site and Caddy
+answers an empty 200. Every path returned "200" including `oss`, which is down.
+That result was worthless and is discarded. The correct probe sends no Host
+override (curl then sends `Host: 127.0.0.1:20180`, which matches the entry
+site). Subdomain members do need their own Host.
+
+**The same flaw is in the latency row of `ams-measure.sh`, so the "before" and
+"after" `time_health_via_caddy_s` numbers measure Caddy's empty-200 handler,
+not timeservice.** They are internally comparable and externally meaningless;
+a corrected latency measurement is below.
+
+### Path-mounted members, `http://127.0.0.1:20180<path>/health`
+
+| path | code | body |
+| --- | --- | --- |
+| /comments /email /kv /logs /message /notify | 200 | `{"status":"ok"}` |
+| /llm-live-pricing /time /wechat | 200 | `{"ok":true}` |
+| /resume | **502** | *(expected — member failed)* |
+| /secrets | **502** | *(expected — member failed)* |
+
+### Subdomain members
+
+| Host | code | body |
+| --- | --- | --- |
+| location.lishuyu.app | 200 | `{"ok":true}` |
+| mail.lishuyu.app | 200 | `{"ok":true}` |
+| pages.shuyuli.com | 200 | `{"ok":true}` |
+| turning-test.lishuyu.app | 200 | `{"ok":true}` |
+
+### Non-pool controls, and the harness probe
+
+`/files/health` 200 `{"status":"ok"}`, `/llm/health` 200 `{"ok":true}`,
+`/oss/health` 502 (down, not a member), `/ams-health` 200 `ok`.
+
+**13 of 15 members serve 200 through the gateway with a real body. The two
+502s are the two members that were already failed before the migration.**
+
+### M2M across the pool boundary — the shared key path
+
+`timeservice` (pool member) mints a token and calls `kvservice` (pool member)
+through Caddy. Both read the **one** `<pool-root>/etc/jwt-rs256.pub`. The secret
+was read inside the script on the box and never printed; the token is not
+reproduced here.
+
+```
+POST /api/m2m/token -> 200
+  header : {'alg': 'RS256', 'typ': 'JWT'}
+  claims : {'sub': 'service:timeservice', 'aud': 'kvservice',
+            'iss': 'http://127.0.0.1:20101', 'iat': 1788425587,
+            'exp': 1788511987, 'typ': 'm2m'}
+  sig len: 256 bytes
+PUT  /kv/pool-t10  no token  -> 401
+PUT  /kv/pool-t10  M2M token -> 204
+GET  /kv/pool-t10  no token  -> 401
+GET  /kv/pool-t10  M2M token -> 200 {"key":"pool-t10","value":"from-timeservice-in-pool",…}
+GET  /kv/pool-t10  tampered  -> 401
+```
+
+Signer and verifier agree inside one process on a key neither reads from the
+other's declaration, and a six-character change to the signature is rejected —
+so "any bearer token works" is ruled out. n=1, the same shape as
+`platform-layer0.md` §4.
+
+## Step 8 — the "after" measurement
+
+Same script, same definitions, n=3, 60 s apart, fleet idle, 08:53–08:55 UTC.
+
+| sample | python_procs | fleet_procs | layer1_sum MiB | all_services MiB | free avail MiB | load | pool mem MiB | pool pids | pool threads |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 5 | 8 | 275 | 464 | 1146 | 0.27 | 133 | 27 | 27 |
+| 2 | 5 | 8 | 275 | 465 | 1146 | 0.21 | 134 | 27 | 27 |
+| 3 | 5 | 8 | 275 | 465 | 1147 | 0.12 | 134 | 27 | 27 |
+
+Per-cgroup at rest: `pool-core` 130, `files` 80, `registry` 76, `llmgateway` 60,
+`auth` 49, `caddy` 34, `hello` 9, `pyhello` 9.
+
+### Before → after, n=3 each
+
+| metric | before | after | delta | target | met |
+| --- | --- | --- | --- | --- | --- |
+| Layer-1 cgroup sum | 712 MiB | 275 MiB | **−437 (−61 %)** | ≤ 300 | yes |
+| all-services cgroup total | 866–867 MiB | 464–465 MiB | **−402 (−46 %)** | ≤ 600 | yes |
+| `free -m` available | 653–657 MiB | 1146–1147 MiB | **+491** | ≥ 1200 | **no**, 1146 |
+| python processes | 18 | 5 | −13 | — | — |
+| pool `memory.current` | n/a | 133–134 MiB | — | ≤ 150 | yes |
+| pool thread count | n/a | 27 | — | < 288 | yes |
+| cold start to all members serving | 120–150 s (n=1) | **21 s** (n=1) | −100 s | < 240 | yes |
+
+`free -m available` misses its 1200 MiB target by 54 MiB. Every other target is
+met, most with wide margin.
+
+### Corrected latency, taken at the same moment
+
+`curl -w %{time_total}`, entry site, no Host override, n=20 each, sorted, p50:
+
+| endpoint | p50 | min | max |
+| --- | --- | --- | --- |
+| `/time/health` (pool member) | 5.39 ms | 4.20 | 35.15 |
+| `/kv/health` (pool member) | 5.46 ms | 4.08 | 12.43 |
+| `/llm/health` (**standalone control**, not pooled) | 5.82 ms | 4.80 | 40.05 |
+
+No valid "before" number exists for this row (see the method correction above),
+so `llmgateway` — a non-pooled service measured in the same minute on the same
+host — is used as the control instead. Pool members are **not slower** than the
+standalone control; the 0.4 ms gap is inside the noise of a 20-sample run.
+Weak evidence against the shared-event-loop coupling risk in spike §addendum:
+one idle-fleet run, n=20, no concurrent load. **Do not read this as "no
+coupling under load" — that was not tested.**
+
+## Step 6b — the sync timer, restarted
+
+`systemctl start ams-platform-sync.timer` at 08:56. First tick:
+
+```
+INFO ams.platform.sync: pool core: 8 of 15 members named; a pool is one process, so all of it is selected
+INFO ams.platform.sync: resume still failing (…); already escalated
+INFO ams.platform.sync: secretsservice still failing (…); already escalated
+INFO ams.platform.sync: sync done: sha=c8b1fff30428 services=17 unchanged=15 failed=2 reloaded=True gateway_changed=0
+```
+
+15 unchanged, 2 failed and **deduped** (`already escalated`, no new escalation),
+gateway unchanged. That is the steady state.
+
+**New operational cost, worth recording.** A tick now takes **3 min 2 s**
+(08:55:56 → 08:58:58) because `resume` and `secretsservice` each burn a 90 s
+health gate, and the 60 s timer therefore runs ticks back to back. The unit's
+own comment explains that `oss` and `secretsservice` were left out of `--only`
+for exactly this reason — but a pooled member **cannot** be excluded that way:
+naming any member selects the whole pool. The escape hatch the comment relies
+on no longer exists for these two. Options for the owning task: give a known-
+dead member a shorter health deadline, let a pool declare a member as expected-
+failed, or fix the two services. Not acted on here.
+
+## Step 9 — regressions
+
+**None.** Nothing that returned 200 before the migration returns anything else
+now.
+
+| before | after |
+| --- | --- |
+| 13 members healthy | the same 13 members healthy |
+| resume, secretsservice failed | the same two failed, same causes |
+| displayservice, oss failed (non-members) | unchanged |
+| files, llmgateway healthy (non-members) | unchanged |
+
+New escalations are the three misclassified `INFO [pool] uvicorn.error` lines
+and one premature post-sync health-gate warning — noise, not failures, both
+analysed above.
+
+Legacy member roots are **left in place**, as the runbook requires. The
+pre-migration snapshot `/var/lib/ams/pre-pool-data-20260903080517.tgz` is
+retained and was never needed.
+
+## Final host state
+
+| item | state |
+| --- | --- |
+| ams on `/home/harness/ams` | `436d86b` |
+| `<store>/upstream/api.git` `ams-platform` | `c8b1fff30428…` |
+| `ams-harness.service` | active; 10 declarations, `pool-core` healthy |
+| `ams-platform-sync.timer` | **active** (restarted); ticks ~3 min, no-op |
+| `pool-core` | pid 2129805, 16 ports 20021–20036, 130 MiB, 27 threads |
+| legacy member roots | present, untouched |
+| snapshot | `/var/lib/ams/pre-pool-data-20260903080517.tgz`, unused |
