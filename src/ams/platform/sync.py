@@ -234,6 +234,14 @@ class SyncConfig:
     fetch_timeout_s: float = sources.DEFAULT_FETCH_TIMEOUT_S
     health_deadline_s: float = 90.0
     health_interval_s: float = 1.0
+    #: How long a service that already failed its probe *at this same commit* is
+    #: left alone before the gate is tried again. The live cost of not having
+    #: this: two permanently dead pool members burned 90 s each on every tick,
+    #: so a steady-state tick took 3 min 2 s and the 60 s timer ran runs back to
+    #: back (`.claude/state/pool-migration.md` step 6b). Not zero, because a
+    #: service fixed by hand (a secret set, a permission granted) has to be able
+    #: to heal without waiting for an unrelated commit.
+    failed_health_retry_s: float = 900.0
     ctl_timeout_s: float = 60.0
     gateway_entry_host: str = "127.0.0.1"
     #: Caps handed to every translation. Defaults match PLAN-allin Q8.
@@ -307,6 +315,14 @@ def _stamp(now_s: float) -> str:
     return datetime.fromtimestamp(now_s, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _unstamp(text: str) -> float | None:
+    """Inverse of :func:`_stamp`. ``None`` for anything it did not write."""
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 @dataclass
 class ServiceRecord:
     """One row of ``platform-state.json``. Field names are the file's keys."""
@@ -331,6 +347,12 @@ class ServiceRecord:
     pool: str | None = None
     #: On a *pool* record: the member ids sharing this process, sorted.
     pool_members: list[str] = field(default_factory=list)
+    #: When the health gate last *failed* for this service. Written only on a
+    #: failure, so a record that has always been healthy never carries the key,
+    #: and read only while the record is ``failed`` -- it is the clock the retry
+    #: window in :func:`_health_gate_due` runs on. Declared here because
+    #: `PlatformState.load` keeps only what the dataclass declares.
+    health_failed_at: str = ""
     escalated: bool = False
     updated_at: str = ""
     stage_since: str = ""
@@ -348,6 +370,8 @@ class ServiceRecord:
             data.pop("pool", None)
         if not data.get("pool_members"):
             data.pop("pool_members", None)
+        if not data.get("health_failed_at"):
+            data.pop("health_failed_at", None)
         return data
 
 
@@ -728,6 +752,16 @@ class _Pending:
     prior_sha: str | None = None
     prior_error: str | None = None
     prior_escalated: bool = False
+    #: The record exactly as this tick found it. Every phase walks a record
+    #: *forward* (`advance` never moves one back), so by the time the health
+    #: gate runs, a service that was `failed` when the tick started is sitting
+    #: at `reloaded` again. Holding the gate therefore has to put the record
+    #: back, and putting it back byte for byte is what keeps a tick that
+    #: changed nothing from writing the state file.
+    prior_record: ServiceRecord | None = None
+    #: Set by :func:`_phase_hold`: still dead at an unchanged commit, so this
+    #: tick neither reloads for it nor probes it.
+    health_held: bool = False
     actions: list[str] = field(default_factory=list)
     changed: bool = False
     reached: str = STAGES[0]
@@ -965,6 +999,7 @@ def _snapshot_prior(run: _Run, item: _Pending, service_id: str) -> None:
     item.prior_sha = rec.sha
     item.prior_error = rec.error
     item.prior_escalated = rec.escalated
+    item.prior_record = replace(rec, pool_members=list(rec.pool_members))
 
 
 @dataclass
@@ -1723,6 +1758,7 @@ def _phase_reload(run: _Run, live: Sequence[_Pending], sha: str) -> tuple[bool, 
         item
         for item in live
         if item.kind == "service"
+        and not item.health_held
         and ("declare" in item.actions or item.prior_stage not in LIVE_STAGES)
     ]
     if not needed:
@@ -1880,6 +1916,11 @@ def _phase_health(run: _Run, client: RegistryClient, item: _Pending, port: int) 
         run.advance(item, "healthy")
         return True
     run.fail(item, "health", f"{url} not 200 within {run.cfg.health_deadline_s:.0f}s", item.sha)
+    # The clock the retry window runs on. Written here rather than in `fail`
+    # because it is only the health transition that is held off, and only a
+    # failure stamps it -- so a record that has never failed a probe never
+    # carries the key and the documented record shape is unchanged for it.
+    run.platform.get(item.id).health_failed_at = _stamp(run.now())
     return False
 
 
@@ -1903,6 +1944,99 @@ def _pool_blocked(run: _Run, item: _Pending) -> bool:
     item.changed = True
     log.info("%s: not declared -- its pool failed (%s)", item.id, error)
     return True
+
+
+def _health_gate_held(run: _Run, item: _Pending, redeclared: set[str | None], now_s: float) -> bool:
+    """Is this service's health gate held off on this tick?
+
+    Only ever true for a service that was already ``failed`` at its **health**
+    probe, at this same commit, with nothing about it moved. Four signals say
+    "no, gate it", and all four are read off the run and the record -- nothing
+    here asks the host or the harness:
+
+    1. **its declaration was rewritten** (``"declare"`` in this tick's actions),
+       which is the only thing that makes the harness restart it (D17);
+    2. **its pool was re-declared**, which restarted the one process serving
+       every member -- a pooled member has no declaration of its own to watch;
+    3. **anything else moved for it** (``item.changed``): a re-stage, a
+       provision, a sidecar, a freshly generated secret;
+    4. **it was not failed at the health transition when the tick started** --
+       a new service, one still being driven to ``healthy``, or one that failed
+       at ``register`` instead, which is usually a registry that was briefly
+       down and which the next tick should therefore retry. The transition is
+       already the first word of ``error``, so no new field records it.
+
+    The prior record is what all of this is read from, never the live one:
+    every phase before this walks a record *forward* (``advance`` never moves
+    one back), so a service that was ``failed`` when the tick started is
+    already sitting at ``declared`` by the time this runs.
+
+    An operator's ``ams ctl restart`` is deliberately **not** a signal, because
+    it leaves no trace in ``platform/state.json`` for this function to read.
+    ``failed_health_retry_s`` covers that case instead: a service repaired by
+    hand is re-probed on its own within one window rather than staying
+    ``failed`` in the record until an unrelated commit happens to touch it.
+    """
+    if item.kind != "service":
+        return False
+    if "declare" in item.actions or item.changed:
+        return False
+    if item.pool and not item.is_pool and item.pool in redeclared:
+        return False
+    if item.prior_stage != FAILED or item.prior_sha != item.sha:
+        return False
+    if not (item.prior_error or "").startswith("health:"):
+        return False
+    last = _unstamp(run.platform.get(item.id).health_failed_at)
+    if last is None:
+        # A record from before this field existed, or one restored from a
+        # backup: gate it once, which stamps it, and hold it from then on.
+        return False
+    return (now_s - last) < run.cfg.failed_health_retry_s
+
+
+def _phase_hold(run: _Run, live: Sequence[_Pending]) -> list[str]:
+    """Hold the health gate for what is still dead at an unchanged commit.
+
+    Runs *before* the mid-run flush, not inside :func:`_phase_finish`, for one
+    reason: the phases have already walked a failed record forward to
+    ``declared``, and a flush in between would persist that -- so the tick
+    would write the state file twice and could never be a no-op. Held items are
+    left at their prior stage, which also keeps them out of ``_mark_reloaded``
+    and therefore out of the gate.
+
+    The live cost of not doing this, measured on the box: two permanently dead
+    pool members burned 90 s each on every tick, a steady-state tick took
+    3 min 2 s, and the 60 s timer ran ticks back to back
+    (`.claude/state/pool-migration.md` step 6b). ``--only`` cannot exclude them,
+    because naming any member of a pool selects the whole pool.
+    """
+    redeclared = {
+        item.pool for item in live if item.is_pool and item.pool and "declare" in item.actions
+    }
+    now_s = run.now()
+    held: list[str] = []
+    for item in live:
+        if not _health_gate_held(run, item, redeclared, now_s):
+            continue
+        if item.prior_record is None:  # pragma: no cover - a failed record always exists
+            continue
+        # Byte for byte, including `updated_at`: an identical record is what
+        # makes `PlatformState.flush` a no-op, which is the property the timer
+        # depends on.
+        run.platform.records[item.id] = item.prior_record
+        item.reached = item.prior_record.stage
+        item.health_held = True
+        held.append(item.id)
+    if held:
+        log.info(
+            "health gate held for %d service(s) still failed at the same commit and "
+            "unchanged since the last probe (retry in %.0fs): %s",
+            len(held),
+            run.cfg.failed_health_retry_s,
+            ", ".join(sorted(held)),
+        )
+    return held
 
 
 def _phase_finish(run: _Run, live: Sequence[_Pending], sha: str) -> None:
@@ -2032,9 +2166,10 @@ def sync(
             continue
         if _phase_materialize(run, item):
             _phase_declare(run, item)
-    run.platform.flush()
 
     live = [item for item in run.pending if not item.failed_with]
+    _phase_hold(run, live)
+    run.platform.flush()
     reloaded, reload_error = _phase_reload(run, live, sha)
 
     gateway_changed: list[str] = []
