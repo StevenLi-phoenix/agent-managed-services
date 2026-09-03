@@ -836,3 +836,37 @@ Not done deliberately: no stop/restart cascade when a dependency dies later
 (Phase-B question), and `platform/rollback.py` still treats only
 `("stopped", "failed")` as down — a service parked in `waiting` reads as neither
 there. Out of this task's scope; worth a look when rollback is next touched.
+
+## T4.3 failure injection + rollback (2026-09-03)
+
+Built `src/ams/platform/rollback.py`: `rollback(state, store, id, *, cfg, to_sha=None)`
+re-stages the target commit, re-provisions, re-reads and re-translates the manifest
+**as it was at that commit**, rewrites the declaration and both sidecars, then
+stop -> reload -> restart -> health gate, and flips the record
+(`sha`/`deployed_sha` = target, `stage`, `rolled_back_from`, `escalated=False`,
+`prev_sha=None` on success). One `PlatformRollback` JSONL record on stdout either
+way. Runnable as `python -m ams.platform.rollback <id> [--to SHA]`; exit 0 healthy,
+1 rolled-back-but-unhealthy, 2 precondition (nothing touched).
+
+Verified: local suite **990 passed / 110 skipped**, ruff clean on the three files.
+Remote `scripts/remote-test.sh ams-e2e tests/linux/test_platform_e2e.py` **24 passed
+in ~49 s, 3 runs, 3 green**; `tests/test_platform_rollback.py` (32) also green there.
+Live evidence from the run logs, not just our bookkeeping: beta `exited signal=9
+uptime=0.40s` then `giving up on beta: restart.policy=never`; hog's cgroup moved
+`memory.max` 67108864 -> 33554432, OOM-killed twice (`signal=9 uptime=0.26s`), and
+the rollback put it back at 67108864 and listening. Live fleet pids captured either
+side of a full e2e run: **identical**, 16 services (T4.1's in-flight fleet), harness
+active. `/home/harness/{ams-e2e,state/ams-e2e}` and the store's `repos/e2e*.git` +
+`src/e2e*` removed.
+
+Two host findings the e2e forced, both recorded in DECISIONS: `run_admin`'s bare
+`os.fork()` must not run in a multi-threaded process (a threaded sync deadlocked
+`rm`/`mv`/`uv python install` into their own SIGKILL timeouts), and nothing may be
+forked before `build_supervisor` claims the delegated cgroup (cgroup v2 EBUSY).
+
+Wiring left for T3.1/T4.4 — two lines in `src/ams/platform/cli.py`:
+`from ams.platform.rollback import add_subparser as add_rollback, cmd_rollback`, then
+`add_rollback(ops)` in `add_subparser` and `"rollback": cmd_rollback` in
+`cmd_platform`'s handler dict. Also one line in `sync.ServiceRecord`:
+`rolled_back_from: str | None = None`, without which the field a rollback writes is
+dropped the next time the sync loop rewrites the state file.

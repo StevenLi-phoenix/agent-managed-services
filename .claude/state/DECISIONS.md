@@ -1296,3 +1296,101 @@ real http/tcp check.
   `api/components/auth/src/auth/{main,email_client}.py`). Caddy proxies whatever
   happens to be up. Anything else would risk a cycle or would hold the gateway
   down for the whole of Layer 0's start.
+
+### D27 (T4.3). Rollback restores code, never data; and the e2e's process topology is load-bearing (2026-09-03)
+
+- **What a rollback moves: the tree, the venv, the declaration, both sidecars.
+  What it does not: `<root>/data`, secrets, the registry, the gateway, and every
+  other service.** Each exclusion is a decision, not an omission. *Data* is out
+  because a rollback undoes code, not the migration the newer code ran; reversing
+  rows is a restore from the T2.4 backup, a different operation with a different
+  blast radius, and silently reverting a schema under a service is how you lose
+  writes. *Secrets* are out because `SVC_SECRET` belongs to the identity, not to
+  a commit — `rollback` never reads a value, never generates one, and fails at
+  `declare` if it is missing rather than minting a replacement that would
+  invalidate the registry's copy. *The registry* is out because the identity is
+  sha-independent and the ACL is re-upserted from the (now rolled-back)
+  `registry.json` by the next sync tick; consequently nothing here calls an admin
+  endpoint and nothing here needs the admin token, which is why the health gate
+  is a plain `urllib` GET (`rollback.wait_healthy`) rather than
+  `RegistryClient.wait_healthy`. Borrowing that method would have meant passing a
+  placeholder token to a constructor that rejects an empty one — a stub that
+  later gets mistaken for a real credential. *Rejected:* re-rendering the
+  gateway. `mount.json` **is** rewritten, but the Caddy config is fleet state
+  assembled from every mount sidecar (D24) and re-rendering restarts the gateway
+  for all twenty routes to fix a case (the mount path changed between two
+  commits) that is rare and self-heals on the next tick. The report warns when
+  the sidecar actually changed.
+- **`prev_sha` is cleared on a successful rollback, kept on a failed one.** It
+  means "the last commit that reached healthy", and after a rollback to X that
+  commit is X, which is now in `sha`. Leaving the old value would make a second
+  rollback target the commit we are already on. On failure nothing has replaced
+  the older healthy commit, so it stays. `sync.begin()` refills it on the next
+  move, so the record heals itself.
+- **The sync timer undoes a rollback, and that is said out loud rather than
+  worked around.** `sync` drives every affected service to the head of the
+  branch, and the range from the rolled-back sha to the head necessarily touches
+  this service — that is why it was rolled back — so the next tick redeploys it.
+  Both the report's `warnings` and the escalation say so. *Rejected:* a
+  `pinned_sha` on the record. The record is `sync.py`'s (out of this task's file
+  scope), and a field nothing reads that *looks* like a pin is worse than no
+  field: an operator would believe the service was held. It is one line in
+  `ServiceRecord` plus one check in `target_sha` whenever T3.1 wants it.
+- **`rolled_back_from` is written by editing the raw JSON document, not through
+  `PlatformState`.** That loader keeps only the keys its dataclass declares, so
+  round-tripping would drop the field from *every other* service's record too.
+  `rollback.load_state_doc` version-checks and otherwise passes the document
+  through untouched (pinned by a test). The field still survives only until the
+  sync loop next rewrites the file — see the one-line addition in PROGRESS.md.
+- **`cfg: SyncConfig` is a required argument, not a default.** Every knob in it
+  (memory floor, cpu cap, the loopback registry/auth URLs) feeds the
+  `TranslateContext`, and a rollback translated under different caps writes a
+  declaration the next sync tick immediately rewrites — an invisible second
+  restart of the service that was just brought back. *Rejected:* defaulting
+  `repo_url` to `DEFAULT_REPO_URL`; on racknerd the source is a local mirror
+  (D24/T3.2) and a silent default would fetch the wrong thing.
+- **Stop, then stage, then reload, *then* restart.** The stop is D24 (T3.2)'s
+  live lesson: `stage()` swaps `<root>/repo` and the venv lives inside it, so a
+  process exec'ing during the swap dies with `ModuleNotFoundError`. The reload is
+  not redundant with the restart — `restart` alone re-spawns the declaration the
+  harness still holds *in memory*, i.e. the bad commit's, against the newly
+  staged tree. And `reload` deliberately leaves a service alone when an operator
+  stopped it (D17), which the stop just did, so the restart is what brings it
+  back. `_wait_stopped` treats `waiting` as down alongside `stopped`/`failed`:
+  a `depends_on`-gated service has no process, which is all staging needs.
+
+### Open / weak signals (rollback + platform e2e, 2026-09-03)
+
+- **`tests/linux/test_platform_e2e.py`'s topology is not a style choice.** The
+  supervisor is in the pytest process and the sync/rollback are *separate
+  processes*, which is production's shape (D17). The first version ran the sync
+  in a thread and failed on the box: `ams.userns.run_admin` is a bare
+  `os.fork()`, and forking a multi-threaded process gives the child only the
+  forking thread, so a lock another thread held is held forever — `rm -rf`, `mv`
+  and `uv python install` hung and were SIGKILLed by their own timeouts (`rc=-9`,
+  no stderr, intermittent per service). **Nothing may add a thread to a process
+  that forks into a user namespace.** That also rules out a threaded fake
+  registry, which is why the e2e's registry is a declared ams service.
+- **Nothing may be forked before `build_supervisor`.** `CgroupRoot.discover`
+  moves *self* into `<delegated>/harness/` and then enables controllers on the
+  delegated root; cgroup v2 refuses that (EBUSY, "no internal processes") while
+  any process still sits directly in the root. A helper started earlier is
+  exactly such a process. Both of these cost a remote round trip each to find and
+  are worth knowing before the next Linux test is written.
+- **The e2e's containment claim rests on pids, not on our own records.** Every
+  injection asserts both the failing service's record *and* that the untouched
+  services' pids did not change. n=3 full runs on racknerd, 3 green, ~49 s each.
+  The live fleet's pids were captured either side of a full run and were
+  identical (16 services, T4.1's in-flight fleet).
+- **The memory injection is a real cgroup OOM, confirmed from the logs**
+  (`memory.max` 67108864 -> 33554432, `exited signal=9 uptime=0.26s` twice, then
+  67108864 again after the rollback), not merely a health-gate timeout. n=1 host,
+  n=3 runs.
+- **A rollback of a `kind: static` mount raises `RollbackError`.** A static site
+  has no process, no declaration and no health probe, so "restart it and gate on
+  health" has no meaning; republishing at an older sha is `publish_static`'s job
+  and belongs to T3.4. Revisit if a static site ever needs pinning.
+- **Untested: a rollback while the harness is down.** `_step_stop` fails with
+  `stop: ControlError: ...` and the record is marked `failed` with nothing staged,
+  which is the intended shape, but it has n=0 observations — the portable tests
+  cover a *refused* stop, not an absent socket.
