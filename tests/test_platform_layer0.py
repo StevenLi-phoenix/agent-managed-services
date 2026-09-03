@@ -470,6 +470,44 @@ def test_declarations_and_sidecars_land_on_disk(rig: _Rig) -> None:
     assert rig.state.service_decl_path(layer0.CADDY_ID).is_file()
 
 
+def test_no_layer1_runs_every_stage_and_touches_no_layer1_service(rig: _Rig) -> None:
+    """A fresh host has no pilot services to re-point and, since pools, must not
+    get standalone kvservice/timeservice declarations that the sync tick would
+    then have to adopt into pool-core. ``layer1={}`` brings up Layer 0 only: every
+    stage label is still reported (the report shape does not change), but no
+    Layer-1 service is stopped, staged, registered or started, and the gateway
+    is rendered with zero mounts."""
+    report = layer0.bring_up(rig.state, rig.store, repo_url=REPO_URL, ref="main", layer1={})
+    assert report.stages == list(layer0.STAGES)
+    assert report.failed_stage is None
+    assert not rig.has("ctl:stop:")
+    assert not rig.has("ctl:start:")
+    assert not rig.has("stage:kvservice")
+    assert not rig.has("identity:")
+    assert report.identities == {}
+    assert rig.state.service_decl_path(layer0.CADDY_ID).is_file()
+    assert set(report.health) == {REGISTRY_ID, AUTH_ID, layer0.CADDY_ID}
+
+
+def test_cli_no_layer1_passes_an_empty_pilot_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_bring_up(state: Any, store: Any, **kw: Any) -> Any:
+        seen.update(kw)
+        return SimpleNamespace(as_dict=lambda: {"ok": True})
+
+    monkeypatch.setattr(layer0, "bring_up", fake_bring_up)
+    common = ["--repo-url", REPO_URL, "--state", str(tmp_path / "s"), "--store", str(tmp_path / "r")]
+    assert layer0.main([*common, "--no-layer1"]) == 0
+    assert seen["layer1"] == {}
+    seen.clear()
+    assert layer0.main(common) == 0
+    assert seen["layer1"] == layer0.DEFAULT_LAYER1_MANIFESTS
+    capsys.readouterr()
+
+
 def test_report_carries_no_secret(rig: _Rig) -> None:
     """The admin token and both SVC_SECRETs pass through this module; none of
     them may reach the report, which ``main`` prints verbatim."""

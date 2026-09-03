@@ -2,9 +2,12 @@
 # Bring Layer 0 (registry, auth) and the Caddy gateway up on racknerd as ams
 # services, then re-point the two pilot Layer-1 services at the replica.
 #
-# Usage: scripts/platform-bootstrap.sh [--no-deploy] [--ref <branch>]
+# Usage: scripts/platform-bootstrap.sh [--no-deploy] [--ref <branch>] [--no-layer1]
 #   --no-deploy   skip scripts/deploy-racknerd.sh (code already on the box)
 #   --ref BRANCH  branch to bring up (default: main)
+#   --no-layer1   Layer 0 only: no pilot services re-pointed. Use on a FRESH host
+#                 (nothing to stop, and kvservice/timeservice are pool members now,
+#                 so the sync timer must be the one that declares them).
 #
 # This is a thin driver. Everything it does on the box is one call into
 # `python -m ams.platform.layer0`, whose ordering constraints are documented in
@@ -42,10 +45,12 @@ REMOTE_ROOT=/home/harness/ams
 
 DEPLOY=1
 REF=main
+LAYER1_FLAG=
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-deploy) DEPLOY=0 ;;
     --ref) REF=$2; shift ;;
+    --no-layer1) LAYER1_FLAG=--no-layer1 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -99,7 +104,7 @@ ssh_ "'$STORE/bin/caddy' version"
 # ------------------------------------------------------------------ bring-up
 
 echo "==> layer-0 bring-up (ref $REF)"
-as_harness "-m ams.platform.layer0 --repo-url $UPSTREAM --ref $REF -v"
+as_harness "-m ams.platform.layer0 --repo-url $UPSTREAM --ref $REF $LAYER1_FLAG -v"
 
 # --------------------------------------------------------------- verification
 

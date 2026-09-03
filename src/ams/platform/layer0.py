@@ -630,6 +630,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--store", metavar="DIR", help="store dir (default: $AMS_STORE_DIR)")
     parser.add_argument("--caddy-port", type=int, default=CADDY_PORT)
     parser.add_argument("--deadline", type=float, default=DEFAULT_HEALTH_DEADLINE_S)
+    parser.add_argument(
+        "--no-layer1",
+        action="store_true",
+        help=(
+            "bring up Layer 0 only (registry, auth, gateway) and re-point no pilot "
+            "service. For a fresh host: the sync timer owns the fleet, pools included, "
+            "and a standalone kvservice/timeservice declared here would have to be "
+            "adopted into pool-core on the first tick."
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -648,6 +658,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ref=args.ref,
             caddy_port=args.caddy_port,
             health_deadline_s=args.deadline,
+            layer1={} if args.no_layer1 else DEFAULT_LAYER1_MANIFESTS,
         )
     except Layer0Error as e:
         log.error("bring-up failed at %s", e.stage)

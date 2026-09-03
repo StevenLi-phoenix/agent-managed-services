@@ -1880,3 +1880,46 @@ re-gated every tick (a no-op tick took ~3 min with two dead members).
 **Open:** the 900 s hold and the sizing formulas are starting values (n=1
 live observation each); latency coupling under load is unmeasured (one idle
 run: pool members 5.4 ms vs standalone control 5.8 ms via Caddy, n=20).
+
+### D30. Mock deploy on a fresh 1 GB DigitalOcean droplet: three fresh-host fixes (2026-09-03)
+
+**Context.** The user asked for a mock deploy of the api platform "to phm with
+a new DO machine", 1 GB RAM. Everything Phase A knew was learned on racknerd,
+a box hand-configured over two days; the point of the rehearsal is to find
+what only the scripts know. Full record: `.claude/state/mock-deploy-do.md`.
+
+**Decisions.**
+
+1. **`layer0.py --no-layer1` rather than making `stop-layer1` tolerate an
+   unknown service.** Rejected alternative: treat `ctl stop <unknown>` as
+   already-stopped and carry on. That would have let the bring-up declare a
+   *standalone* kvservice and timeservice on a fresh host, which since D29
+   are members of `pool-core`; the first sync tick would then hit the adoption
+   guard (or worse, run two copies). The pilot re-pointing was Phase A's proof
+   step and has no meaning on a host that never ran the pilot. Layer 0 alone
+   is the fresh-host shape; the sync timer owns the fleet.
+2. **`_phase_finish` registers every identity before it opens any health
+   gate (two passes), rather than moving `registered` ahead of `reloaded` in
+   the stage order.** Observed: the pool item precedes its members in `work`,
+   so the pool's 90 s `/_pool/health` gate ran while every member's startup
+   404ed on `POST /api/services/register`; the pool was recorded `failed`
+   (and, with the D29-addendum hold, would not have been re-gated for 900 s)
+   although its next restart succeeded once the identities existed.
+   Rejected alternative: register before reload. Correct in principle (it is
+   the CLAUDE.md rule) but it re-orders the monotonic stage list every record
+   and golden test pins, for a gain of one crash + one 20 s backoff per
+   service on a fresh host only. Recorded as an open item, not done.
+3. **`install-host.sh` gains `libatomic1` and an `apt-get update`.** The
+   standalone pnpm binary needs `libatomic.so.1`; racknerd had it by accident
+   (a dependency of something else), a minimal 24.04 cloud image does not, and
+   `set -e` then silently skipped Caddy, the state dir and the unit.
+4. **A 1 GiB swapfile on the 1 GB box, and swap *use* is reported as a
+   number, not hidden.** Without it, `uv sync` of the 15-member pool venv on
+   961 MiB would be one OOM kill away from a failed provision with no
+   diagnostic. DO images ship no swap; racknerd has a swap partition.
+
+**Assumptions / would break if.** The two-pass register assumes creating an
+identity never depends on the service being up (true: it is a registry
+write with a stored secret). `--no-layer1` assumes the sync unit's `--only`
+list names at least one member of every pool wanted (it does: "8 of 15
+members named; a pool is one process, so all of it is selected").

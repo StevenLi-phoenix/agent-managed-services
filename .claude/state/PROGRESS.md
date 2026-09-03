@@ -1089,3 +1089,29 @@ Linux suite green except the known load-sensitive `test_pids_max_caps_a_fork_sto
 Legacy member roots + snapshot `/var/lib/ams/pre-pool-data-20260903080517.tgz`
 kept on the box for one backup cycle; delete by hand after.
 Next: user decisions (roster, R2 creds, api branch push), Phase B unchanged.
+
+## 2026-09-03 — racknerd cleanup + mock deploy on a fresh 1 GB DO droplet
+
+**racknerd residue removed** (user: "顺手把 racknerd 上的残留清掉"): the 15
+legacy pooled-member roots and their secret copies, the e2e `hello`/`pyhello`
+declarations, uid blocks + ports of those 18 ids (`UidAllocator.release` /
+`PortAllocator.release`), `uidmap.json.bak.*`, the test rsync dirs
+(`t10-live t2-pool-runner t41 t8-pool-adopt`, `t41*.log`, the stale
+`/home/harness/state`), `store/scratch-pool`, and
+`/var/lib/ams/pre-pool-data-20260903080517.tgz`. `services/` 1.7 G → 609 M.
+One sync tick after: `unchanged=17 failed=2`, nothing recreated, 8 cgroups.
+
+**Mock deploy** (user: "mock deploy to phm with new DO machine … 1GB"):
+droplet `platform-mock` (203.0.113.10, `s-1vcpu-1gb`, ssh `phm-mock`,
+$6/mo — delete when done). Scripts-only fresh-host bring-up surfaced four
+gaps, all fixed and tested (D30): `install-host.sh` needs `libatomic1` (+
+`apt-get update`); `layer0.py --no-layer1` (no pilot pair on a fresh host,
+and it would collide with `pool-core`); `platform-bootstrap.sh --no-layer1`
+passthrough; `sync._phase_finish` registers every identity before any health
+gate. Fresh re-run on wiped state: Layer 0 up in 19 s, `pool-core` healthy in
+23 s on one attempt, 13/15 members + llmgateway healthy (resume/secretsservice
+dead as on racknerd), 15/15 routes 200 via Caddy, second tick 1 s. Record:
+`.claude/state/mock-deploy-do.md`, evidence `evidence/mock-do-1gb-2026-09-03.txt`.
+Open (D30): standalone services still start before they are registered (one
+crash + 20 s backoff each on a fresh host); node 22 and the timer units are
+hand steps.

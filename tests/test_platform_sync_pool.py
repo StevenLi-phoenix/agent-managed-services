@@ -535,6 +535,27 @@ def test_finish_looks_the_port_up_on_the_owner(
     assert f":{allocated[POOL_ID]['alpha']}" in caddyfile
 
 
+def test_every_identity_is_created_before_any_health_gate_opens(
+    pool_env: Any, upstream_pool: Any, stub_pool: None
+) -> None:
+    """Fresh host. A pooled member with no registry identity yet crashes its
+    uvicorn at startup (the SDK's register POST 404s), and the runner exits when
+    no member started -- so gating the pool's ``/_pool/health`` before its
+    members are registered can only time out. Seen on the DO mock host
+    2026-09-03: pool-core failed at health after 90 s, *then* llmpricing's
+    identity was created. Registration is registry-only work; every identity
+    the tick will create must exist before the first probe of anything."""
+    src, _sha = upstream_pool
+    report = run(pool_env, src)
+    assert report.outcome(POOL_ID).stage == "healthy"
+    reqs = pool_env.registry.requests
+    creates = [i for i, r in enumerate(reqs) if r["method"] == "POST" and r["path"] == "/api/services"]
+    probes = [i for i, r in enumerate(reqs) if r["method"] == "GET" and r["path"].endswith("/health")]
+    assert len(creates) == 3, [r["path"] for r in reqs]  # alpha, beta, solo
+    assert probes, "no health probe recorded"
+    assert max(creates) < min(probes), [(r["method"], r["path"]) for r in reqs]
+
+
 def test_a_member_whose_pool_has_no_port_fails_naming_the_owner(
     pool_env: Any, upstream_pool: Any, stub_pool: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

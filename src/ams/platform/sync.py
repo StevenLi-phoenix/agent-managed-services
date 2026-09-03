@@ -2105,9 +2105,15 @@ def _phase_finish(run: _Run, live: Sequence[_Pending], sha: str) -> None:
     client = RegistryClient(run.cfg.registry_url, admin_token)
     ports = PortAllocator(run.state.ports_state)
 
-    for item in work:
-        if not _phase_register(run, client, item):
-            continue
+    # Two passes, not one: every identity first, then the gates. A translated
+    # service registers itself inside its FastAPI lifespan and a 404 there is a
+    # uvicorn startup failure, so a pool whose members are not yet registered
+    # cannot answer /_pool/health no matter how long it is given -- and the pool
+    # item sits *before* its members in `work`. Registration is registry-only
+    # work (no probe, no wait), so doing all of it up front costs nothing on a
+    # steady-state tick and is what a fresh host needs (mock-deploy-do.md).
+    registered = [item for item in work if _phase_register(run, client, item)]
+    for item in registered:
         owner = item.port_owner or item.id
         allocated = ports.get(owner).get(item.port_name)
         if allocated is None:

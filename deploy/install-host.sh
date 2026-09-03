@@ -12,7 +12,10 @@ STORE_MNT=$HARNESS_HOME/store
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get install -y -q uidmap python3.12-venv rsync xfsprogs unzip curl >/dev/null
+# libatomic1: the standalone pnpm binary dlopens libatomic.so.1 and a minimal
+# 24.04 cloud image does not ship it (found on the DO mock host, 2026-09-03).
+apt-get update -q >/dev/null
+apt-get install -y -q uidmap python3.12-venv rsync xfsprogs unzip curl libatomic1 >/dev/null
 
 # 1. Unprivileged harness user with an /etc/subuid + /etc/subgid range (useradd assigns one).
 if ! id "$HARNESS_USER" >/dev/null 2>&1; then

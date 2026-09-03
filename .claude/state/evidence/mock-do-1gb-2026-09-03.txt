@@ -1,0 +1,12 @@
+== sample 1 15:49:59
+python_processes=4 fleet_service_procs=5 layer1_sum_MiB=186 all_services_MiB=350 free_available_MiB=366 load=0.08
+pool_memory_current_MiB=130 pool_pids_current=27 pool_threads=27
+time_health_via_caddy_s=0.001432 http=200
+== sample 2 15:50:59
+python_processes=4 fleet_service_procs=5 layer1_sum_MiB=187 all_services_MiB=351 free_available_MiB=364 load=0.03
+pool_memory_current_MiB=131 pool_pids_current=27 pool_threads=27
+time_health_via_caddy_s=0.000777 http=200
+== sample 3 15:51:59
+python_processes=4 fleet_service_procs=5 layer1_sum_MiB=187 all_services_MiB=352 free_available_MiB=357 load=0.01
+pool_memory_current_MiB=132 pool_pids_current=27 pool_threads=27
+time_health_via_caddy_s=0.000887 http=200

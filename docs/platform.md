@@ -163,6 +163,16 @@ once, `REGISTRY_ADMIN_TOKEN` / `AUTH_SESSION_SECRET` / `AUTH_PAT_VERIFY_TOKEN` /
 Re-running creates nothing. `src/ams/platform/layer0.py` is the 17-stage
 bring-up that orders it all; `scripts/platform-bootstrap.sh` drives it.
 
+On a **fresh host** pass `--no-layer1` (both to `layer0.py` and to
+`scripts/platform-bootstrap.sh`): there is no pilot service to stop and
+re-point, and since pools `kvservice`/`timeservice` are members of `pool-core`,
+so a standalone declaration written here would have to be adopted on the first
+sync tick. Layer 0 comes up alone and the sync timer declares the fleet. The
+full fresh-host sequence (`deploy/install-host.sh` → `scripts/deploy-racknerd.sh`
+→ `platform-bootstrap.sh --no-layer1` → placeholder secrets → the sync timer)
+was rehearsed on a 1 GB DigitalOcean droplet on 2026-09-03
+(`.claude/state/mock-deploy-do.md`).
+
 Auth is TCP-probed, not HTTP: it registers ten routers and no `/health`, and
 probing `/.well-known/jwks.json` every 10 s would turn a liveness check into
 load (D22). No GitHub OAuth placeholders are set — the app builds a provider

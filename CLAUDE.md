@@ -60,7 +60,7 @@ Read first: `.claude/state/DECISIONS.md` (the why, D1–D29 + open items),
 - Goldens: `tests/golden/platform/` (21 manifests + `<id>.toml` / `.mount.json` / `.registry.json` per service — the manifests are **copied in**, because `api/` is gitignored and not rsynced to the Linux host) and `tests/golden/gateway/{path,subdomain,static,tls,logdir}`. Pools: `tests/golden/platform/pool/` (a 2-member `kvservice`+`timeservice` pool: `pool-core.toml`, `pool-core.pool.json`, the two members' `.yaml` + `.mount.json`).
 - Fixtures: `tests/fixtures/uv-e2e-app`, `tests/fixtures/pool-members` (a fixture pool venv/app pair for the runner's Linux test). `tests/conftest.py` skips `linux`-marked tests without a delegated cgroup.
 - Pools test modules (portable): `test_schema_portnames.py`, `test_pool_runner_static.py`, `test_platform_pool_translate.py`, `test_platform_overlay_pool.py`, `test_platform_gateway_pool.py`, `test_platform_sync_pool.py`, `test_platform_backup_pool.py`, `test_platform_policy_pool.py`, `test_platform_pool_adopt.py`; Linux-only: `tests/linux/test_pool_runner_live.py`, `tests/linux/test_pool_adopt_live.py`.
-- Baseline: **1193 passed / 122 skipped** locally (2026-09-03, `.venv/bin/python -m pytest -q`), pools T1–T8 landed.
+- Baseline: **1231 passed / 125 skipped** locally (2026-09-03, `.venv/bin/python -m pytest -q`), pools T1–T10 + D30 fresh-host fixes landed.
 
 ## Target host (racknerd, Ubuntu 24.04)
 - Harness user `harness` uid 1000, subuid/subgid `100000:65536`; `/home/harness`
@@ -89,6 +89,7 @@ Read first: `.claude/state/DECISIONS.md` (the why, D1–D29 + open items),
 - **Provisioning never runs inside the supervisor loop.** `git fetch` and `uv sync` block for minutes and the loop is single-threaded; they belong to `ams provision` / `ams platform sync`, separate processes on a timer.
 - **Stop a service before re-staging its tree.** `stage()` swaps `<root>/repo` and the venv lives inside it; a process importing during the swap dies with `ModuleNotFoundError` that looks like a broken dependency.
 - **Create the registry identity before starting a translated Layer-1 service.** No `SVC_DEV` means the SDK registers inside the FastAPI lifespan, and a 404 there is a uvicorn startup failure.
+- **A fresh host is `platform-bootstrap.sh --no-layer1`, then the sync timer.** `layer0.py` without the flag stops and re-points the Phase A pilot pair, which does not exist on a fresh host and, since pools, would collide with `pool-core`. `sync._phase_finish` registers every identity before it opens any health gate (D30) — keep it two-pass. Rehearsed end-to-end on a 1 GB DO droplet 2026-09-03 (`.claude/state/mock-deploy-do.md`).
 - A field that must survive a sync rewrite has to be declared on `ServiceRecord`: `PlatformState.load` keeps only the keys the dataclass declares.
 - Production tree on the box is `/home/harness/ams`, only via the deploy script.
 - **Deploy the new ams before pushing `pool` overlays to the mirror.** An un-upgraded host's overlay reader rejects the unknown `pool` key, and the 60 s sync timer marks every affected member `failed` on its next tick (`docs/platform-pools.md`).
