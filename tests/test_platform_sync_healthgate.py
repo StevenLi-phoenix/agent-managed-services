@@ -42,7 +42,7 @@ from test_platform_sync_pool import (  # noqa: F401 - fixtures again
 )
 
 from ams.platform import sync as sync_mod
-from ams.platform.sync import sync
+from ams.platform.sync import EXIT_ERROR, EXIT_OK, sync
 from ams.state import StateDir
 
 
@@ -339,3 +339,124 @@ def test_the_record_still_names_the_health_failure_after_a_skipped_tick(
     assert report.escalations == ()
     assert record["sha"] == report.sha
     assert _decl_exists(env.state, "alpha")
+
+
+# --------------------------------------------------------------------------- the exit code
+
+
+def test_the_steady_state_tick_after_a_cutover_is_a_complete_no_op(
+    pool_env: Any,  # noqa: F811
+    upstream_pool: Any,  # noqa: F811
+    stub_pool: None,  # noqa: F811
+    probes: list[str],
+    clock: Clock,
+) -> None:
+    """The live regression, end to end (`.claude/state/evidence/`,
+    `sync-tick-2026-09-03T1005.log`): a pooled fleet carrying two dead members
+    must, on the next tick, reload nothing, write nothing, probe nothing and
+    exit 0. Exiting 1 is what made systemd report the unit as permanently
+    failed and hid every real failure behind it.
+    """
+    src, _sha = upstream_pool
+    first = run_at(pool_env, src, clock)
+    assert first.failed, "the fixture must leave real failures behind to carry"
+    assert first.exit_code == EXIT_ERROR, "the tick that discovered them says so"
+
+    before = snapshot(pool_env.state.root)
+    pool_env.calls.items.clear()
+    probes.clear()
+    posts_before = len(pool_env.registry.requests)
+    clock.advance(60.0)
+    second = run_at(pool_env, src, clock)
+
+    # The whole chain, not only the probe: a held member is not re-declared,
+    # not re-reloaded, not re-registered and not re-gated. Live evidence that
+    # this is what the box does, 13 consecutive ticks between 10:12 and 10:25:
+    # zero `create identity`, zero `acl upsert`, zero `wait_healthy` for either
+    # dead member (`.claude/state/evidence/`).
+    assert probes == []
+    assert second.reloaded is False
+    assert pool_env.calls.of("reload") == []
+    assert len(pool_env.registry.requests) == posts_before, "a held member is re-registered"
+    assert not second.state_written
+    assert snapshot(pool_env.state.root) == before
+    assert second.escalations == ()
+    assert second.exit_code == EXIT_OK
+    # The failures are still reported, they are just not this tick's news.
+    assert set(second.failed) == set(first.failed)
+    assert second.ok is False
+
+
+def test_a_new_failure_still_exits_non_zero(
+    env: Any,  # noqa: F811
+    upstream: Any,  # noqa: F811
+    probes: list[str],
+    clock: Clock,
+) -> None:
+    src, _sha = upstream
+    first = run_at(env, src, clock)
+    assert first.exit_code == EXIT_ERROR
+
+    clock.advance(60.0)
+    assert run_at(env, src, clock).exit_code == EXIT_OK, "the same cause is not news"
+
+    # A commit that moves the service re-gates it, and the new (sha, stage,
+    # error) is a new cause: escalated again, and non-zero again.
+    _commit(
+        src,
+        {"services/alpha/service.yaml": service_manifest("alpha", port=9201, memory="256M")},
+        "alpha bump",
+    )
+    clock.advance(60.0)
+    third = run_at(env, src, clock)
+    assert third.escalations, "a failure at a new commit is a new cause"
+    assert third.exit_code == EXIT_ERROR
+
+
+def test_a_run_level_error_still_exits_non_zero(
+    env: Any,  # noqa: F811
+    upstream: Any,  # noqa: F811
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(_state: Any, **_kw: Any) -> dict[str, Any]:
+        return {"ok": False, "error": "the harness said no"}
+
+    monkeypatch.setattr(sync_mod, "ctl_reload", refuse)
+    src, _sha = upstream
+    report = run_at(env, src, clock)
+
+    assert report.error is not None
+    assert report.exit_code == EXIT_ERROR
+
+
+def test_the_whole_chain_runs_again_once_the_window_expires(
+    pool_env: Any,  # noqa: F811
+    upstream_pool: Any,  # noqa: F811
+    stub_pool: None,  # noqa: F811
+    probes: list[str],
+    clock: Clock,
+) -> None:
+    """The other half of the rule: holding is a delay, not a write-off. When
+    the window expires the member goes through registration and the gate again,
+    exactly as it would after a commit that moved it."""
+    src, _sha = upstream_pool
+    run_at(pool_env, src, clock, failed_health_retry_s=900.0)
+
+    clock.advance(300.0)
+    probes.clear()
+    posts_before = len(pool_env.registry.requests)
+    run_at(pool_env, src, clock, failed_health_retry_s=900.0)
+    assert probes == []
+    assert len(pool_env.registry.requests) == posts_before
+
+    clock.advance(700.0)
+    run_at(pool_env, src, clock, failed_health_retry_s=900.0)
+
+    assert probes, "the retry has to actually probe"
+    identities = [
+        r["body"]["id"]
+        for r in pool_env.registry.posts("/api/services")
+        if isinstance(r["body"], dict) and "id" in r["body"]
+    ]
+    assert identities.count("alpha") >= 2, "the retry re-runs registration, not only the probe"

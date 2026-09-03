@@ -530,11 +530,35 @@ class SyncReport:
 
     @property
     def ok(self) -> bool:
+        """No run-level error and nothing in the fleet is ``failed``.
+
+        A *state* question -- "is everything up right now" -- which is what
+        ``ams platform status`` and the tests ask. It stays true to that even
+        while the exit code below deliberately does not.
+        """
         return self.error is None and not self.failed
 
     @property
     def exit_code(self) -> int:
-        return EXIT_OK if self.ok else EXIT_ERROR
+        """Non-zero only when **this tick** went wrong, not when it inherited a
+        service that was already broken.
+
+        The unit runs every 60 s, and two services on the box are dead for
+        reasons no tick can fix. Exiting 1 because the *fleet* has a failure
+        made systemd print "Failed with result 'exit-code'" after every single
+        tick, including the one-second ones that changed nothing -- so the one
+        signal an operator has for "the deploy loop itself is broken" was
+        permanently on and told them nothing.
+
+        ``escalations`` is exactly the right signal, and it already exists: a
+        failure is escalated once per ``(sha, stage, error)`` and never again
+        while the cause is unchanged (see :meth:`_Run.fail`). So a tick that
+        discovers something new, or that hits a run-level error, is non-zero;
+        a tick that merely carries yesterday's known failures is zero, and the
+        failure is still in the report, in ``platform/state.json`` and in
+        ``ams platform status``.
+        """
+        return EXIT_OK if self.error is None and not self.escalations else EXIT_ERROR
 
     def outcome(self, service_id: str) -> ServiceOutcome:
         for o in self.services:
