@@ -238,6 +238,21 @@ systemctl reload ams-harness       # = ams ctl reload
 systemctl list-timers 'ams-platform-*'     # sync every 60 s, backup daily 04:10 UTC
 ```
 
+## Pools: N services, one process
+
+A manifest whose `service.ams.toml` carries `pool = "<name>"` does not become
+its own ams service: `sync.py` groups every manifest naming the same pool
+into one declaration (`pool-<name>`), staged and provisioned once, and run by
+a single ams-supplied asset (`src/ams/platform/assets/pool_runner.py`) as N
+`uvicorn.Server` instances on N ports in one process. Each member keeps its
+own port, registry identity, Caddy route, health probe and change detection —
+only *which process* runs it changes. `mount.json` gains one optional key,
+`port_owner`, for `gateway.resolve_ports` to follow; every other sidecar is
+untouched, and an unpooled fleet's output is byte-identical to before pools
+existed. Full contract, the runner's identity-env swap, the trust-domain
+statement, `ams platform pool plan|adopt`, and the migration runbook:
+`docs/platform-pools.md`. Decision record: D29.
+
 ## Known gaps
 
 Each is an open item in `.claude/state/DECISIONS.md`, not a TODO invented here.

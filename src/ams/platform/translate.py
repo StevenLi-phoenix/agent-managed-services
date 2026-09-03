@@ -28,11 +28,13 @@ from typing import Any
 
 from ams.platform.yamlsubset import parse as parse_yaml
 from ams.schema import (
+    PORT_NAME_RE,
     RESERVED_ENV,
     RESERVED_ENV_PREFIXES,
     SERVICE_ID_RE,
     HealthSpec,
     LimitsSpec,
+    LoggingSpec,
     RestartSpec,
     RuntimeSpec,
     ServiceDecl,
@@ -51,6 +53,17 @@ __all__ = [
     "SIDECAR_VERSION",
     "DEPENDS_ON",
     "REGISTRY_SERVICE_ID",
+    "IDENTITY_ENV",
+    "POOL_ADMIN_PORT_NAME",
+    "POOL_ID_PREFIX",
+    "POOL_JSON_VERSION",
+    "POOL_UVICORN_PIN",
+    "PoolMember",
+    "PoolTranslation",
+    "build_pool",
+    "mangle_member",
+    "pool_member",
+    "pool_port_name",
 ]
 
 SIDECAR_VERSION = 1
@@ -70,6 +83,41 @@ MEMORY_FLOOR = "120M"
 #: and depend on nothing.
 REGISTRY_SERVICE_ID = "registry"
 DEPENDS_ON = (REGISTRY_SERVICE_ID,)
+
+# --------------------------------------------------------------------------- pool
+#: The pooled runner's own admin/health listener (PLAN-pool §3.3). It is a port
+#: name in the pool declaration, which is why no member id may equal it.
+POOL_ADMIN_PORT_NAME = "pool"
+#: ``pool = "core"`` in a ``service.ams.toml`` overlay becomes service id
+#: ``pool-core``. The prefix keeps a pool from ever colliding with a member id.
+POOL_ID_PREFIX = "pool-"
+POOL_JSON_VERSION = 1
+POOL_HEALTH_PATH = "/_pool/health"
+#: PLAN-pool §4.4: the runner drives uvicorn's *internal* API (``Config.load``,
+#: ``Server.lifespan``, ``Server.startup``), so the version is pinned here and
+#: bumped deliberately, never by a resolver widening the range.
+POOL_UVICORN_PIN = "uvicorn[standard]==0.52.4"
+
+#: Swapped per member around build / lifespan startup / lifespan shutdown
+#: (PLAN-pool §4.2, from spike-pool finding 1). Everything NOT in this set is
+#: unioned into the pool's single process env, which is only safe while the
+#: union is unambiguous -- hence ``build_pool``'s conflict check.
+IDENTITY_ENV = frozenset(
+    {
+        "SVC_NAME",
+        "SVC_AUDIENCE",
+        "SVC_SECRET",
+        "SVC_ROOT_PATH",
+        "SVC_ENDPOINT",
+        "SVC_CAPABILITIES",
+        "SVC_HEALTH_PATH",
+        "SVC_DISPLAY_NAME",
+        "SVC_OWNER",
+        "SVC_LOCATION",
+        "PORT",
+        "AMS_DATA_DIR",
+    }
+)
 
 _LOOPBACK_URL_RE = re.compile(r"^http://127\.0\.0\.1:(\d{1,5})$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
@@ -132,6 +180,15 @@ class TranslateContext:
     ``services_dir`` is the ams state ``services/`` directory. The service root
     is ``<services_dir>/<id>/root``, and ``id`` only exists once the manifest is
     parsed -- hence a directory here rather than a per-service root.
+
+    ``pool`` is the one field that changes what ``translate`` emits rather than
+    only its numbers: a member of pool ``core`` has no root, no venv and no
+    service.toml of its own, so every absolute path it is given must already
+    point into ``<services_dir>/pool-core/root``. Doing that here -- rather than
+    string-rewriting a finished standalone ``Translation`` afterwards -- keeps
+    exactly one place that knows how a service root is spelled, and lets
+    ``_rewrite_data_path``'s "points at another service's state dir" rejection
+    keep working unchanged (PLAN-pool §3.3, §5.3).
     """
 
     sha: str
@@ -144,6 +201,18 @@ class TranslateContext:
     cpu_max: str = "40%"
     pids_max: int = 64
     start_period_s: float = 120.0
+    #: Unprefixed pool name (``"core"``) when this manifest is a pooled member.
+    pool: str | None = None
+    #: PLAN-pool §3.3: derived from the n=1 import measurement, so these are
+    #: starting values to be re-derived on the box (T10), not facts.
+    pool_memory_base: str = "150M"
+    pool_memory_per_member: str = "30M"
+    pool_pids_base: int = 48
+    pool_pids_per_member: int = 16
+    pool_cpu_max: str = "100%"
+    pool_start_period_s: float = 240.0
+    pool_runner_name: str = "pool_runner.py"
+    pool_uvicorn_pin: str = POOL_UVICORN_PIN
 
     def __post_init__(self) -> None:
         if not _SHA_RE.match(self.sha):
@@ -171,10 +240,22 @@ class TranslateContext:
         for name in self.extra_secret_names:
             if not _ENV_NAME_RE.match(name):
                 raise _err("ctx.extra_secret_names", f"{name!r} is not an env var name")
+        if self.pool is not None and not SERVICE_ID_RE.match(self.pool):
+            raise _err("ctx.pool", f"{self.pool!r} does not match {SERVICE_ID_RE.pattern}")
+        for fname in ("pool_memory_base", "pool_memory_per_member"):
+            try:
+                parse_size(getattr(self, fname))
+            except ValueError as e:
+                raise _err(f"ctx.{fname}", str(e)) from None
 
     def root_for(self, service_id: str) -> PurePosixPath:
         """Absolute service root as seen on the target host."""
         return PurePosixPath(self.services_dir.as_posix()) / service_id / "root"
+
+    @property
+    def pool_id(self) -> str | None:
+        """``"pool-core"`` when this context translates a member of pool ``core``."""
+        return None if self.pool is None else POOL_ID_PREFIX + self.pool
 
 
 @dataclass(frozen=True)
@@ -346,7 +427,15 @@ def _memory_max(raw: str | None, ctx: TranslateContext) -> str:
     return ctx.memory_floor if want < parse_size(ctx.memory_floor) else raw
 
 
-def _mount(data: Any, service_id: str, kind: str, build: Sequence[str]) -> dict[str, Any]:
+def _mount(
+    data: Any,
+    service_id: str,
+    kind: str,
+    build: Sequence[str],
+    *,
+    port_owner: str | None = None,
+    port_name: str = PORT_NAME,
+) -> dict[str, Any]:
     m = _table(data, "mount", _MOUNT_KEYS)
     gateway = _req_str(m, "gateway", "mount")
     path = _opt_str(m, "path", "mount")
@@ -360,7 +449,7 @@ def _mount(data: Any, service_id: str, kind: str, build: Sequence[str]) -> dict[
 
     if kind == "static":
         _forbid(m, ["port"], "mount", "forbidden for kind=static (Caddy serves files directly)")
-        port_name: str | None = None
+        resolved_port_name: str | None = None
         static_root: str | None = service_id
     else:
         if "port" not in m:
@@ -369,21 +458,26 @@ def _mount(data: Any, service_id: str, kind: str, build: Sequence[str]) -> dict[
             raise _err("mount.port", "expected an integer")
         # Discarded on purpose: ams allocates the port and the gateway renderer
         # resolves `port_name` against the live allocation (docs/platform-sidecars.md).
-        port_name = PORT_NAME
+        resolved_port_name = port_name
         static_root = None
 
-    return {
+    out: dict[str, Any] = {
         "version": SIDECAR_VERSION,
         "id": service_id,
         "kind": kind,
         "gateway": gateway,
         "path": path,
         "subdomain": subdomain,
-        "port_name": port_name,
+        "port_name": resolved_port_name,
+        # Additive and OPTIONAL: absent means "the port is allocated on my own
+        # id", which is every non-pooled service. Emitting it as null instead
+        # would rewrite all 21 mount goldens for no gain (D26's precedent).
+        **({"port_owner": port_owner} if port_owner is not None else {}),
         "static_root": static_root,
         "build": list(build),
         "headers": {},
     }
+    return out
 
 
 def _acl(data: Any) -> list[dict[str, str]]:
@@ -444,6 +538,10 @@ def translate(text: str, ctx: TranslateContext) -> Translation:
     mount_flags = {"manual_restart": manual_restart if kind == "service" else False}
 
     if kind == "static":
+        if ctx.pool is not None:
+            # PLAN-pool §3.2. The overlay reader sees one file and cannot know
+            # the kind, so the rejection has to land here.
+            raise _err("kind", "pool is not valid for kind: static")
         return _translate_static(doc, deploy, service_id, mount_flags)
     return _translate_service(
         doc, deploy, source, service_id, display_name, owner, mount_flags, ctx
@@ -512,7 +610,10 @@ def _translate_service(  # noqa: C901 - one flat mapping is clearer than five ho
     if not isinstance(health_path, str) or not health_path.startswith("/"):
         raise _err("registry.health_path", "expected a path starting with '/'")
 
-    root = ctx.root_for(service_id)
+    # A pooled member has no root of its own: it runs inside the pool process,
+    # under the pool's root, with its state one directory deeper (§3.3).
+    pool_id = ctx.pool_id
+    root = ctx.root_for(pool_id if pool_id is not None else service_id)
     env = _build_env(
         proc.get("environment", {}),
         service_id=service_id,
@@ -523,6 +624,7 @@ def _translate_service(  # noqa: C901 - one flat mapping is clearer than five ho
         health_path=health_path,
         root=root,
         ctx=ctx,
+        data_subdir=service_id if pool_id is not None else None,
     )
 
     restart_raw = proc.get("restart", "on-failure")
@@ -560,7 +662,14 @@ def _translate_service(  # noqa: C901 - one flat mapping is clearer than five ho
         depends_on=DEPENDS_ON,
     )
 
-    mount = _mount(doc.get("mount"), service_id, "service", ())
+    mount = _mount(
+        doc.get("mount"),
+        service_id,
+        "service",
+        (),
+        port_owner=pool_id,
+        port_name=pool_port_name(service_id) if pool_id is not None else PORT_NAME,
+    )
     registry = {
         "version": SIDECAR_VERSION,
         "id": service_id,
@@ -592,6 +701,7 @@ def _build_env(
     health_path: str,
     root: PurePosixPath,
     ctx: TranslateContext,
+    data_subdir: str | None = None,
 ) -> dict[str, str]:
     if not isinstance(raw, dict):
         raise _err("process.environment", "expected a mapping")
@@ -624,23 +734,37 @@ def _build_env(
             raise _err(path, "reserved: the harness sets it (PATH/HOME/AMS_*/PORT_*/...)")
         if key in injected and key not in _MANIFEST_MAY_ALSO_SET:
             raise _err(path, "the harness injects this variable; remove it from the manifest")
-        env[key] = _rewrite_data_path(_env_value(value, path), service_id, root, path)
+        env[key] = _rewrite_data_path(
+            _env_value(value, path), service_id, root, path, data_subdir=data_subdir
+        )
     env.update(injected)
     return env
 
 
-def _rewrite_data_path(value: str, service_id: str, root: PurePosixPath, path: str) -> str:
+def _rewrite_data_path(
+    value: str,
+    service_id: str,
+    root: PurePosixPath,
+    path: str,
+    *,
+    data_subdir: str | None = None,
+) -> str:
     """``/var/lib/<name>/x`` -> ``<root>/data/x`` (the pilot's finding #5).
 
     Every stateful service points at ``/var/lib/<name>``, which a mapped uid
     cannot write. The declaration schema only expands ``${PORT_*}``, so the
     substitution is baked in as an absolute path rather than a token.
+
+    ``data_subdir`` is the member id for a pooled service: N members share one
+    root, so each gets ``<pool-root>/data/<member>/`` and ``backup.discover``
+    can still name the owner of a database it finds (PLAN-pool §5.6).
     """
     own = f"/var/lib/{service_id}"
+    data = f"{root}/data" if data_subdir is None else f"{root}/data/{data_subdir}"
     if value == own:
-        return f"{root}/data"
+        return data
     if value.startswith(own + "/"):
-        return f"{root}/data/{value[len(own) + 1 :]}"
+        return f"{data}/{value[len(own) + 1 :]}"
     if value.startswith("/var/lib/"):
         raise _err(
             path,
@@ -648,6 +772,335 @@ def _rewrite_data_path(value: str, service_id: str, root: PurePosixPath, path: s
             "is rewritten to the service's own data dir",
         )
     return value
+
+
+# --------------------------------------------------------------------------- pool
+
+_APP_TARGET_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
+_SIZE_UNITS = (("T", 1 << 40), ("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10))
+
+
+@dataclass(frozen=True)
+class PoolMember:
+    """One manifest's contribution to a pool.
+
+    ``translation`` is the member's own, still carrying the mount and registry
+    sidecars sync writes per member -- pooling changes how a member is *run*,
+    not how it is routed or registered.
+    """
+
+    id: str
+    translation: Translation
+    #: uv project directory relative to the repo root, e.g. ``services/kvservice``.
+    runtime_rel: str
+    #: ``"<module>:<attr>"`` parsed out of the manifest's ``process.exec``.
+    app: str
+    factory: bool
+    #: The ``IDENTITY_ENV`` subset, swapped around this member's build/lifespan.
+    identity_env: Mapping[str, str]
+    #: Everything else, unioned into the pool's one process env.
+    shared_env: Mapping[str, str]
+    #: Unmangled, e.g. ``("SVC_SECRET", "DEEPSEEK_API_KEY")``.
+    secret_names: tuple[str, ...]
+
+    @property
+    def port_name(self) -> str:
+        return pool_port_name(self.id)
+
+    @property
+    def port_env(self) -> str:
+        return "POOL_PORT_" + mangle_member(self.id)
+
+
+@dataclass(frozen=True)
+class PoolTranslation:
+    """N manifests as one declaration plus the ``pool.json`` the runner reads."""
+
+    id: str
+    decl: ServiceDecl
+    members: tuple[PoolMember, ...]
+    pool_json: Mapping[str, Any]
+
+
+def mangle_member(member_id: str) -> str:
+    """``"notification-svc"`` -> ``"NOTIFICATION_SVC"``.
+
+    Env var names have no hyphen, so the mapping is lossy in principle. The
+    caller (``build_pool``) checks injectivity across the pool rather than
+    pretending it cannot collide.
+    """
+    return member_id.replace("-", "_").upper()
+
+
+def pool_port_name(member_id: str) -> str:
+    """The pool's port name for one member: its id verbatim where that is legal.
+
+    ``PORT_NAME_RE`` allows no hyphen, so ``files-web`` would be rejected by the
+    schema; the lower-cased mangled form is used instead and recorded in
+    ``pool.json`` so nothing downstream has to re-derive the rule.
+    """
+    return member_id if PORT_NAME_RE.match(member_id) else member_id.replace("-", "_")
+
+
+def _format_size(n: int) -> str:
+    for suffix, mult in _SIZE_UNITS:
+        if n >= mult and n % mult == 0:
+            return f"{n // mult}{suffix}"
+    return str(n)
+
+
+def _parse_uvicorn_exec(argv: Sequence[str], member_id: str) -> tuple[str, bool]:
+    """``uvicorn <mod>:<attr> [--factory] --host 127.0.0.1 --port ...`` -> app, factory.
+
+    The runner constructs ``uvicorn.Config`` itself, so any option that would
+    have changed how the server is built is a silent behaviour change once the
+    argv is thrown away. Reject it instead of dropping it.
+    """
+    path = f"{member_id}.process.exec"
+    if not argv or PurePosixPath(argv[0]).name != "uvicorn":
+        head = argv[0] if argv else ""
+        raise _err(path, f"a pooled member must be a uvicorn command line, got {head!r}")
+    if len(argv) < 2 or not _APP_TARGET_RE.match(argv[1]):
+        got = argv[1] if len(argv) > 1 else ""
+        raise _err(path, f"{got!r} is not a '<module>:<attr>' application target")
+
+    factory = False
+    i = 2
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--factory":
+            factory = True
+            i += 1
+        elif tok in ("--host", "--port"):
+            if i + 1 >= len(argv):
+                raise _err(path, f"{tok} has no value")
+            if tok == "--host" and argv[i + 1] != "127.0.0.1":
+                raise _err(
+                    path,
+                    f"--host {argv[i + 1]!r}: the pool runner binds every member to "
+                    "127.0.0.1 and the gateway is the only front door",
+                )
+            i += 2
+        else:
+            raise _err(
+                path,
+                f"unsupported uvicorn option {tok!r}; the pool runner builds the "
+                "server itself and would silently drop it",
+            )
+    return argv[1], factory
+
+
+def pool_member(t: Translation, manifest_dir_rel: str) -> PoolMember:
+    """Extract what the pool needs from one member's own ``Translation``.
+
+    ``t`` must have been produced with ``TranslateContext.pool`` set, so its
+    paths already point into the pool root.
+    """
+    if t.kind != "service" or t.decl is None:
+        raise _err(t.id, "only kind: service can join a pool")
+    decl = t.decl
+    workdir = decl.start.workdir
+    if workdir != "repo" and not workdir.startswith("repo/"):
+        raise _err(f"{t.id}.process.working_dir", f"{workdir!r} is not under 'repo/'")
+    runtime_rel = workdir[len("repo/") :] if workdir != "repo" else ""
+    want = manifest_dir_rel.strip("/")
+    if want != runtime_rel:
+        raise _err(
+            t.id,
+            f"manifest directory {want!r} does not match the uv project directory "
+            f"{runtime_rel!r} from deploy.install; the pool installs one editable "
+            "package per member and cannot guess which is right",
+        )
+    app, factory = _parse_uvicorn_exec(decl.start.argv, t.id)
+
+    identity: dict[str, str] = {}
+    shared: dict[str, str] = {}
+    for key, value in decl.env.items():
+        # PORT is an identity key, but the runner takes it from ``port_env``;
+        # a secret never reaches [env] (the schema forbids the overlap) and is
+        # filtered anyway so the sidecar can never carry one.
+        if key == "PORT" or key in decl.secrets:
+            continue
+        (identity if key in IDENTITY_ENV else shared)[key] = value
+
+    return PoolMember(
+        id=t.id,
+        translation=t,
+        runtime_rel=runtime_rel,
+        app=app,
+        factory=factory,
+        identity_env=MappingProxyType(identity),
+        shared_env=MappingProxyType(shared),
+        secret_names=tuple(decl.secrets),
+    )
+
+
+def _check_pool_members(pool: str, members: Sequence[PoolMember]) -> None:
+    """The cross-manifest rules of PLAN-pool §3.2, in the order they are cheapest."""
+    if not members:
+        raise TranslateError(f"pool {pool!r}: no members")
+    if len(members) == 1:
+        raise TranslateError(
+            f"pool {pool!r}: only one member ({members[0].id!r}) "
+            "— refusing to create a pool of one"
+        )
+    for m in members:
+        if m.translation.kind != "service" or m.translation.decl is None:
+            raise _err(m.id, "only kind: service can join a pool")
+        if m.id == POOL_ADMIN_PORT_NAME:
+            raise TranslateError(
+                f"pool {pool!r}: member id {POOL_ADMIN_PORT_NAME!r} collides with "
+                "the reserved admin port name"
+            )
+
+    by_suffix: dict[str, list[str]] = {}
+    for m in members:
+        by_suffix.setdefault(mangle_member(m.id), []).append(m.id)
+    for suffix, ids in by_suffix.items():
+        if len(ids) > 1:
+            raise TranslateError(
+                f"pool {pool!r}: member ids {sorted(ids)} mangle to the same env "
+                f"suffix {suffix}"
+            )
+
+
+def _pool_env(pool: str, members: Sequence[PoolMember], ctx: TranslateContext) -> dict[str, str]:
+    """The pool's one process env: the runner's own keys plus the shared union.
+
+    Identity keys are exempt from the union because differing is their job --
+    they are swapped per member per phase (§4.2). Everything else must agree,
+    because after the swap there is exactly one value left for the request path
+    to read (spike-pool finding 2).
+    """
+    union: dict[str, str] = {}
+    owner: dict[str, str] = {}
+    for m in members:
+        for key, value in m.shared_env.items():
+            if key in union and union[key] != value:
+                raise TranslateError(
+                    f"pool {pool!r}: members {owner[key]!r} and {m.id!r} both set "
+                    f"{key} to different values ({union[key]!r} vs {value!r}); a pool "
+                    "shares one process env for non-identity keys, so one of them "
+                    "must change or leave the pool"
+                )
+            union[key] = value
+            owner.setdefault(key, m.id)
+
+    env = dict(union)
+    env["GIT_COMMIT"] = ctx.sha
+    env["POOL_ID"] = pool
+    env["POOL_PORT_ADMIN"] = "${PORT_" + POOL_ADMIN_PORT_NAME + "}"
+    for m in members:
+        env[m.port_env] = "${PORT_" + m.port_name + "}"
+    return env
+
+
+def _pool_json(pool: str, members: Sequence[PoolMember], ctx: TranslateContext) -> dict[str, Any]:
+    root = ctx.root_for(POOL_ID_PREFIX + pool)
+    entries: list[dict[str, Any]] = []
+    for m in members:
+        decl = m.translation.decl
+        assert decl is not None  # _check_pool_members
+        suffix = mangle_member(m.id)
+        # The harness injects AMS_DATA_DIR=<root>/data for the pool *process*,
+        # which is the shared parent -- a member reading it would get its
+        # neighbours' state too. It is an identity key (§4.2), so the runner
+        # swaps in the per-member value from here. It cannot come through
+        # ``decl.env``: the schema reserves the whole AMS_ prefix.
+        member_env = {
+            **m.identity_env,
+            **m.shared_env,
+            "AMS_DATA_DIR": f"{root}/data/{m.id}",
+        }
+        entries.append(
+            {
+                "id": m.id,
+                "app": m.app,
+                "factory": m.factory,
+                "port_name": m.port_name,
+                "port_env": m.port_env,
+                "health_path": decl.health.path,
+                # Names only. The values live in the harness-private secret
+                # store under the *pool* id and reach the process as env.
+                "secret_env": {name: f"{name}__{suffix}" for name in m.secret_names},
+                "env": dict(sorted(member_env.items())),
+            }
+        )
+    return {
+        "version": POOL_JSON_VERSION,
+        "pool": pool,
+        "sha": ctx.sha,
+        "members": entries,
+    }
+
+
+def build_pool(
+    pool: str, members: Sequence[PoolMember], ctx: TranslateContext
+) -> PoolTranslation:
+    """N members -> the one ``ServiceDecl`` that runs them and its ``pool.json``.
+
+    Raises ``TranslateError`` for every cross-manifest rule of PLAN-pool §3.2;
+    each of them is a thing a per-manifest reader physically cannot see.
+    """
+    if not SERVICE_ID_RE.match(pool):
+        raise _err("pool", f"{pool!r} does not match {SERVICE_ID_RE.pattern}")
+    members = tuple(members)
+    _check_pool_members(pool, members)
+
+    pool_id = POOL_ID_PREFIX + pool
+    root = ctx.root_for(pool_id)
+    n = len(members)
+
+    secrets: list[str] = []
+    for m in members:
+        suffix = mangle_member(m.id)
+        secrets += [f"{name}__{suffix}" for name in m.secret_names]
+
+    packages: list[str] = [ctx.pool_uvicorn_pin]
+    for m in members:
+        packages += ["-e", m.runtime_rel]
+
+    memory = parse_size(ctx.pool_memory_base) + n * parse_size(ctx.pool_memory_per_member)
+    decl = ServiceDecl(
+        id=pool_id,
+        name=f"pool {pool}",
+        # `python` is bare on purpose: `runtime_env` prepends <root>/.venv/bin
+        # to PATH, exactly as the per-service translation relies on for uvicorn.
+        start=StartSpec(argv=("python", f"{root}/{ctx.pool_runner_name}"), workdir="repo"),
+        env=_pool_env(pool, members, ctx),
+        ports={POOL_ADMIN_PORT_NAME: 0, **{m.port_name: 0 for m in members}},
+        # sync=false: there is no single pyproject to sync. The venv is built
+        # from the pinned uvicorn plus one editable install per member.
+        runtime=RuntimeSpec(kind="uv", python="3.12", sync=False, packages=tuple(packages)),
+        health=HealthSpec(
+            kind="http",
+            port=POOL_ADMIN_PORT_NAME,
+            path=POOL_HEALTH_PATH,
+            start_period_s=ctx.pool_start_period_s,
+        ),
+        stop=StopSpec(signal="SIGTERM", timeout_s=10.0),
+        limits=LimitsSpec(
+            memory_max=_format_size(memory),
+            cpu_max=ctx.pool_cpu_max,
+            # The SDK runs up to three daemon threads per member and cgroup v2
+            # counts a thread as a pid, so the per-service 64 would be wrong.
+            pids_max=ctx.pool_pids_base + n * ctx.pool_pids_per_member,
+        ),
+        # A pool is N services in one process: "never restart" would take all N
+        # down for one member's crash, so the pool always comes back.
+        restart=RestartSpec(policy="always", backoff_s=10.0),
+        # The runner owns the root handler and prefixes every line with a level
+        # token, so the severity heuristic is turned off in favour of the fact.
+        logging=LoggingSpec(format="level-prefix"),
+        secrets=tuple(secrets),
+        depends_on=DEPENDS_ON,
+    )
+    return PoolTranslation(
+        id=pool_id,
+        decl=decl,
+        members=members,
+        pool_json=MappingProxyType(_pool_json(pool, members, ctx)),
+    )
 
 
 # --------------------------------------------------------------------------- TOML
@@ -738,6 +1191,11 @@ def emit_toml(decl: ServiceDecl) -> str:
         if h.pattern:
             lines.append(f"pattern = {_toml_str(h.pattern)}")
         lines.append(f"start_period_s = {_toml_value(h.start_period_s)}")
+
+    # Ahead of [stop], where examples/platform/caddy/service.toml puts it. Only
+    # when it is not the default, so no existing golden grows a table.
+    if decl.logging.format != "auto":
+        lines += ["", "[logging]", f"format = {_toml_str(decl.logging.format)}"]
 
     lines += [
         "",

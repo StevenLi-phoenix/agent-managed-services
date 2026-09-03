@@ -988,3 +988,92 @@ and the sidecar's `kind == "static"` (absent/malformed sidecar fails safe = stil
 gates). Local suite **999 passed / 110 skipped** (+6 tests), ruff clean; deploying
 to racknerd via `scripts/deploy-racknerd.sh` (see DECISIONS D28 for the live
 verification).
+
+## 2026-09-03 — Pools (memory optimisation, user request 「一大堆服务可以合并，只通过 tag 区分」)
+
+Phase: implementation dispatched. Facts in `pool-facts-{api,ams}.md`, plan in
+`PLAN-pool.md` (alternative B chosen: one process, one venv, N `uvicorn.Server`s
+on N ports; grouping key `pool = "<name>"` in `service.ams.toml`; the tag is the
+member's own service id). T0 spike PASSED (n=3) — `spike-pool.md`,
+`evidence/pool_spike2.py`. Baseline to beat: fleet cgroup 1105 MiB, 16 Python
+processes at 44–74 MiB each; pooled 6 members measured at 66 MiB.
+
+Done: facts, plan, T0. In flight: T1 (schema PORT_NAME_RE), T4 (overlay `pool`),
+T5 (gateway `port_owner`), T7 (backup label + policy), T11 (api SDK
+`login_redirect` request-derived return_to). Next: planner revision of §4.2/§4.3
+→ T2 (runner asset), T3 (translate `build_pool`), T6 (sync grouping) → T8
+(`pool adopt`, rollback refusal) → T9 docs/D29 → T10 live cutover on racknerd
+with the §7.3 before/after table.
+
+User-decidable defaults taken (user not present): 15-member `core` roster with
+displayservice/llmgateway/files/oss standalone; accepted losses §5.9; backup keys
+stay per logical service.
+
+## 2026-09-03 — Pools: T1–T9 (T2 confirmed landed; T10 next)
+
+All of T1–T8 are landed and verified by reading the tree, not by report:
+
+- **T0** spike PASSED — `.claude/state/spike-pool.md` (6 members, one loop, RSS
+  66 MiB n=3).
+- **T1** `schema.PORT_NAME_RE` widened to 32 chars — `tests/test_schema_portnames.py`.
+- **T2** the pool runner asset — `src/ams/platform/assets/pool_runner.py` (no
+  `__init__.py`), `tests/test_pool_runner_static.py`,
+  `tests/linux/test_pool_runner_live.py`, fixture `tests/fixtures/pool-members`.
+  Confirmed present on disk this task (was still "not started" as of the last
+  PLAN-pool.md status table read).
+- **T3** `translate.build_pool`/`pool_member`/`mangle_member`/`PoolMember`/
+  `PoolTranslation` — `tests/test_platform_pool_translate.py`, goldens
+  `tests/golden/platform/pool/{pool-core.toml,pool-core.pool.json,
+  kvservice.mount.json,timeservice.mount.json,kvservice.yaml,timeservice.yaml}`.
+- **T4** `static.Overlay.pool`/`overlay_pool` — `tests/test_platform_overlay_pool.py`.
+- **T5** `gateway.resolve_ports` `port_owner` — `tests/test_platform_gateway_pool.py`.
+- **T6** `sync.py` pool grouping, `ServiceRecord.pool`/`pool_members`, adoption
+  guard, two-hop-aware `_phase_materialize`/`_phase_declare`/`_phase_finish` —
+  `tests/test_platform_sync_pool.py`.
+- **T7** `backup.Target.label`/`discover` pool-aware labeling,
+  `policy._pool_suffix` — `tests/test_platform_backup_pool.py`,
+  `tests/test_platform_policy_pool.py`.
+- **T8** `src/ams/platform/pool.py` (`plan`/`adopt`, two-hop staged move),
+  `rollback.py` member refusal + pool re-derivation, `cli.py` `platform pool
+  {plan,adopt}` — `tests/test_platform_pool_adopt.py`,
+  `tests/linux/test_pool_adopt_live.py`.
+- **T11** (api-repo side, separate repo): landed on branch `ams-platform` at
+  `f88ebe60` per the fleet dry check in `spike-pool.md` — `SVC_ENDPOINT`
+  derived from the request instead of falling back to `""`.
+- **T9** (this entry): `docs/platform-pools.md` (new), edits to
+  `docs/platform.md`, `docs/manifest-translation.md`,
+  `docs/platform-sidecars.md`, `CLAUDE.md`; `.claude/state/DECISIONS.md` D29
+  appended.
+
+Local suite **1193 passed / 122 skipped** (`.venv/bin/python -m pytest -q`,
+2026-09-03), up from 999/110 before pools. ruff not re-run this task.
+
+Where code and plan disagreed (documented in D29 rather than silently
+matching the plan's sketch):
+- `cli.format_status` has no header row and no `AGE` column — the plan's §3.4
+  mock showed both; the real renderer uses the pre-existing `since=<ts>` field
+  per row and adds a `POOL` column only when at least one record carries a
+  pool key.
+- `PlatformState`'s pool fields are omitted by `as_json` when unset (not
+  written as `null`), matching the `deployed_sha` precedent (D26).
+- `gateway._phase_gateway` needed **no** code change of its own — `port_owner`
+  is entirely `resolve_ports`'s concern, so the phase function is unchanged
+  from its pre-pool form.
+- A member whose *manifest* fails to translate fails the **whole pool** at
+  build time (one `PoolError`, one shared `failed` message for every member —
+  `sync._pool_blocked`); a member whose *process* fails at runtime is the
+  skip-and-continue case §4.5 describes. The plan's prose did not always keep
+  these two failure points distinct.
+- Adoption's data move is implemented as a two-hop staged move through a
+  harness-owned directory (member uid block → staging → pool uid block), not
+  a direct `mv` — `run_admin` maps only one uid block per fork, so a direct
+  move across two different service uids cannot work in one admin namespace.
+
+Next: **T10** — live verification on racknerd: the blocking-I/O grep audit,
+confirm `secretsservice` starts standalone, `scripts/remote-test.sh` with the
+pool Linux tests, deploy, the §7.2 cutover (respecting the ordering
+constraint — deploy ams before pushing `pool` overlays to the mirror), and
+the §7.3 before/after measurement table in `docs/platform-pools.md`. Three
+user-decidable defaults (15-member roster, accepted losses, per-service
+backup keys) were taken in the user's absence per PLAN-pool §10 and should be
+confirmed before or during the cutover.

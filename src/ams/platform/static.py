@@ -44,6 +44,7 @@ __all__ = [
     "Overlay",
     "load_ams_overlay",
     "overlay_secret_names",
+    "overlay_pool",
     "publish_static",
 ]
 
@@ -82,7 +83,16 @@ class StaticError(RuntimeError):
 # tradeoff D19 made for `service_workdir`.
 _SECRET_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _OVERLAY_FILENAME = "service.ams.toml"
-_OVERLAY_TOP_KEYS = frozenset({"secrets", "env"})
+_OVERLAY_TOP_KEYS = frozenset({"secrets", "env", "pool"})
+
+# PLAN-pool.md §3.2: `registry`/`auth`/`caddy` are the other Layer-0/1
+# services a pool id must never collide with; `pool` is reserved separately
+# as the pooled runner's own admin port name (§3.3's `[ports] pool = 0`).
+# The `kind: static` rejection and cross-manifest checks (member id
+# collisions, an existing member id reused as the pool name) are cross-file
+# checks this reader cannot make -- it sees one manifest directory at a
+# time -- and are done by sync/translate instead (§3.2).
+_RESERVED_POOL_NAMES = frozenset({"registry", "auth", "caddy", "pool"})
 
 
 @dataclass(frozen=True)
@@ -91,6 +101,7 @@ class Overlay:
 
     secrets: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    pool: str | None = None
 
 
 def _check_env_name(path: Path, name: str, *, what: str) -> None:
@@ -158,13 +169,33 @@ def load_ams_overlay(manifest_dir: Path) -> Overlay:
             raise StaticError(f"{path}: env.{k} must be a string, got {v!r}")
         env[k] = v
 
-    return Overlay(secrets=tuple(secrets), env=MappingProxyType(env))
+    pool: str | None = None
+    if "pool" in data:
+        raw_pool = data["pool"]
+        if not isinstance(raw_pool, str):
+            raise StaticError(f"{path}: pool must be a string, got {raw_pool!r}")
+        if not SERVICE_ID_RE.match(raw_pool):
+            raise StaticError(
+                f"{path}: pool {raw_pool!r} does not match {SERVICE_ID_RE.pattern!r}"
+            )
+        if raw_pool in _RESERVED_POOL_NAMES:
+            raise StaticError(f"{path}: pool {raw_pool!r} is reserved")
+        pool = raw_pool
+
+    return Overlay(secrets=tuple(secrets), env=MappingProxyType(env), pool=pool)
 
 
 def overlay_secret_names(manifest_dir: Path) -> list[str]:
     """T3.1 hook 1: names to fold into ``TranslateContext.extra_secret_names``
     before translating the manifest at ``manifest_dir``."""
     return list(load_ams_overlay(manifest_dir).secrets)
+
+
+def overlay_pool(manifest_dir: Path) -> str | None:
+    """T3.1 hook 2: the pool name (unprefixed, e.g. ``"core"``) declared for
+    the manifest at ``manifest_dir``, or ``None`` if it does not opt into a
+    pool. Mirrors ``overlay_secret_names``."""
+    return load_ams_overlay(manifest_dir).pool
 
 
 # --------------------------------------------------------------------------- build steps

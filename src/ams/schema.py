@@ -30,7 +30,7 @@ from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 from ams.events import LogFormat
 
 SERVICE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
-PORT_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,15}$")
+PORT_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Set by the harness; a declaration may not override them (would desync the
 # per-service runtime bin dir, the port the health probe uses, etc.).

@@ -71,11 +71,12 @@ from typing import IO, Any
 
 from ams.platform import gateway as gateway_mod
 from ams.platform import sources
+from ams.platform import translate as translate_mod
 from ams.platform.bootstrap import AUTH_ID, LAYER0_PORTS, REGISTRY_ID, BootstrapError, loopback_url
 from ams.platform.bootstrap import place_jwt_key as place_jwt_key  # noqa: PLC0414 - patch point
 from ams.platform.registryclient import RegistryClient, RegistryError, from_sidecar
 from ams.platform.sources import SourceError, SourceMirror
-from ams.platform.static import StaticError, load_ams_overlay, publish_static
+from ams.platform.static import Overlay, StaticError, load_ams_overlay, publish_static
 from ams.platform.translate import (
     TranslateContext,
     TranslateError,
@@ -87,8 +88,10 @@ from ams.runtime import RuntimeStore, python_venv_dir
 from ams.runtime import provision as provision  # noqa: PLC0414 - monkeypatch point
 from ams.schema import DeclError, ServiceDecl
 from ams.secrets import MissingSecret, SecretStore, store_for
+from ams.spawn import DATA_DIRNAME, INNER_GID, INNER_UID
 from ams.state import StateDir, read_json_checked, write_json_atomic
 from ams.uidmap import UidAllocator, UidBlock
+from ams.userns import run_admin
 
 log = logging.getLogger("ams.platform.sync")
 
@@ -106,6 +109,29 @@ REGISTRY_DIRNAME = "registry"
 # non-secret `[env]` tunable. T3.4's `load_ams_overlay` is the only reader.
 SVC_SECRET_NAME = "SVC_SECRET"
 SVC_SECRET_BYTES = 32
+
+# --- pools (PLAN-pool). N manifests share one process; the pool is a service in
+# its own right (`pool-<name>`) and each member keeps its own port, its own
+# mount sidecar and its own registry identity. These mirror `translate`'s frozen
+# constants (PLAN-pool §5.3) rather than importing them, so this module keeps
+# working while `translate.build_pool` is landing; a portable test asserts the
+# two agree once it has.
+POOL_ID_PREFIX = "pool-"
+POOL_ADMIN_PORT_NAME = "pool"
+POOL_JSON_NAME = "pool.json"
+POOL_RUNNER_NAME = "pool_runner.py"
+POOL_ASSETS_DIRNAME = "assets"
+#: Harness-owned copies of what was pushed into the (service-owned) pool root.
+#: The harness cannot read back a 0640 file it does not own, so "has this
+#: changed" is answered against this shadow instead of against the real file --
+#: which is what keeps a steady-state tick free of `run_admin` forks.
+POOL_SHADOW_DIRNAME = "pool"
+POOL_ROOT_FILE_MODE = 0o640
+POOL_DATA_DIR_MODE = 0o750
+POOL_HEALTH_PATH = "/_pool/health"
+POOL_SECRET_PREFIX = f"{SVC_SECRET_NAME}__"
+POOL_ADOPT_COMMAND = "ams platform pool adopt"
+MAIN_PORT_NAME = "main"
 
 #: Layer-0 ports are fixed, not allocated (D22).
 DEFAULT_REGISTRY_URL = loopback_url(LAYER0_PORTS[REGISTRY_ID])
@@ -141,6 +167,17 @@ class SyncError(RuntimeError):
     """A run-level precondition is wrong (bad config, unusable state file)."""
 
 
+class PoolError(SyncError):
+    """A pool cannot be built: a cross-manifest rule broke (PLAN-pool §3.2).
+
+    Raised while grouping, caught by :func:`_phase_translate`, and turned into
+    *one* escalation against the pool id plus a ``failed`` record for each of
+    its members. It is deliberately not allowed out of the phase: a pool is a
+    group of services, not the fleet, and one broken pool must not stop the
+    other nineteen manifests from deploying.
+    """
+
+
 # --------------------------------------------------------------------------- paths
 
 
@@ -158,6 +195,16 @@ def mounts_dir(state: StateDir) -> Path:
 
 def registry_dir(state: StateDir) -> Path:
     return platform_dir(state) / REGISTRY_DIRNAME
+
+
+def pool_shadow_dir(state: StateDir) -> Path:
+    return platform_dir(state) / POOL_SHADOW_DIRNAME
+
+
+def pool_id_for(pool: str) -> str:
+    """``core`` -> ``pool-core``. The prefix is what keeps a pool id from ever
+    colliding with a member id (PLAN-pool §3.2)."""
+    return f"{POOL_ID_PREFIX}{pool}"
 
 
 # --------------------------------------------------------------------------- config
@@ -221,6 +268,7 @@ class SyncConfig:
         sha: str,
         services_dir: Path,
         extra_secret_names: Sequence[str] = (),
+        pool: str | None = None,
     ) -> TranslateContext:
         return TranslateContext(
             sha=sha,
@@ -228,6 +276,7 @@ class SyncConfig:
             registry_url=self.registry_url,
             auth_url=self.auth_url,
             extra_secret_names=tuple(extra_secret_names),
+            pool=pool,
             default_memory_max=self.default_memory_max,
             memory_floor=self.memory_floor,
             cpu_max=self.cpu_max,
@@ -275,12 +324,31 @@ class ServiceRecord:
     #: it -- :meth:`PlatformState.load` keeps only fields the dataclass declares
     #: (D27/T4.3), so an undeclared key would be dropped on the next flush.
     rolled_back_from: str | None = None
+    #: On a *member* record: the pool it runs inside (``"core"``, unprefixed).
+    #: Additive to the version-1 shape for the same reason `deployed_sha` was
+    #: (D26): every reader takes it with `.get`, and it must be declared here or
+    #: `PlatformState.load` drops it on the next flush (PLAN-pool §5.5).
+    pool: str | None = None
+    #: On a *pool* record: the member ids sharing this process, sorted.
+    pool_members: list[str] = field(default_factory=list)
     escalated: bool = False
     updated_at: str = ""
     stage_since: str = ""
 
     def as_json(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        # The two pool keys are omitted when they are unset. A fleet with no
+        # pools then keeps the exact record shape `docs/platform-sidecars.md`
+        # documents, and -- the reason that matters operationally -- deploying
+        # this build does not rewrite all twenty-one records just to add two
+        # nulls, which would break "a tick that changes nothing writes nothing"
+        # on the very first tick after the upgrade. `load` reads both keys with
+        # membership tests, so an absent key and a null one are the same thing.
+        if data.get("pool") is None:
+            data.pop("pool", None)
+        if not data.get("pool_members"):
+            data.pop("pool_members", None)
+        return data
 
 
 class PlatformState:
@@ -487,6 +555,84 @@ def ctl_restart(state: StateDir, service_id: str, *, timeout_s: float = 60.0) ->
     return control_request(control_socket_path(state), "restart", service_id, timeout_s=timeout_s)
 
 
+def pool_runner_source() -> Path:
+    """The runner asset shipped with ams (PLAN-pool §4.1).
+
+    Package *data*, never an import: ``src/ams`` must not depend on fastapi or
+    uvicorn, and the runner does. ams only ever reads its bytes.
+    """
+    return Path(__file__).resolve().parent / POOL_ASSETS_DIRNAME / POOL_RUNNER_NAME
+
+
+def place_pool_file(
+    root: Path, name: str, content: bytes, block: UidBlock, *, mode: int = POOL_ROOT_FILE_MODE
+) -> None:
+    """Put a harness-authored file inside the (service-owned) pool root.
+
+    Same shape as :func:`bootstrap.place_jwt_key`: the root has already been
+    handed to the service uid, so the harness writes a temp file in the
+    *parent* directory -- which it still owns -- and copies it in through the
+    admin namespace. No shell, four argv lists (D1).
+    """
+    root = Path(root)
+    dst = root / name
+    tmp = root.parent / f".{name}.tmp{os.getpid()}"
+    tmp.write_bytes(content)
+    try:
+        os.chmod(tmp, mode)
+        run_admin(["cp", str(tmp), str(dst)], block).check()
+        run_admin(["chown", f"{INNER_UID}:{INNER_GID}", str(dst)], block).check()
+        run_admin(["chmod", oct(mode)[2:].zfill(4), str(dst)], block).check()
+    finally:
+        tmp.unlink(missing_ok=True)
+    log.info("placed %s in %s (mode %o)", name, root, mode)
+
+
+def make_pool_data_dirs(root: Path, members: Sequence[str], block: UidBlock) -> None:
+    """``<root>/data/<member>`` for every member, owned by the pool's uid.
+
+    One directory per member rather than one shared one: a member's manifest
+    asks for ``/var/lib/<name>/x.db`` and the translator rewrites it under its
+    own subdirectory, so the databases stay separable -- which is what lets the
+    backup keep its per-service R2 key after pooling (PLAN-pool §5.6).
+    """
+    data = Path(root) / DATA_DIRNAME
+    dirs = [str(data / m) for m in members]
+    if not dirs:
+        return
+    run_admin(["mkdir", "-m", oct(POOL_DATA_DIR_MODE)[2:], "-p", *dirs], block).check()
+    run_admin(["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(data)], block).check()
+
+
+def legacy_data_is_nonempty(state: StateDir, member_id: str, block: UidBlock) -> bool:
+    """Does the *pre-pool* ``services/<member>/root/data`` still hold anything?
+
+    The adoption guard (PLAN-pool §5.5). The harness cannot list a 0750
+    service-owned directory, so the answer comes from the admin namespace --
+    but only when the directory exists at all, which on a fleet that never ran
+    unpooled is never, and costs one ``stat``.
+    """
+    data = state.service_root(member_id) / DATA_DIRNAME
+    if not data.is_dir():
+        return False
+    try:
+        return any(data.iterdir())
+    except OSError:
+        pass
+    result = run_admin(["find", str(data), "-mindepth", "1", "-maxdepth", "1", "-print"], block)
+    if not result.ok:
+        # Unreadable is not the same as empty, and this guard exists to stop
+        # data being orphaned: treat it as occupied and make a human look.
+        log.warning(
+            "%s: cannot list %s (rc=%d); treating it as non-empty",
+            member_id,
+            data,
+            result.returncode,
+        )
+        return True
+    return bool(result.stdout.strip())
+
+
 # --------------------------------------------------------------------------- helpers
 
 
@@ -587,10 +733,32 @@ class _Pending:
     reached: str = STAGES[0]
     failed_with: str | None = None
     health_path: str = "/health"
+    #: The pool this item belongs to, unprefixed. Set on a member *and* on the
+    #: pool item itself; `is_pool` is what tells them apart (PLAN-pool §5.5).
+    pool: str | None = None
+    #: Pool item only: the member ids, sorted.
+    pool_members: list[str] = field(default_factory=list)
+    #: Pool item only: the ``<root>/pool.json`` document.
+    pool_json: Mapping[str, Any] | None = None
+    #: The allocator row that holds this item's port. ``""`` means "my own id",
+    #: which is every unpooled service.
+    port_owner: str = ""
+    #: The name of the port on that row. A pooled member's port is named after
+    #: the member; the pool's own admin/health port is named ``pool``.
+    port_name: str = MAIN_PORT_NAME
+    #: Where this item's ``SVC_SECRET`` lives. A pooled member's is stored under
+    #: the *pool* id as ``SVC_SECRET__<MANGLED>`` -- one process, one env, so the
+    #: names cannot collide (PLAN-pool §3.3).
+    secret_owner: str = ""
+    secret_name: str = SVC_SECRET_NAME
 
     @property
     def id(self) -> str:
         return self.translation.id
+
+    @property
+    def is_pool(self) -> bool:
+        return bool(self.pool) and self.id.startswith(POOL_ID_PREFIX)
 
     @property
     def kind(self) -> str:
@@ -632,6 +800,10 @@ class _Run:
         self.escalations: list[Mapping[str, Any]] = []
         self.platform = PlatformState.load(state_path(state))
         self.pending: list[_Pending] = []
+        #: pool name -> the error that stopped it. A member of a failed pool is
+        #: marked failed without an escalation of its own: one broken process is
+        #: one cause, and N copies of it is the noise T3.3 exists to prevent.
+        self.failed_pools: dict[str, str] = {}
 
     # ------------------------------------------------------------ escalation
 
@@ -663,6 +835,8 @@ class _Run:
         self.platform.set_stage(item.id, FAILED, now_s=self.now(), error=error)
         item.failed_with = error
         item.changed = True
+        if item.is_pool and item.pool:
+            self.failed_pools[item.pool] = error
         if already:
             # The cause has not changed since the last tick: nothing is emitted.
             # This is the "escalates once, not per tick" guarantee T3.3 needs.
@@ -793,17 +967,351 @@ def _snapshot_prior(run: _Run, item: _Pending, service_id: str) -> None:
     item.prior_escalated = rec.escalated
 
 
+@dataclass
+class _Parsed:
+    """One manifest after the head translation, before any pool grouping."""
+
+    manifest: Path
+    dirname: str
+    overlay: Overlay | None = None
+    translation: Translation | None = None
+    decl: ServiceDecl | None = None
+    #: Set instead of the three above when the manifest did not translate.
+    failed: _Pending | None = None
+
+    @property
+    def pool(self) -> str | None:
+        return self.overlay.pool if self.overlay is not None else None
+
+    @property
+    def id(self) -> str:
+        return self.translation.id if self.translation is not None else self.dirname
+
+
+@dataclass
+class _PoolGroup:
+    """Every member of one pool, plus the pool's own pending item."""
+
+    name: str
+    entries: list[_Parsed]
+    item: _Pending
+    sha: str
+    #: member id -> ``translate.PoolMember``; empty when ``build_pool`` failed.
+    members: dict[str, Any] = field(default_factory=dict)
+    #: member id -> the port name ``pool.json`` gives it.
+    port_names: dict[str, str] = field(default_factory=dict)
+
+
+def _translate_at(
+    run: _Run,
+    manifest: Path,
+    overlay: Overlay,
+    sha: str,
+    services_dir: Path,
+    *,
+    pool: str | None = None,
+) -> tuple[Translation, ServiceDecl | None]:
+    ctx = run.cfg.context_for(
+        sha=sha, services_dir=services_dir, extra_secret_names=overlay.secrets, pool=pool
+    )
+    translation = translate(manifest.read_text(encoding="utf-8"), ctx)
+    return translation, _apply_overlay_env(translation.decl, overlay.env)
+
+
+def _pool_api() -> tuple[Any, Any, Any]:
+    """``(build_pool, pool_member, mangle_member)`` from :mod:`translate`.
+
+    Looked up at call time rather than imported at module scope: sync must keep
+    working -- and every unpooled service must keep deploying -- while the
+    translator half of the feature is landing, and a missing symbol is then one
+    pool's failure instead of an ImportError for the whole harness.
+    """
+    wanted = ("build_pool", "pool_member", "mangle_member")
+    missing = [n for n in wanted if not hasattr(translate_mod, n)]
+    if missing:
+        raise PoolError(
+            f"ams.platform.translate is missing {missing}; this build of ams cannot build pools"
+        )
+    return (translate_mod.build_pool, translate_mod.pool_member, translate_mod.mangle_member)
+
+
+def _check_pool(name: str, entries: Sequence[_Parsed]) -> None:
+    """The two cross-manifest rules ``build_pool`` cannot make for itself.
+
+    Everything else in PLAN-pool §3.2 -- a pool of one, ``kind: static``, the
+    reserved ``pool`` port name, ids that mangle alike, two members binding one
+    shared env key to different values -- is checked by ``translate`` and raised
+    from there, so there is exactly one copy of each rule. What is left needs
+    the *pool name* next to the member ids, which the translator is never handed
+    together.
+    """
+    broken = [e for e in entries if e.failed is not None]
+    if broken:
+        # Including the underlying message: `kind: static` and a malformed
+        # manifest both land here, and "the pool did not build" without the
+        # reason sends the reader to the wrong file.
+        detail = "; ".join(f"{e.dirname}: {e.failed.failed_with}" for e in broken if e.failed)
+        raise PoolError(f"pool {name!r}: member manifest(s) did not translate -- {detail}")
+    ids = [e.id for e in entries]
+    duplicates = sorted({sid for sid in ids if ids.count(sid) > 1})
+    if duplicates:
+        raise PoolError(f"pool {name!r}: duplicate member id(s) {duplicates}")
+    if name in ids:
+        raise PoolError(f"pool {name!r}: the pool name is also a member id")
+
+
+def _pool_target_sha(run: _Run, entries: Sequence[_Parsed], head: str) -> str:
+    """The commit the whole pool moves to (PLAN-pool §5.5).
+
+    One process, one tree, one ``GIT_COMMIT``: the members cannot sit at
+    different commits, so D26's per-member rule decides only *whether* the pool
+    moves. Any affected member moves all of them; members that disagree about
+    where they already are can only be reconciled at the head.
+    """
+    deployed: set[str] = set()
+    for entry in entries:
+        target = run.target_sha(entry.manifest, entry.id)
+        if target == head:
+            return head
+        deployed.add(target)
+    if len(deployed) == 1:
+        return deployed.pop()
+    log.info(
+        "pool members disagree about their deployed commit (%s); moving the pool to the head",
+        ", ".join(sorted(sha[:12] for sha in deployed)),
+    )
+    return head
+
+
+def _translate_pool_members(
+    run: _Run, entries: Sequence[_Parsed], target: str, services_dir: Path, pool: str
+) -> None:
+    """Re-translate every member at ``target`` *as a pooled member*.
+
+    Only ever needed to move a pool *off* the head: the first pass already
+    translated every member with ``TranslateContext.pool`` set, so the paths
+    already point into the pool root and a tick that does not move the pool
+    re-translates nothing.
+
+    All or nothing: half a pool at one commit and half at another is a
+    declaration that cannot be built, so a member that fails here raises for the
+    whole group rather than being quietly dropped out of it.
+    """
+    out: list[tuple[Translation, ServiceDecl | None]] = []
+    for entry in entries:
+        assert entry.overlay is not None  # only successfully parsed entries are grouped
+        out.append(
+            _translate_at(run, entry.manifest, entry.overlay, target, services_dir, pool=pool)
+        )
+    for entry, (translation, decl) in zip(entries, out, strict=True):
+        entry.translation, entry.decl = translation, decl
+
+
+def _manifest_rel(run: _Run, manifest: Path) -> str:
+    try:
+        return manifest.parent.relative_to(run.checkout).as_posix()
+    except ValueError:  # pragma: no cover - the manifest came from the checkout
+        return manifest.parent.name
+
+
+def _pool_health_path(decl: ServiceDecl | None) -> str:
+    if decl is None:
+        return POOL_HEALTH_PATH
+    return getattr(decl.health, "path", None) or POOL_HEALTH_PATH
+
+
+def _select_pools(run: _Run, parsed: Sequence[_Parsed]) -> dict[str, list[_Parsed]]:
+    """Group the pooled manifests, keeping the pools this run is meant to touch.
+
+    ``--only <one member>`` selects the *whole* pool: the members share one
+    process, so there is no declaration that deploys half of it.
+    """
+    groups: dict[str, list[_Parsed]] = {}
+    for entry in parsed:
+        if entry.pool:
+            groups.setdefault(entry.pool, []).append(entry)
+    wanted: dict[str, list[_Parsed]] = {}
+    for name, entries in sorted(groups.items()):
+        selected = [e for e in entries if run.cfg.selects(e.dirname, e.id)]
+        if not selected and not run.cfg.selects(pool_id_for(name)):
+            log.debug("pool %s: no member selected", name)
+            continue
+        if selected and len(selected) != len(entries):
+            log.info(
+                "pool %s: %d of %d members named; a pool is one process, so all of it is selected",
+                name,
+                len(selected),
+                len(entries),
+            )
+        wanted[name] = entries
+    return wanted
+
+
+def _build_pool_group(
+    run: _Run, name: str, entries: list[_Parsed], head: str, services_dir: Path
+) -> _PoolGroup:
+    """Translate one pool into its own ``_Pending``, or fail it as a unit."""
+    pool_id = pool_id_for(name)
+    sha = head
+    decl: ServiceDecl | None = None
+    pool_json: Mapping[str, Any] | None = None
+    members: dict[str, Any] = {}
+    port_names: dict[str, str] = {}
+    error: str | None = None
+    try:
+        build_pool, pool_member, _mangle = _pool_api()
+        _check_pool(name, entries)
+        target = _pool_target_sha(run, entries, head)
+        try:
+            if target != head:
+                _translate_pool_members(run, entries, target, services_dir, name)
+            sha = target
+        except (TranslateError, DeclError, OSError, UnicodeDecodeError) as e:
+            if target == head:
+                raise
+            # It translated at the head a moment ago, so this is not a manifest
+            # problem: take the whole pool to the head rather than drop it.
+            log.warning(
+                "pool %s: re-translating at %s failed (%s); using the head", name, target[:12], e
+            )
+            _translate_pool_members(run, entries, head, services_dir, name)
+            sha = head
+        extra: set[str] = set()
+        for entry in entries:
+            assert entry.overlay is not None
+            extra.update(entry.overlay.secrets)
+        ctx = run.cfg.context_for(
+            sha=sha,
+            services_dir=services_dir,
+            extra_secret_names=tuple(sorted(extra)),
+            pool=name,
+        )
+        built = build_pool(
+            name,
+            [pool_member(e.translation, _manifest_rel(run, e.manifest)) for e in entries],
+            ctx,
+        )
+        decl, pool_json = built.decl, built.pool_json
+        members = {pm.id: pm for pm in built.members}
+        port_names = {
+            str(m["id"]): str(m["port_name"])
+            for m in (pool_json or {}).get("members", ())
+            if isinstance(m, Mapping) and m.get("id") and m.get("port_name")
+        }
+    except (PoolError, TranslateError, StaticError, DeclError, OSError, UnicodeDecodeError) as e:
+        error = str(e) if isinstance(e, PoolError) else f"{type(e).__name__}: {e}"
+
+    manual = any(
+        bool(e.translation.flags.get("manual_restart", False))
+        for e in entries
+        if e.translation is not None
+    )
+    item = _Pending(
+        manifest=entries[0].manifest,
+        translation=Translation(
+            id=pool_id,
+            kind="service",
+            decl=decl,
+            mount={},
+            registry=None,
+            flags={"manual_restart": manual},
+        ),
+        decl=decl,
+        decl_text=emit_toml(decl) if decl is not None else None,
+        sha=sha,
+        health_path=_pool_health_path(decl),
+        pool=name,
+        pool_members=sorted(e.id for e in entries),
+        pool_json=pool_json,
+        port_name=POOL_ADMIN_PORT_NAME,
+    )
+    _snapshot_prior(run, item, pool_id)
+    item.prior_stage = run.platform.begin(
+        pool_id, sha, manual_restart=item.manual_restart, now_s=run.now()
+    )
+    run.platform.get(pool_id).pool_members = list(item.pool_members)
+    if error is not None:
+        run.fail(item, "translate", error, sha)
+    else:
+        run.advance(item, "translated")
+    return _PoolGroup(
+        name=name,
+        entries=entries,
+        item=item,
+        sha=sha,
+        members=members,
+        port_names=port_names,
+    )
+
+
+def _member_item(run: _Run, entry: _Parsed, group: _PoolGroup, mangle: Any) -> _Pending:
+    """One pooled member: sidecars and an identity, but no declaration.
+
+    ``decl``/``decl_text`` are deliberately ``None``. The member's
+    ``service.toml`` is not written, because the process that serves it is the
+    pool's -- which is the whole point of the feature (PLAN-pool §5.5).
+
+    The port name is read out of ``pool.json``, which carries it for every
+    member; the mount sidecar is the fallback. Either way it is the
+    translator's, never re-derived here -- ``pool_port_name`` mangles a member
+    id that is not a legal port name, and a second copy of that rule is how the
+    gateway and the allocator come to disagree about one service.
+    """
+    member = group.members.get(entry.id)
+    translation = member.translation if member is not None else entry.translation
+    assert translation is not None
+    mount = translation.mount or {}
+    port_name = group.port_names.get(entry.id) or mount.get("port_name") or entry.id
+    item = _Pending(
+        manifest=entry.manifest,
+        translation=translation,
+        decl=None,
+        decl_text=None,
+        sha=group.sha,
+        health_path=str((translation.registry or {}).get("health_path", "/health")),
+        pool=group.name,
+        port_owner=str(mount.get("port_owner") or group.item.id),
+        port_name=str(port_name),
+        secret_owner=group.item.id,
+        secret_name=f"{POOL_SECRET_PREFIX}{mangle(entry.id)}",
+    )
+    _snapshot_prior(run, item, item.id)
+    item.prior_stage = run.platform.begin(item.id, group.sha, manual_restart=False, now_s=run.now())
+    run.platform.get(item.id).pool = group.name
+    run.advance(item, "translated")
+    return item
+
+
+def _fallback_mangle(member_id: str) -> str:
+    """Only used to name a secret when ``translate.mangle_member`` is missing --
+    in which case the pool has already failed and nothing reads the name."""
+    return member_id.replace("-", "_").upper()
+
+
 def _phase_translate(run: _Run, manifests: Sequence[Path], sha: str, services_dir: Path) -> None:
-    """Parse every selected manifest. A broken one fails only itself."""
+    """Parse every selected manifest. A broken one fails only itself.
+
+    Two passes, because which commit a pool moves to is a property of its
+    *members*: every manifest is translated at the head first, then the pooled
+    ones are grouped and re-translated together at the one sha the pool moves to
+    (PLAN-pool §5.5). A checkout with no ``pool =`` overlay never enters the
+    second pass, and every unpooled service takes exactly the path it did
+    before.
+    """
+    parsed: list[_Parsed] = []
     for manifest in manifests:
         dirname = manifest.parent.name
+        overlay: Overlay | None = None
         try:
+            # The pool is read *before* the translation and passed into it: a
+            # pooled member's absolute paths have to point into the pool root
+            # from the start, and rewriting a finished standalone `Translation`
+            # afterwards would be a second place that knows how a service root
+            # is spelled (PLAN-pool §5.3, T3's contract).
             overlay = load_ams_overlay(manifest.parent)
-            ctx = run.cfg.context_for(
-                sha=sha, services_dir=services_dir, extra_secret_names=overlay.secrets
+            translation, decl = _translate_at(
+                run, manifest, overlay, sha, services_dir, pool=overlay.pool
             )
-            translation = translate(manifest.read_text(encoding="utf-8"), ctx)
-            decl = _apply_overlay_env(translation.decl, overlay.env)
         except (TranslateError, StaticError, DeclError, OSError, UnicodeDecodeError) as e:
             if not run.cfg.selects(dirname):
                 log.debug("%s is not selected; ignoring its translate error", manifest)
@@ -824,11 +1332,32 @@ def _phase_translate(run: _Run, manifests: Sequence[Path], sha: str, services_di
                 dirname, sha, manual_restart=False, now_s=run.now()
             )
             run.fail(item, "translate", f"{type(e).__name__}: {e}", sha)
-            run.pending.append(item)
+            # The overlay is kept when it parsed, so a broken *pooled* manifest
+            # is still grouped -- and takes its pool down with it rather than
+            # letting the survivors deploy as a process quietly missing a member.
+            parsed.append(_Parsed(manifest=manifest, dirname=dirname, overlay=overlay, failed=item))
             continue
+        parsed.append(_Parsed(manifest, dirname, overlay, translation, decl))
 
-        if not run.cfg.selects(dirname, translation.id):
-            log.debug("%s not selected", translation.id)
+    groups = {
+        name: _build_pool_group(run, name, entries, sha, services_dir)
+        for name, entries in _select_pools(run, parsed).items()
+    }
+    mangle = getattr(translate_mod, "mangle_member", _fallback_mangle)
+
+    for entry in parsed:
+        if entry.failed is not None:
+            run.pending.append(entry.failed)
+            continue
+        assert entry.translation is not None
+        if entry.pool is not None:
+            group = groups.get(entry.pool)
+            if group is None:
+                continue
+            run.pending.append(_member_item(run, entry, group, mangle))
+            continue
+        if not run.cfg.selects(entry.dirname, entry.id):
+            log.debug("%s not selected", entry.id)
             continue
 
         # The id only exists once the manifest parses, and the affected check is
@@ -836,27 +1365,28 @@ def _phase_translate(run: _Run, manifests: Sequence[Path], sha: str, services_di
         # deployed sha for a service this commit did not touch. `translate` is
         # pure and sub-millisecond; the alternative is guessing the id from the
         # directory name, which nothing else in this module does.
-        target = run.target_sha(manifest, translation.id)
+        translation, decl = entry.translation, entry.decl
+        target = run.target_sha(entry.manifest, entry.id)
         if target != sha:
+            assert entry.overlay is not None
             try:
-                ctx = run.cfg.context_for(
-                    sha=target, services_dir=services_dir, extra_secret_names=overlay.secrets
+                translation, decl = _translate_at(
+                    run, entry.manifest, entry.overlay, target, services_dir
                 )
-                translation = translate(manifest.read_text(encoding="utf-8"), ctx)
-                decl = _apply_overlay_env(translation.decl, overlay.env)
             except (TranslateError, DeclError, OSError, UnicodeDecodeError) as e:
                 # It translated at the head a moment ago, so this is not a
                 # manifest problem: fall back to the head rather than skip it.
                 log.warning(
                     "%s: re-translating at %s failed (%s); using the head",
-                    translation.id,
+                    entry.id,
                     target[:12],
                     e,
                 )
                 target = sha
+                translation, decl = entry.translation, entry.decl
 
         item = _Pending(
-            manifest=manifest,
+            manifest=entry.manifest,
             translation=translation,
             decl=decl,
             decl_text=emit_toml(decl) if decl is not None else None,
@@ -869,6 +1399,11 @@ def _phase_translate(run: _Run, manifests: Sequence[Path], sha: str, services_di
         )
         run.advance(item, "translated")
         run.pending.append(item)
+
+    # Pools first: a member is not declarable until its pool is, and processing
+    # the pool first is what lets a failed pool skip its members without a
+    # second escalation each.
+    run.pending[:0] = [group.item for group in groups.values()]
 
 
 def _publish_static_site(run: _Run, item: _Pending) -> bool:
@@ -906,9 +1441,18 @@ def _publish_static_site(run: _Run, item: _Pending) -> bool:
 
 
 def _phase_materialize(run: _Run, item: _Pending) -> bool:
-    """Stage the tree, place the JWT key, provision. False = this one failed."""
+    """Stage the tree, place the JWT key, provision. False = this one failed.
+
+    A pooled member has neither a tree nor a venv of its own: its pool stages
+    once into ``services/pool-<n>/root/repo`` and provisions once with every
+    member installed editable into that one venv, which is what turns twelve
+    ``cp --reflink`` + twelve ``uv sync`` into one of each (PLAN-pool §5.5).
+    """
     if item.kind == "static":
         return _publish_static_site(run, item)
+    if item.pool and not item.is_pool:
+        log.debug("%s: pooled into %s; nothing to stage or provision", item.id, item.port_owner)
+        return True
     if item.decl is None:
         return True
     root = run.state.service_root(item.id)
@@ -952,10 +1496,141 @@ def _phase_materialize(run: _Run, item: _Pending) -> bool:
     return True
 
 
+def _unlink_member_decl(run: _Run, item: _Pending) -> bool:
+    """Remove a pooled member's *stale* ``service.toml``, never its root.
+
+    A service that used to run on its own leaves a declaration behind, and the
+    harness would keep starting it beside the pool -- two processes serving one
+    identity, on two ports, both registering. The root is deliberately left
+    alone: the member's data still lives in it until `ams platform pool adopt`
+    moves it, and sync never moves data (PLAN-pool §5.5).
+    """
+    path = run.state.service_decl_path(item.id)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        run.fail(item, "declare", f"stale service.toml: {type(e).__name__}: {e}", item.sha)
+        return False
+    log.info("%s: removed the pre-pool declaration %s", item.id, path)
+    item.actions.append("unpool-decl")
+    item.changed = True
+    return True
+
+
+def _member_secret_names(item: _Pending, mangle: Any) -> list[str]:
+    return [f"{POOL_SECRET_PREFIX}{mangle(member)}" for member in item.pool_members]
+
+
+def _adoption_blocked(run: _Run, item: _Pending) -> list[str]:
+    """Members whose pre-pool ``root/data`` still holds something."""
+    blocked: list[str] = []
+    for member in item.pool_members:
+        if not (run.state.service_root(member) / DATA_DIRNAME).is_dir():
+            continue
+        try:
+            block = run.block_for(member)
+        except (RuntimeError, OSError, ValueError) as e:  # pragma: no cover - host only
+            log.warning("%s: cannot allocate a uid block to inspect its data (%s)", member, e)
+            blocked.append(member)
+            continue
+        if legacy_data_is_nonempty(run.state, member, block):
+            blocked.append(member)
+    return blocked
+
+
+def _place_pool_root_file(
+    run: _Run, item: _Pending, name: str, content: bytes, block: UidBlock, action: str
+) -> bool:
+    """Push one harness-authored file into the pool root, iff it is not there.
+
+    "Is it there" is answered against the harness-owned shadow copy plus a
+    ``stat`` of the destination, because the destination itself is 0640 and
+    owned by a uid the harness cannot read as. The shadow is written *after* the
+    copy succeeds, so a failed placement is retried on the next tick.
+    """
+    root = run.state.service_root(item.id)
+    shadow = pool_shadow_dir(run.state) / item.id / name
+    try:
+        unchanged = shadow.read_bytes() == content and (root / name).exists()
+    except OSError:
+        unchanged = False
+    if unchanged:
+        return False
+    place_pool_file(root, name, content, block)
+    shadow.parent.mkdir(parents=True, exist_ok=True)
+    tmp = shadow.with_name(f".{name}.tmp{os.getpid()}")
+    tmp.write_bytes(content)
+    os.replace(tmp, shadow)
+    item.actions.append(action)
+    item.changed = True
+    return True
+
+
+def _declare_pool(run: _Run, item: _Pending) -> bool:
+    """Everything a pool needs on disk before its declaration is written.
+
+    Order is load-bearing: the adoption guard first (it refuses the whole
+    declaration), then the member secrets (a declaration naming a secret with no
+    value fails at spawn, D16), then ``pool.json`` and the runner (the argv in
+    the declaration points at the runner, and the runner reads ``pool.json``
+    beside itself), and only then -- back in the caller -- ``service.toml``,
+    whose arrival is what makes the next reload start the process.
+    """
+    blocked = _adoption_blocked(run, item)
+    if blocked:
+        run.fail(
+            item,
+            "declare",
+            f"member(s) {blocked} still have data in their pre-pool "
+            f"services/<id>/root/{DATA_DIRNAME}; run `{POOL_ADOPT_COMMAND} {item.pool}` to move "
+            "it into the pool root -- sync never moves data",
+            item.sha,
+        )
+        return False
+
+    try:
+        block = run.block_for(item.id)
+    except (RuntimeError, OSError, ValueError) as e:
+        run.fail(item, "declare", f"uid block: {type(e).__name__}: {e}", item.sha)
+        return False
+
+    mangle = getattr(translate_mod, "mangle_member", _fallback_mangle)
+    try:
+        for name in _member_secret_names(item, mangle):
+            if name not in run.secrets.names(item.id):
+                run.secrets.set(item.id, name, _secrets.token_hex(SVC_SECRET_BYTES).encode("ascii"))
+                item.actions.append("secret")
+                item.changed = True
+    except (OSError, ValueError) as e:
+        run.fail(item, "declare", f"member secret: {type(e).__name__}: {e}", item.sha)
+        return False
+
+    document = json.dumps(dict(item.pool_json or {}), indent=2, sort_keys=True) + "\n"
+    try:
+        placed = _place_pool_root_file(
+            run, item, POOL_JSON_NAME, document.encode("utf-8"), block, "pool-json"
+        )
+        _place_pool_root_file(
+            run, item, POOL_RUNNER_NAME, pool_runner_source().read_bytes(), block, "pool-runner"
+        )
+        if placed:
+            # The member set can only change when pool.json does, and `mkdir -p`
+            # is idempotent, so this rides on that write instead of forking into
+            # the admin namespace on every tick.
+            make_pool_data_dirs(run.state.service_root(item.id), item.pool_members, block)
+            item.actions.append("pool-data")
+    except (OSError, RuntimeError) as e:
+        run.fail(item, "declare", f"pool files: {type(e).__name__}: {e}", item.sha)
+        return False
+    return True
+
+
 def _phase_declare(run: _Run, item: _Pending) -> bool:
     """Write the sidecars, generate ``SVC_SECRET``, write ``service.toml``."""
     try:
-        if _write_json_if_changed(
+        if item.translation.mount and _write_json_if_changed(
             mounts_dir(run.state) / f"{item.id}.json", item.translation.mount
         ):
             item.actions.append("mount")
@@ -969,6 +1644,17 @@ def _phase_declare(run: _Run, item: _Pending) -> bool:
         run.fail(item, "declare", f"sidecar: {type(e).__name__}: {e}", item.sha)
         return False
 
+    if item.pool and not item.is_pool:
+        # A pooled member's two sidecars are fleet state (its gateway route and
+        # its registry identity) and are written above like anyone else's. What
+        # it does not get is a `service.toml`: the pool's declaration is the one
+        # that starts the process serving it.
+        if not _unlink_member_decl(run, item):
+            return False
+        run.advance(item, "declared")
+        run.platform.get(item.id).deployed_sha = item.sha
+        return True
+
     if item.kind != "service" or item.decl is None or item.decl_text is None:
         # A static site has no process and no registry record, so `declared` is
         # where its state machine ends: claiming `healthy` would claim a probe
@@ -980,16 +1666,20 @@ def _phase_declare(run: _Run, item: _Pending) -> bool:
     # The secret must exist before the declaration does: a declaration listing
     # SVC_SECRET with no stored value fails at spawn (D16), and the reload two
     # phases from here is what starts the service.
-    try:
-        if SVC_SECRET_NAME not in run.secrets.names(item.id):
-            run.secrets.set(
-                item.id, SVC_SECRET_NAME, _secrets.token_hex(SVC_SECRET_BYTES).encode("ascii")
-            )
-            item.actions.append("secret")
-            item.changed = True
-    except (OSError, ValueError) as e:
-        run.fail(item, "declare", f"{SVC_SECRET_NAME}: {type(e).__name__}: {e}", item.sha)
-        return False
+    if item.is_pool:
+        if not _declare_pool(run, item):
+            return False
+    else:
+        try:
+            if SVC_SECRET_NAME not in run.secrets.names(item.id):
+                run.secrets.set(
+                    item.id, SVC_SECRET_NAME, _secrets.token_hex(SVC_SECRET_BYTES).encode("ascii")
+                )
+                item.actions.append("secret")
+                item.changed = True
+        except (OSError, ValueError) as e:
+            run.fail(item, "declare", f"{SVC_SECRET_NAME}: {type(e).__name__}: {e}", item.sha)
+            return False
 
     missing = run.secrets.missing(item.id, item.decl.secrets)
     if missing:
@@ -1112,7 +1802,12 @@ def _phase_gateway(run: _Run) -> tuple[list[str], bool]:
     mounts: list[dict[str, Any]] = []
     for mount in all_mounts:
         service_id = str(mount.get("id") or "")
-        if mount.get("kind") == "service" and not ports.get(service_id):
+        # A pooled member's port lives on its pool's allocator row, so "has this
+        # been allocated yet" has to be asked of the owner -- the same
+        # indirection `gateway.resolve_ports` follows one call later. An absent
+        # `port_owner` means "my own id", which is every unpooled service.
+        owner = str(mount.get("port_owner") or service_id)
+        if mount.get("kind") == "service" and not ports.get(owner):
             log.warning("%s: declared but not yet allocated a port; not on the gateway", service_id)
             continue
         mounts.append(mount)
@@ -1161,7 +1856,13 @@ def _phase_register(run: _Run, client: RegistryClient, item: _Pending) -> bool:
         return True
     try:
         service_id, kwargs, rules = from_sidecar(reg)
-        secret = run.secrets.load(item.id, [SVC_SECRET_NAME])[SVC_SECRET_NAME]
+        # A pooled member's SVC_SECRET is stored under the *pool* id as
+        # SVC_SECRET__<MANGLED>: one process holds every member's identity, so
+        # the names have to be distinct in one env (PLAN-pool §3.3). The value
+        # the registry is given is unchanged -- the registry never learns that
+        # pooling exists.
+        owner = item.secret_owner or item.id
+        secret = run.secrets.load(owner, [item.secret_name])[item.secret_name]
         client.create_identity(service_id, secret, **kwargs)
         client.upsert_acl(service_id, rules)
     except (RegistryError, MissingSecret, KeyError) as e:
@@ -1182,6 +1883,28 @@ def _phase_health(run: _Run, client: RegistryClient, item: _Pending, port: int) 
     return False
 
 
+def _pool_blocked(run: _Run, item: _Pending) -> bool:
+    """True when this member's pool failed, in which case it is failed with it.
+
+    Marked failed, *not* escalated: one process failing is one cause, and N
+    escalations for it is exactly the per-tick noise the dedupe in
+    :meth:`_Run.fail` exists to prevent. The pool's own escalation names the
+    reason and its record names the members.
+    """
+    if item.is_pool or not item.pool:
+        return False
+    error = run.failed_pools.get(item.pool)
+    if error is None:
+        return False
+    message = f"pool {pool_id_for(item.pool)}: {error}"
+    run.platform.set_stage(item.id, FAILED, now_s=run.now(), error=message)
+    run.platform.get(item.id).escalated = True
+    item.failed_with = message
+    item.changed = True
+    log.info("%s: not declared -- its pool failed (%s)", item.id, error)
+    return True
+
+
 def _phase_finish(run: _Run, live: Sequence[_Pending], sha: str) -> None:
     """Registry identity + ACL, then the health gate, for what reached ``reloaded``.
 
@@ -1195,12 +1918,22 @@ def _phase_finish(run: _Run, live: Sequence[_Pending], sha: str) -> None:
     # harness restarts a service only when its declaration's content hash
     # changes (D17), so a service whose declaration is byte-identical is still
     # running the process that was already registered and already healthy.
+    # A pooled member has no declaration of its own, so "my declaration changed"
+    # has to be read off its pool: when the pool was re-declared its process was
+    # restarted, and every member in it is worth re-probing.
+    redeclared = {
+        item.pool for item in live if item.is_pool and item.pool and "declare" in item.actions
+    }
     work = [
         item
         for item in live
         if item.kind == "service"
         and item.reached == "reloaded"
-        and ("declare" in item.actions or run.platform.get(item.id).stage != "healthy")
+        and (
+            "declare" in item.actions
+            or (item.pool in redeclared and not item.is_pool)
+            or run.platform.get(item.id).stage != "healthy"
+        )
     ]
     if not work:
         return
@@ -1217,9 +1950,15 @@ def _phase_finish(run: _Run, live: Sequence[_Pending], sha: str) -> None:
     for item in work:
         if not _phase_register(run, client, item):
             continue
-        allocated = ports.get(item.id).get("main")
+        owner = item.port_owner or item.id
+        allocated = ports.get(owner).get(item.port_name)
         if allocated is None:
-            run.fail(item, "health", "no allocated port named 'main'", item.sha)
+            run.fail(
+                item,
+                "health",
+                f"no allocated port named {item.port_name!r} on {owner!r}",
+                item.sha,
+            )
             continue
         _phase_health(run, client, item, allocated)
 
@@ -1289,6 +2028,8 @@ def sync(
     for item in run.pending:
         if item.failed_with:
             continue
+        if _pool_blocked(run, item):
+            continue
         if _phase_materialize(run, item):
             _phase_declare(run, item)
     run.platform.flush()
@@ -1317,11 +2058,140 @@ def sync(
     return report
 
 
+def _dry_plan_pool(
+    run: _Run,
+    name: str,
+    entries: Sequence[_Parsed],
+    head: str,
+    emit: Callable[[Mapping[str, Any]], None],
+) -> list[ServiceOutcome]:
+    """The plan for one pool: its own line, then one indented line per member.
+
+    This is what PLAN-pool §7.2 step 4 is read against before the migration's
+    first state-changing tick, so it answers that step's four questions from
+    what is actually on disk rather than from what the code intends: one new
+    service, N declarations going away, N mount sidecars gaining a
+    ``port_owner``, and zero registry sidecar changes.
+    """
+    pool_id = pool_id_for(name)
+    out: list[ServiceOutcome] = []
+    broken = [e for e in entries if e.failed is not None]
+    if broken:
+        error = (
+            f"pool {name!r} will not build: member manifest(s) "
+            f"{sorted(e.dirname for e in broken)} did not translate"
+        )
+        emit(
+            _record(
+                service_id=pool_id,
+                stage="plan",
+                error=error,
+                sha=head,
+                kind=PLAN_KIND,
+                action="log",
+            )
+        )
+        return [ServiceOutcome(id=pool_id, kind="service", stage=FAILED, sha=head, error=error)]
+
+    pool_sha = _pool_target_sha(run, entries, head)
+    members = sorted(e.id for e in entries)
+    rec = run.platform.records.get(pool_id)
+    actions = ["translate"]
+    if rec is None or rec.sha != pool_sha or rec.stage == FAILED:
+        # A pool has no registry identity of its own, so `register` is a
+        # member's action and never the pool's.
+        actions += ["stage", "provision", "declare", "reload", "health"]
+    emit(
+        _record(
+            service_id=pool_id,
+            stage="plan",
+            error=(
+                f"would run: {', '.join(actions)} (pool of {len(members)}: {', '.join(members)})"
+            ),
+            sha=pool_sha,
+            prev_sha=rec.prev_sha if rec else None,
+            kind=PLAN_KIND,
+            action="log",
+        )
+    )
+    out.append(
+        ServiceOutcome(
+            id=pool_id,
+            kind="service",
+            stage=rec.stage if rec else STAGES[0],
+            sha=pool_sha,
+            prev_sha=rec.prev_sha if rec else None,
+            actions=tuple(actions),
+        )
+    )
+
+    for entry in entries:
+        assert entry.translation is not None
+        member_rec = run.platform.records.get(entry.id)
+        changes: list[str] = []
+        current = _read_sidecar(mounts_dir(run.state) / f"{entry.id}.json")
+        wanted = dict(entry.translation.mount)
+        if current == wanted:
+            changes.append("mount-unchanged")
+        elif not (current or {}).get("port_owner"):
+            changes.append(f"mount-gains-port_owner={wanted.get('port_owner') or pool_id}")
+        else:
+            changes.append("mount-changes")
+        changes.append(
+            "declaration-unlinked"
+            if run.state.service_decl_path(entry.id).is_file()
+            else "no-declaration"
+        )
+        registry_now = _read_sidecar(registry_dir(run.state) / f"{entry.id}.json")
+        wanted_registry = dict(entry.translation.registry or {})
+        changes.append(
+            "registry-unchanged" if registry_now == wanted_registry else "registry-changes"
+        )
+        changes.append("register")
+        changes.append("health")
+        emit(
+            _record(
+                service_id=entry.id,
+                stage="plan",
+                # Two spaces: members read as indented under their pool, the
+                # same shape `ams platform status` uses (§3.4).
+                error=f"  in pool {name}: {', '.join(changes)}",
+                sha=pool_sha,
+                prev_sha=member_rec.prev_sha if member_rec else None,
+                kind=PLAN_KIND,
+                action="log",
+            )
+        )
+        out.append(
+            ServiceOutcome(
+                id=entry.id,
+                kind="service",
+                stage=member_rec.stage if member_rec else STAGES[0],
+                sha=pool_sha,
+                prev_sha=member_rec.prev_sha if member_rec else None,
+                actions=tuple(changes),
+            )
+        )
+    return out
+
+
+def _read_sidecar(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _dry_run(run: _Run, manifests: Sequence[Path], sha: str, services_dir: Path) -> SyncReport:
     """Print what a real run would do. Touches nothing under the state dir.
 
     The source mirror is still updated -- that is a cache in the *store*, and
     without it there would be no manifests to plan against.
+
+    Pooled manifests are planned as a group, at the position of the pool's first
+    member, so the ordering of every unpooled line is exactly what it was before
+    pools existed.
     """
     outcomes: list[ServiceOutcome] = []
     records: list[Mapping[str, Any]] = []
@@ -1330,22 +2200,43 @@ def _dry_run(run: _Run, manifests: Sequence[Path], sha: str, services_dir: Path)
         records.append(record)
         _emit(run.stream, record)
 
+    parsed: list[_Parsed] = []
     for manifest in manifests:
         dirname = manifest.parent.name
+        overlay: Overlay | None = None
         try:
             overlay = load_ams_overlay(manifest.parent)
-            ctx = run.cfg.context_for(
-                sha=sha, services_dir=services_dir, extra_secret_names=overlay.secrets
+            translation, _decl = _translate_at(
+                run, manifest, overlay, sha, services_dir, pool=overlay.pool
             )
-            translation = translate(manifest.read_text(encoding="utf-8"), ctx)
-            _apply_overlay_env(translation.decl, overlay.env)
         except (TranslateError, StaticError, DeclError, OSError, UnicodeDecodeError) as e:
             if not run.cfg.selects(dirname):
                 continue
             error = f"translate: {type(e).__name__}: {e}"
+            failed = _Pending(
+                manifest=manifest,
+                translation=Translation(
+                    id=dirname, kind="service", decl=None, mount={}, registry=None
+                ),
+                decl=None,
+                decl_text=None,
+                sha=sha,
+            )
+            failed.failed_with = error
+            parsed.append(
+                _Parsed(manifest=manifest, dirname=dirname, overlay=overlay, failed=failed)
+            )
+            continue
+        parsed.append(_Parsed(manifest, dirname, overlay, translation, None))
+
+    pools = _select_pools(run, parsed)
+    planned: set[str] = set()
+    for entry in parsed:
+        if entry.failed is not None and entry.pool is None:
+            error = entry.failed.failed_with or "translate failed"
             emit(
                 _record(
-                    service_id=dirname,
+                    service_id=entry.dirname,
                     stage="translate",
                     error=error,
                     sha=sha,
@@ -1355,21 +2246,33 @@ def _dry_run(run: _Run, manifests: Sequence[Path], sha: str, services_dir: Path)
             )
             outcomes.append(
                 ServiceOutcome(
-                    id=dirname, kind="service", stage=FAILED, sha=sha, error=error, changed=True
+                    id=entry.dirname,
+                    kind="service",
+                    stage=FAILED,
+                    sha=sha,
+                    error=error,
+                    changed=True,
                 )
             )
             continue
-        if not run.cfg.selects(dirname, translation.id):
+        if entry.pool is not None:
+            if entry.pool not in pools or entry.pool in planned:
+                continue
+            planned.add(entry.pool)
+            outcomes += _dry_plan_pool(run, entry.pool, pools[entry.pool], sha, emit)
             continue
-        rec = run.platform.records.get(translation.id)
+        assert entry.translation is not None
+        if not run.cfg.selects(entry.dirname, entry.id):
+            continue
+        rec = run.platform.records.get(entry.id)
         actions = ["translate"]
         if rec is None or rec.sha != sha or rec.stage == FAILED:
             actions += ["stage", "provision", "declare"]
-            if translation.kind == "service":
+            if entry.translation.kind == "service":
                 actions += ["reload", "register", "health"]
         emit(
             _record(
-                service_id=translation.id,
+                service_id=entry.id,
                 stage="plan",
                 error=f"would run: {', '.join(actions)}",
                 sha=sha,
@@ -1380,8 +2283,8 @@ def _dry_run(run: _Run, manifests: Sequence[Path], sha: str, services_dir: Path)
         )
         outcomes.append(
             ServiceOutcome(
-                id=translation.id,
-                kind=translation.kind,
+                id=entry.id,
+                kind=entry.translation.kind,
                 stage=rec.stage if rec else STAGES[0],
                 sha=sha,
                 prev_sha=rec.prev_sha if rec else None,

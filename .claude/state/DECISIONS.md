@@ -1588,3 +1588,263 @@ transcript with the tables is `.claude/state/platform-fleet.md`.
   `errors=9`) and restarted nothing. The services kept running on their in-memory
   declarations, so nothing broke — but a harness restart in that window would
   have failed to start nine services. Nothing detects this today. n=1.
+
+### D29. Pools: N manifests, one process, distinguished by tag (2026-09-03)
+
+The fleet's memory is dominated by a fixed per-process cost, not by the
+services. On racknerd, 16 Python uvicorn processes hold 44–74 MiB each while
+`import fastapi` alone is 44 MiB, and 14 member packages imported into one
+interpreter cost 59 MiB in total. The services are ~1 MiB each; the interpreter
+is everything. **So the unit of deployment, not the unit of code, is what has
+to change.**
+
+A **pool** is one ams declaration, one root, one venv, one process, hosting N
+`api` services as N `uvicorn.Server` instances on N ports in one asyncio event
+loop (`src/ams/platform/assets/pool_runner.py`). Each member keeps its own
+allocated port, its own registry identity and ACL, its own Caddy route, its own
+`/health` on its own port, its own `data/<member>/` directory, its own
+secrets, its own `ServiceRecord` and its own change detection. The **tag that
+distinguishes members is the service id it already has** — `SVC_NAME`, the
+registry id, the mount id. Nothing new was invented to tell members apart;
+the only new key says which process a manifest runs in. Full contract:
+`docs/platform-pools.md`. Full design and rejected alternatives:
+`.claude/state/PLAN-pool.md`.
+
+- **The grouping key is `pool = "<name>"` in `service.ams.toml`
+  (`static.Overlay.pool`, `static.overlay_pool`), not in `service.yaml`.** The
+  legacy deployer validates manifests against a schema with
+  `"additionalProperties": false` at the root, so a new manifest key would
+  hard-fail the deployer that still owns production. The overlay is already
+  the ams-only channel, already read before `translate()`, already
+  reject-rather-than-guess. The pool's ams id is `pool-<name>`
+  (`translate.POOL_ID_PREFIX`) so it can never collide with a member id.
+- **N ports, not one.** *Rejected:* one uvicorn with N `build_app()` results
+  mounted under N path prefixes. A live probe (2026-09-03, n=1) showed that
+  shape works — four apps under four Starlette `Mount()`s on one port, with the
+  right `root_path`, `/docs` and `openapi.json` `servers` whether or not a
+  member sets `root_path` itself. It was still rejected on what the probe did
+  not remove: it inverts the gateway's prefix-stripping rule for every pooled
+  member, forces `health_path` to carry the mount prefix, has no prefix at all
+  for the five subdomain-mounted members, and leaves two websocket routes
+  behind an untested `Mount` scope rewrite. **The decisive reason is
+  reversibility.** This design's own safety valve — for a dependency conflict,
+  a memory spike, or a service that must not be interrupted — is "that member
+  leaves the pool". With one port per member, leaving is a pure deployment
+  edit: the member's Caddy block is byte-identical in or out of the pool, and
+  only the port number in `reverse_proxy` differs (verified — `gateway.py`'s
+  `resolve_ports` is the *entire* gateway-side change; `_render_site`,
+  `_port_for` and every existing Caddyfile golden are untouched). With one
+  shared port, leaving is a routing migration every time. Keeping one port per
+  member also leaves `registryclient.py` and every `registry/<id>.json`
+  sidecar byte-identical — the registry never learns pooling exists. The
+  one-port shape stays documented as the fallback if N `uvicorn.Server`
+  instances in one event loop turn out not to work.
+- **The runner is an ams asset placed into the pool root, not SDK code.**
+  `src/ams/platform/assets/pool_runner.py` (no `__init__.py` in `assets/`),
+  copied to `<root>/pool_runner.py` by `_phase_declare` and run by the pool's
+  own venv python. ams only ever reads its bytes, so "nothing in `src/ams`
+  imports fastapi/uvicorn" holds and is asserted by a portable test (imports
+  every `ams.*` module, asserts both absent from `sys.modules`). *Rejected:* a
+  `sdk.pool` module in the api repo — which manifests share a process is a
+  deployment decision owned by the runtime, and putting it in a library Layer 0
+  also depends on means every runner fix is an api commit plus a fleet
+  redeploy, for a private repo with a second consumer (the legacy deployer)
+  that needed zero changes of its own.
+- **The env splits into ~12 identity keys, swapped per member per phase, and
+  everything else, unioned into the process env.** Fifteen members' `SVC_NAME`s
+  cannot coexist in one env; fifteen sequential reads can. `load_from_env()` is
+  **not** one-shot at `build_app()` time as both fact reports had assumed: an
+  AST survey of all 19 services plus the SDK (n=19, static, `envsurvey.py`)
+  found `timeservice`, `llmpricing`, `resume`, `displayservice` and
+  `test-service` calling it again **inside their lifespan**. So the swap wraps
+  build, lifespan startup and lifespan shutdown (`pool_runner._identity_env`,
+  `_build_member`, `_startup_member`, `_shutdown_member`), using the uvicorn
+  split verified in the spike (n=3 runs, 6 members, every `/health` 200, RSS
+  66 MiB, SIGTERM → all stopped in 0.63–0.73 s) — `config.load()`,
+  `lifespan = config.lifespan_class(config)`, sequential `await startup()` per
+  member under its identity env, concurrent `main_loop()`, sequential
+  `shutdown()` back under the identity env. Every request-time env read outside
+  the identity set uses a service-specific name (`MESSAGE_INGEST_TOKEN`,
+  `LOCATION_*`, `DEEPSEEK_API_KEY`, …), which is what makes the union safe;
+  `translate.build_pool`/`_pool_env` reject a pool whose members bind one
+  non-identity key to different values, naming both members and the conflicting
+  value. Two keys turned out to be mandatory rather than metadata:
+  `SVC_AUDIENCE` (`KeyError` without it) and `REGISTRY_URL`/`AUTH_URL` (the SDK
+  refreshes ACLs against the *default* registry URL when they are unset). The
+  one identity key read at **request** time is `SVC_ENDPOINT`
+  (`sdk/ui.py:266`, `mailbox/main.py:249`); it resolves to `""` in a pool, so
+  the login return-to is derived from the request instead — the single
+  api-side change in this design (T11, landed on the `api` branch
+  `ams-platform` at `f88ebe60` per the fleet dry check below), and a
+  correctness fix in its own right. Secrets are the exception to `pool.json`:
+  they arrive through the process env as `<NAME>__<MANGLED-MEMBER>` from
+  `<state>/secrets/<pool-id>/` (`translate.mangle_member`, checked for
+  injectivity across the pool), because the spawn-time injection point is per
+  declaration and there is exactly one declaration.
+- **The runner catches `SystemExit` per member, not just `Exception`.** A
+  uvicorn startup failure calls `sys.exit(3)` inside the task, and in one event
+  loop that `SystemExit` — a `BaseException`, invisible to `except Exception` —
+  propagates out of `asyncio.run` and takes down every member. Verified in the
+  spike. `_build_member`/`_startup_member`/`_shutdown_member` each catch
+  `(Exception, SystemExit)` and log one `ERROR [<member>] pool: <phase> failed`
+  line; the process itself exits non-zero only when zero members started
+  (`_serve`).
+- **The pool venv pins `uvicorn[standard]==0.52.4`** (`translate.POOL_UVICORN_PIN`,
+  emitted as `packages[0]` ahead of every member's editable install),
+  overriding every member's own `>=0.27`. The startup split uses six uvicorn
+  internals (`Config.load`, `Config.lifespan_class`, `Server.lifespan`,
+  `startup`, `main_loop`, `shutdown`), none public API. The runner
+  `hasattr`-checks all six (`_check_uvicorn_api`) before building anything and
+  exits with one line naming the missing attribute and the version found, so an
+  incompatible bump is a clean `failed` record at second zero rather than a
+  half-started pool. Any uvicorn bump revisits this file deliberately.
+- **One pool is one trust domain, stated rather than engineered around.**
+  Members share an address space; any member can read another's environment
+  and `app.state`. Isolation between members is not attempted. The runner's
+  environment restore is hygiene, not a boundary. The pool boundary is drawn on
+  blast radius: `displayservice`, `llmgateway`, `files` and `oss` stay
+  standalone because their memory is bounded by workload rather than by code.
+- **A member that fails to build or start is skipped; the pool serves the
+  rest.** *Rejected:* failing the whole pool, which converts one bad commit
+  into a 12-service outage — strictly worse than today. Two distinct failure
+  points, and they are handled differently on purpose: a member whose
+  **manifest itself does not translate** (a `TranslateError`) fails the whole
+  pool at build time — `translate._check_pool_members`/`build_pool` raise, the
+  sync loop's `_build_pool_group` catches it as a `PoolError`, and every member
+  of that pool is marked `failed` with one shared message (`_pool_blocked`),
+  not N separate escalations, because one broken manifest is one cause. A
+  member whose **process** fails to build or start inside a pool that *did*
+  translate is the case §4.5 covers: its port never binds, its own health
+  probe fails, its own `ServiceRecord` goes `failed`, and the rest of the pool
+  keeps running. `/_pool/health` is 200 while **any** member serves, because it
+  drives the supervisor's restart policy and the D27 dependency gate.
+- **The pool is the rollback unit; a member id is refused** (`rollback.py`,
+  checked against `record.get("pool")`). Message names the pool and states the
+  reason: "its members share one process, one tree and one venv". Rolling back
+  a pool id re-derives it from its members' manifests **as they were at the
+  target sha** (`_find_pool_translation`: per-member `translate()` with
+  `TranslateContext.pool` set, then one `build_pool` over the union) — there is
+  no manifest for a pool itself. All or nothing: a member that does not
+  translate at that sha means the commit is not one the pool can reach. The
+  health gate afterwards runs **per member** (`_step_pool_health`): the pool's
+  own admin probe answering proves the runner is up, not that every member's
+  app was built and mounted. D26's change detection survives at pool
+  granularity — a commit to any member restarts all of them; that is the
+  accepted price.
+- **Provisioning is one `uv pip install -e <member>…` into one venv at
+  `<root>/.venv`** (`runtime=RuntimeSpec(kind="uv", sync=False,
+  packages=[pin, "-e", rel, …])`), not `uv sync --frozen`. Twelve
+  `cp --reflink` and twelve `uv sync` become one of each
+  (`sync._phase_materialize`: `if item.pool and not item.is_pool: … nothing to
+  stage or provision`).
+- **Adoption is an explicit operator command, never a sync side effect.**
+  `ams platform pool adopt <pool>` (`src/ams/platform/pool.py`) stops each
+  member over the control socket, moves its `data/` under the pool root and
+  its secrets under `<NAME>__<MANGLED>`, then unlinks its stale
+  `service.toml`. Sync's `_declare_pool` refuses to declare a pool whose member
+  still has a non-empty legacy `data/` and escalates once with the exact
+  command. **The move is a two-hop staged move, not a direct `mv`**: a member's
+  `data/` is owned by the member's uid block and the pool's by the pool's, and
+  `run_admin` maps exactly one block into the namespace it forks, so no single
+  admin fork holds `CAP_DAC_OVERRIDE` over both directories at once. The move
+  is therefore `<member-root>/data/*` → a harness-owned staging directory
+  (`<state>/platform/adopt/<member>/`, inner 0 in *both* namespaces) →
+  `<pool-root>/data/<member>/`, two renames on one filesystem, so a
+  multi-gigabyte database moves in constant time. *Rejected:* teaching
+  `run_admin` to map two blocks at once — it widens the privilege of every
+  admin fork in the harness to fix one operation that runs once per pool in the
+  lifetime of the fleet. A run that dies between hops is recoverable: the next
+  run drains the staging directory before touching the member's own `data/`.
+- **`ams platform status`'s rendering has no header row and no `AGE`
+  column** (`cli.format_status`) — a correction to the plan's mock, which
+  sketched both. Pools sort first with members indented underneath
+  (`_ordered`); a `POOL` column is added only when at least one record carries
+  a pool key, so an unpooled fleet's output is byte-identical to before pools
+  existed; every row still prints `since=<stage_since>`, the pre-existing
+  per-row format, rather than a separate age field.
+
+**Assumptions.** (1) The member projects resolve into one venv — read from 21
+`pyproject.toml` files with zero conflicting specifiers, installed together
+once in a scratch venv, and six of them then built, served and stopped from it
+(n=3). The escape hatch when this breaks is deleting one overlay line. (2) No
+member's memory is unbounded — mitigated by the exclusion list, not by a
+mechanism. (3) Members tolerate a shared process: no `signal.signal`, no
+`sys.exit`, no module-level mutable SDK state, `ContextVar` rather than
+globals, per-instance heartbeat threads, distinct package names, distinct DB
+paths — all read exhaustively. `auth` is the known counter-example (a
+module-level session secret minted at import) and stays out of every pool.
+
+**Facts** (verified, this task)
+- `load_from_env()` is not one-shot at `build_app()` time: an AST survey of all
+  19 `api` services plus the SDK (n=19, static, `envsurvey.py`) found
+  `timeservice`, `llmpricing`, `resume`, `displayservice` and `test-service`
+  calling it again inside their lifespan. This is why the identity-env swap
+  wraps three phases, not one.
+- Every request-time env read outside the ~12 identity keys uses a
+  service-specific name, not a shared one (same n=19 static survey) — the
+  finding that makes the non-identity union safe, with `SVC_ENDPOINT` the one
+  exception (T11 fixed it).
+- A uvicorn startup failure calls `sys.exit(3)` inside the task, and in one
+  event loop that `SystemExit` propagates out of `asyncio.run` and kills every
+  member unless caught explicitly — verified live in the spike (n=3 runs, 6
+  members: `kvservice`, `timeservice`, `llmpricing`, `logservice`,
+  `messageservice`, `commentservice`), which also measured RSS 66 MiB, 3–4
+  threads, and SIGTERM → all stopped in 0.63–0.73 s under `SVC_DEV=1`.
+- The fleet dry check (`build_pool("core")` over all 15 real manifests on api
+  branch `ams-platform` @ `c8b1fff3`, T11 fix at `f88ebe60`, 2026-09-03, n=1
+  local run — not yet on racknerd): 15 members, 16 ports, 20 mangled secrets,
+  `limits = 600M / 100% / pids 288`, 34 unioned non-identity env keys with zero
+  conflicts, `resume` correctly detected as a module-level app
+  (`factory=false`), and `schema.loads(emit_toml(decl)) == decl` held.
+- Local suite: **1193 passed / 122 skipped** (`.venv/bin/python -m pytest -q`,
+  2026-09-03) with T1–T8 landed; up from 993/110 at the end of wave 4.
+
+**Open / weak signals**
+- **Memory saving is a projection, not a result.** No measurement has
+  exercised request traffic, database connections or per-app caches, and every
+  measurement ran with `SVC_DEV=1` (registry client and its per-member threads
+  disabled). What exists: 16 standalone processes at 44–74 MiB (n=1 each);
+  `import fastapi` 44 MiB; 14 apps imported into one interpreter 59 MiB,
+  marginal ≈1 MiB/app (n=1); T0's 6 apps serving in one process at 66 MiB
+  (n=3). The projected saving is ≈500 MiB for a 12-member pool. **Do not
+  delete the standalone path or widen the pool roster on the strength of this**
+  until §7.3 of `docs/platform-pools.md` is filled in with n=3 idle samples on
+  the real fleet (T10, not yet run).
+- **`pids_max = 48 + 16 × N` and `memory_max = 150M + 30M × N` are still
+  unmeasured formulas.** T0's 3–4 threads at N=6 ran with `SVC_DEV=1`, which
+  suppresses exactly the per-member heartbeat, M2M-refresh and CLS-forwarder
+  threads the pids formula is sized for — that number must not be reused. T10
+  re-derives both against a fleet with `SVC_DEV` unset.
+- **The one-loop blocking-I/O hazard is a structural risk with a textual
+  audit, not a live measurement.** A static heuristic (n=19, `asyncaudit.py`)
+  grepped pooled members for blocking calls inside `async def` handlers and
+  found none among the recommended roster (sync `def` handlers run on
+  Starlette's shared anyio threadpool and do not block the loop); what
+  couples is one 40-thread pool shared by 15 members instead of 15 separate
+  pools. Decision: keep the one-loop runner; the documented fallback if T10
+  shows cross-member latency coupling is one thread + one loop per member
+  (same memory, sequential startup still needed for the env swap). A textual
+  grep is not a load test — treat "no blocking calls found" as a lead, not a
+  clearance.
+- **The pool venv has no lockfile.** Provisioning resolves at declare time
+  with no `uv.lock` equivalent for the pool as a whole (each member still has
+  its own, unused by the pool's install). A `uv pip compile` lockfile for the
+  pool is a Phase-B option that changes nothing about the shape described
+  here.
+- **`SVC_ENDPOINT`-style request-time reads of an identity key were found by
+  reading the SDK and one member (`mailbox`), not by an exhaustive audit of
+  all 19 services' request handlers.** T11 fixed both known call sites; a
+  third has not been ruled out. `CLAUDE.md`'s new rule ("a request-time read of
+  `SVC_*` is a bug") is the standing instruction for anyone who finds a third.
+- **User-decidable defaults were taken in the user's absence** (PLAN-pool §10
+  risk 1–3), each with its default stated and reversible: the 15-member `core`
+  roster with `displayservice`/`llmgateway`/`files`/`oss` standalone (default:
+  accept the 15-member roster); the accepted losses in `docs/platform-pools.md`
+  § "What the user loses" (default: accept — the request explicitly asked for
+  merged processes); backup keys staying per logical service via `Target.label`
+  rather than becoming `pool-core/<member>/…` (default: keep them per-service,
+  since changing it after T7 orphans 14 days of R2 objects). None of the three
+  has been confirmed by the user; flag before the racknerd cutover (T10).
+- **The migration is not one-command reversible.** Un-pooling means restoring
+  each member's `data/` from a backup, dropping the overlay lines and syncing.
+  `ams platform pool adopt` has no inverse (`pool evict` is not in scope).

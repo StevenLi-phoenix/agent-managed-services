@@ -1,0 +1,881 @@
+"""Adopt N standalone services into one pool (PLAN-pool §5.8, §7.2 steps 5-6).
+
+``ams platform sync`` groups pooled manifests into one declaration but it never
+moves a byte of data: a sync tick is mechanical and runs on a timer, and moving
+a live SQLite file is neither. So the first tick after ``pool = "core"`` appears
+in the overlays stops at the adoption guard and escalates, naming this module's
+command. Adoption is then an explicit, operator-run, idempotent step::
+
+    ams platform pool plan core      # what would move
+    ams platform pool adopt core     # move it
+
+For each member of the pool, ``adopt``:
+
+1. stops it over the control socket (a process that is writing to a database is
+   not a process whose database may move);
+2. moves ``services/<member>/root/data/*`` into
+   ``services/pool-<name>/root/data/<member>/`` and hands it to the pool's uid;
+3. copies ``secrets/<member>/<NAME>`` to ``secrets/pool-<name>/<NAME>__<MANGLED>``
+   (§6): one process, one env, so the member's id becomes the name suffix;
+4. unlinks ``services/<member>/service.toml`` -- the pool's declaration is what
+   runs the member now, and two declarations would mean two processes serving
+   one identity.
+
+What it never does: **delete the legacy root**. The root keeps the member's
+repo, its venv and an empty ``data/`` after adoption, and an operator removes it
+by hand once a backup cycle has proved the pool healthy (§7.2 step 10). Nothing
+here is undone automatically either -- the honest reverse of a migration that
+moved databases is a restore from the backup, and the docs say so rather than
+this module pretending otherwise.
+
+**Why the move is two hops through a harness-owned staging directory.**
+``run_admin`` maps exactly one uid block into the namespace it forks (inner 0 =
+the harness, inner 1000 = *that* block). A member's ``data/`` is owned by the
+member's block and the pool's ``data/`` by the pool's, so no single admin
+namespace holds CAP_DAC_OVERRIDE over both directories, and a direct ``mv``
+fails with EACCES on whichever end is unmapped. The move therefore runs as:
+
+    <member-root>/data/*  --(member block)-->  <state>/platform/adopt/<member>/
+    <state>/platform/adopt/<member>/*  --(pool block)-->  <pool-root>/data/<member>/
+
+Both hops are renames on one filesystem, so a 2 GiB database moves in constant
+time and is never copied. The staging directory is owned by the harness, which
+is inner 0 in *both* namespaces -- that is the whole trick. The alternative,
+teaching ``run_admin`` to map two blocks at once, was rejected: it widens the
+privilege of every admin fork in the harness to fix one operation that runs
+once per pool in the lifetime of the fleet.
+
+A run that dies between the hops leaves files in the staging directory. The next
+run drains them into the pool before it looks at the member's own ``data/``,
+which is what makes a half-finished adoption recoverable by re-running it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import stat
+import sys
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol
+
+from ams.platform.sync import (
+    POOL_ID_PREFIX,
+    PlatformState,
+    SyncError,
+    pool_id_for,
+    state_path,
+)
+from ams.platform.translate import mangle_member
+from ams.secrets import SecretStore, store_for
+from ams.spawn import DATA_DIRNAME, INNER_GID, INNER_UID
+from ams.state import StateCorrupt, StateDir
+from ams.uidmap import UidBlock
+from ams.userns import AdminResult
+from ams.userns import run_admin as run_admin  # noqa: PLC0414 - the patch point
+
+log = logging.getLogger("ams.platform.pool")
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+#: A precondition is wrong and nothing was touched. Same meaning as rollback's.
+EXIT_PRECONDITION = 2
+
+#: Where the two-hop move parks files between namespaces. Harness-owned, 0700,
+#: on the same filesystem as both roots so every hop is a rename.
+ADOPT_DIRNAME = "adopt"
+STAGING_MODE = 0o700
+DATA_DIR_MODE = 0o750
+SECRET_FILE_MODE = 0o600
+
+#: Statuses that mean "no process is running under this id". Defined here rather
+#: than in :mod:`ams.platform.rollback` because adoption is the older question
+#: ("may I move this file?") and rollback imports it back; one definition either
+#: way, and this one has no import cycle.
+DOWN_STATUSES = frozenset({"stopped", "failed", "waiting"})
+
+STOP_POLL_S = 0.25
+STOP_DEADLINE_S = 30.0
+
+
+class PoolAdoptError(RuntimeError):
+    """A precondition is wrong. Raised before anything on the host is touched."""
+
+
+# --------------------------------------------------------------------------- seams
+
+
+class Control(Protocol):
+    """The two control-socket calls adoption makes."""
+
+    def status(self) -> Mapping[str, Any]: ...
+
+    def stop(self, service_id: str) -> Mapping[str, Any]: ...
+
+
+class _Allocator(Protocol):
+    def allocate(self, service_id: str) -> UidBlock: ...
+
+
+class _AdminFn(Protocol):
+    def __call__(self, argv: Sequence[str], block: UidBlock, **kw: Any) -> AdminResult: ...
+
+
+@dataclass(frozen=True)
+class SocketControl:
+    """The real control socket. Absent supervisor raises ``ControlError``."""
+
+    state: StateDir
+    timeout_s: float = 60.0
+
+    def status(self) -> Mapping[str, Any]:
+        return self._request("status")
+
+    def stop(self, service_id: str) -> Mapping[str, Any]:
+        return self._request("stop", service_id)
+
+    def _request(self, op: str, service_id: str | None = None) -> Mapping[str, Any]:
+        from ams.control import control_socket_path
+        from ams.control import request as control_request
+
+        return control_request(
+            control_socket_path(self.state), op, service_id, timeout_s=self.timeout_s
+        )
+
+
+def staging_dir(state: StateDir, member_id: str) -> Path:
+    """``<state>/platform/adopt/<member>`` -- the halfway house of the move."""
+    return Path(state.root) / "platform" / ADOPT_DIRNAME / member_id
+
+
+# --------------------------------------------------------------------------- the plan
+
+
+@dataclass(frozen=True)
+class MemberPlan:
+    """What adopting one member would move. Empty everywhere = already adopted."""
+
+    id: str
+    legacy_root: Path
+    legacy_data: Path
+    target_data: Path
+    #: Names (not paths) under ``legacy_data`` that would move.
+    data_entries: tuple[str, ...] = ()
+    #: Names left in the staging directory by an interrupted run.
+    staged_entries: tuple[str, ...] = ()
+    #: False when neither the harness nor the admin namespace could list the
+    #: directory. Adoption refuses rather than guessing what is in there.
+    data_readable: bool = True
+    #: ``(source name, target name)`` pairs still to copy, e.g.
+    #: ``("SVC_SECRET", "SVC_SECRET__KVSERVICE")``. Names only, never values.
+    secrets: tuple[tuple[str, str], ...] = ()
+    #: Target names that already have a value and will be left alone.
+    secrets_present: tuple[str, ...] = ()
+    decl_exists: bool = False
+    running: bool = False
+
+    @property
+    def needs_adopt(self) -> bool:
+        return bool(self.data_entries or self.staged_entries or self.secrets or self.decl_exists)
+
+    def lines(self) -> list[str]:
+        out = [f"  {self.id}:"]
+        for name in self.data_entries:
+            out.append(f"    move {self.legacy_data / name} -> {self.target_data / name}")
+        for name in self.staged_entries:
+            out.append(f"    finish move {name} -> {self.target_data / name} (staged)")
+        for source, target in self.secrets:
+            out.append(f"    copy secret {source} -> {target}")
+        for target in self.secrets_present:
+            out.append(f"    keep secret {target} (already set)")
+        if self.decl_exists:
+            out.append(f"    remove declaration {self.id}/service.toml")
+        if not self.data_readable:
+            out.append(f"    UNREADABLE {self.legacy_data} -- adopt will refuse")
+        if len(out) == 1:
+            out.append("    nothing to do")
+        return out
+
+
+@dataclass(frozen=True)
+class PoolPlan:
+    """Every member of one pool and what adoption would do to it."""
+
+    pool: str
+    pool_id: str
+    pool_root: Path
+    members: tuple[MemberPlan, ...]
+    #: Ids the supervisor reports as up; ``None`` when no supervisor answered.
+    running: tuple[str, ...] | None = None
+
+    @property
+    def is_noop(self) -> bool:
+        return not any(m.needs_adopt for m in self.members)
+
+    @property
+    def pending(self) -> tuple[MemberPlan, ...]:
+        return tuple(m for m in self.members if m.needs_adopt)
+
+    def lines(self) -> list[str]:
+        head = f"{self.pool_id}: {len(self.members)} member(s), root {self.pool_root}"
+        if self.running is None:
+            head += " (no supervisor is listening)"
+        elif self.running:
+            head += f" (running: {', '.join(self.running)})"
+        out = [head]
+        for member in self.members:
+            out += member.lines()
+        if self.is_noop:
+            out.append("nothing to adopt: every member is already in the pool")
+        return out
+
+    def summary(self) -> str:
+        if self.is_noop:
+            return f"{self.pool_id}: nothing to adopt ({len(self.members)} member(s) already in)"
+        return f"{self.pool_id}: {len(self.pending)} of {len(self.members)} member(s) to adopt"
+
+
+@dataclass(frozen=True)
+class AdoptReport:
+    """What one adoption did. Names only -- a secret value never lands here."""
+
+    pool_id: str
+    members: tuple[str, ...]
+    noop: bool = False
+    moved: tuple[str, ...] = ()
+    secrets_copied: tuple[str, ...] = ()
+    declarations_removed: tuple[str, ...] = ()
+    stopped: tuple[str, ...] = ()
+    actions: tuple[str, ...] = ()
+
+    @property
+    def exit_code(self) -> int:
+        return EXIT_OK
+
+    def summary(self) -> str:
+        if self.noop:
+            return (
+                f"{self.pool_id}: nothing to adopt "
+                f"({len(self.members)} member(s) already in the pool)"
+            )
+        return (
+            f"{self.pool_id}: adopted {len(self.members)} member(s); "
+            f"moved={len(self.moved)} secrets={len(self.secrets_copied)} "
+            f"declarations removed={len(self.declarations_removed)}"
+        )
+
+
+# --------------------------------------------------------------------------- resolving
+
+
+def resolve(pool_id: str) -> tuple[str, str]:
+    """``"core"`` or ``"pool-core"`` -> ``("core", "pool-core")``."""
+    if not isinstance(pool_id, str) or not pool_id.strip():
+        raise PoolAdoptError("a pool name is required, e.g. 'ams platform pool plan core'")
+    name = pool_id[len(POOL_ID_PREFIX) :] if pool_id.startswith(POOL_ID_PREFIX) else pool_id
+    if not name:
+        raise PoolAdoptError(f"{pool_id!r} is not a pool name")
+    return name, pool_id_for(name)
+
+
+def members_of(state: StateDir, pool: str, pool_id: str) -> tuple[str, ...]:
+    """The pool's members, from the platform state file.
+
+    Two sources, unioned: the pool record's ``pool_members`` (what sync wrote
+    when it grouped the manifests) and every member record carrying
+    ``pool = <name>``. Either alone is enough to adopt; both exist because a
+    pool that failed to build still leaves the member rows behind.
+    """
+    path = state_path(state)
+    try:
+        platform = PlatformState.load(path)
+    except (StateCorrupt, SyncError) as e:
+        raise PoolAdoptError(f"{path}: {e}") from None
+    found: set[str] = set()
+    record = platform.records.get(pool_id)
+    if record is not None:
+        found.update(record.pool_members)
+    found.update(
+        sid for sid, rec in platform.records.items() if rec.pool == pool and sid != pool_id
+    )
+    if not found:
+        raise PoolAdoptError(
+            f"no pool {pool!r} in {path}: there is no record for {pool_id} and no service "
+            f'declares pool = "{pool}". Add the overlay lines and run '
+            "'ams platform sync' once so the pool is grouped, then adopt it."
+        )
+    return tuple(sorted(found))
+
+
+# --------------------------------------------------------------------------- listing
+
+
+def _split0(raw: bytes) -> list[str]:
+    return [chunk.decode("utf-8", "surrogateescape") for chunk in raw.split(b"\0") if chunk]
+
+
+def _list_dir(
+    directory: Path,
+    *,
+    service_id: str,
+    uids: _Allocator | None,
+    run_admin_fn: _AdminFn | None,
+) -> tuple[tuple[str, ...], bool]:
+    """Names directly under ``directory``, and whether the answer is trustworthy.
+
+    The harness owns neither a service root nor a pool root, so a 0750 directory
+    is unlistable from here; the admin namespace is the fallback, exactly as
+    ``sync.legacy_data_is_nonempty`` does it. "Could not list" is never reported
+    as "empty": that is how data gets orphaned.
+    """
+    if not directory.is_dir():
+        return (), True
+    try:
+        return tuple(sorted(p.name for p in directory.iterdir())), True
+    except OSError as e:
+        log.debug("%s: cannot list %s from the harness (%s); using the admin ns",
+                  service_id, directory, e)
+    if uids is None or run_admin_fn is None:
+        return (), False
+    try:
+        block = uids.allocate(service_id)
+    except (RuntimeError, OSError, ValueError) as e:  # pragma: no cover - host only
+        log.warning("%s: cannot allocate a uid block to list %s (%s)", service_id, directory, e)
+        return (), False
+    result = run_admin_fn(
+        ["find", str(directory), "-mindepth", "1", "-maxdepth", "1", "-print0"], block
+    )
+    if not result.ok:
+        return (), False
+    return tuple(sorted(Path(p).name for p in _split0(result.stdout))), True
+
+
+def _control_rows(control: Control | None) -> dict[str, Any] | None:
+    """The supervisor's service table, or ``None`` when nothing is listening."""
+    if control is None:
+        return None
+    from ams.control import ControlError
+
+    try:
+        response = control.status()
+    except ControlError as e:
+        log.info("no supervisor answered (%s); adopting against a stopped fleet", e)
+        return None
+    rows = response.get("services")
+    return dict(rows) if isinstance(rows, Mapping) else {}
+
+
+def _is_up(rows: Mapping[str, Any] | None, service_id: str) -> bool:
+    if not rows:
+        return False
+    row = rows.get(service_id)
+    if not isinstance(row, Mapping):
+        return False
+    return bool(row.get("pid")) or str(row.get("status") or "unknown") not in DOWN_STATUSES
+
+
+# --------------------------------------------------------------------------- plan()
+
+
+def plan(
+    state: StateDir,
+    pool_id: str,
+    *,
+    uids: _Allocator | None = None,
+    run_admin_fn: _AdminFn | None = None,
+    control: Control | None = None,
+    secrets: SecretStore | None = None,
+) -> PoolPlan:
+    """What ``adopt`` would do, without doing any of it. Reads only.
+
+    ``uids``/``run_admin_fn`` are optional because a plan must work from a
+    laptop against a copied state dir; without them an unlistable ``data/``
+    comes back as ``data_readable=False`` rather than as an empty directory.
+    """
+    pool, resolved = resolve(pool_id)
+    member_ids = members_of(state, pool, resolved)
+    secrets = secrets if secrets is not None else store_for(state)
+    rows = _control_rows(control)
+    pool_root = state.service_root(resolved)
+    have = set(secrets.names(resolved))
+
+    members: list[MemberPlan] = []
+    for member in member_ids:
+        legacy_root = state.service_root(member)
+        legacy = legacy_root / DATA_DIRNAME
+        entries, readable = _list_dir(
+            legacy, service_id=member, uids=uids, run_admin_fn=run_admin_fn
+        )
+        staged, _ = _list_dir(
+            staging_dir(state, member), service_id=member, uids=uids, run_admin_fn=run_admin_fn
+        )
+        # Names only: which of the member's secrets still need a copy under the
+        # pool id, and which the pool already has (sync generates SVC_SECRET__X
+        # when it declares the pool, and a value that exists is never replaced).
+        suffix = mangle_member(member)
+        names = secrets.names(member)
+        pairs_full = tuple(
+            (name, f"{name}__{suffix}") for name in names if f"{name}__{suffix}" not in have
+        )
+        present = tuple(
+            sorted(f"{name}__{suffix}" for name in names if f"{name}__{suffix}" in have)
+        )
+        members.append(
+            MemberPlan(
+                id=member,
+                legacy_root=legacy_root,
+                legacy_data=legacy,
+                target_data=pool_root / DATA_DIRNAME / member,
+                data_entries=entries,
+                staged_entries=staged,
+                data_readable=readable,
+                secrets=pairs_full,
+                secrets_present=present,
+                decl_exists=state.service_decl_path(member).exists(),
+                running=_is_up(rows, member),
+            )
+        )
+    return PoolPlan(
+        pool=pool,
+        pool_id=resolved,
+        pool_root=pool_root,
+        members=tuple(members),
+        running=None if rows is None else tuple(sorted(sid for sid in rows if _is_up(rows, sid))),
+    )
+
+
+# --------------------------------------------------------------------------- adopt()
+
+
+@dataclass
+class _Adoption:
+    """Mutable bookkeeping for one adoption, so each step stays a small function."""
+
+    state: StateDir
+    pool: str
+    pool_id: str
+    plan: PoolPlan
+    uids: _Allocator
+    run_admin_fn: _AdminFn
+    control: Control | None
+    secrets: SecretStore
+    rows: dict[str, Any] | None
+    sleep: Callable[[float], None]
+    now: Callable[[], float]
+    moved: list[str] = field(default_factory=list)
+    secrets_copied: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    stopped: list[str] = field(default_factory=list)
+    actions: list[str] = field(default_factory=list)
+
+    @property
+    def pool_block(self) -> UidBlock:
+        return self.uids.allocate(self.pool_id)
+
+
+def adopt(
+    state: StateDir,
+    pool_id: str,
+    *,
+    uids: _Allocator | None = None,
+    run_admin_fn: _AdminFn | None = None,
+    control: Control | None = None,
+    secrets: SecretStore | None = None,
+    dry_run: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> AdoptReport | PoolPlan:
+    """Move each member's data, secrets and declaration into the pool.
+
+    Idempotent: a second run finds nothing to move and says so. Refuses, before
+    touching anything, while the pool process is up, and refuses when a
+    member's data would land on a file the pool root already holds -- that
+    collision is an operator's decision, not a supervisor's.
+
+    ``dry_run=True`` returns the :class:`PoolPlan` instead, which is exactly
+    what ``ams platform pool plan`` prints.
+    """
+    pool, resolved = resolve(pool_id)
+    uids = uids if uids is not None else _default_uids(state)
+    run_admin_fn = run_admin_fn if run_admin_fn is not None else run_admin
+    control = control if control is not None else SocketControl(state)
+    secrets = secrets if secrets is not None else store_for(state)
+
+    rows = _control_rows(control)
+    if _is_up(rows, resolved):
+        row = (rows or {}).get(resolved) or {}
+        raise PoolAdoptError(
+            f"{resolved} is running (status={row.get('status')!r} pid={row.get('pid')}); "
+            f"adoption moves the data that process is reading. Stop it first: "
+            f"ams ctl stop {resolved}"
+        )
+
+    the_plan = plan(
+        state,
+        resolved,
+        uids=uids,
+        run_admin_fn=run_admin_fn,
+        control=None,  # already asked, and asking twice can disagree with itself
+        secrets=secrets,
+    )
+    the_plan = _with_rows(the_plan, rows)
+    if dry_run:
+        return the_plan
+
+    members = tuple(m.id for m in the_plan.members)
+    if the_plan.is_noop:
+        log.info(
+            "%s: nothing to adopt; %d member(s) are already in the pool", resolved, len(members)
+        )
+        return AdoptReport(pool_id=resolved, members=members, noop=True)
+
+    run = _Adoption(
+        state=state,
+        pool=pool,
+        pool_id=resolved,
+        plan=the_plan,
+        uids=uids,
+        run_admin_fn=run_admin_fn,
+        control=control,
+        secrets=secrets,
+        rows=rows,
+        sleep=sleep,
+        now=now,
+    )
+    _check_collisions(run)
+    _ensure_pool_dirs(run)
+    for member in the_plan.members:
+        if not member.needs_adopt:
+            log.info("%s: already in %s; skipping", member.id, resolved)
+            continue
+        _stop_member(run, member)
+        _move_member_data(run, member)
+        _copy_member_secrets(run, member)
+        _remove_member_declaration(run, member)
+    report = AdoptReport(
+        pool_id=resolved,
+        members=members,
+        moved=tuple(run.moved),
+        secrets_copied=tuple(run.secrets_copied),
+        declarations_removed=tuple(run.removed),
+        stopped=tuple(run.stopped),
+        actions=tuple(run.actions),
+    )
+    log.info("%s", report.summary())
+    return report
+
+
+def _default_uids(state: StateDir) -> _Allocator:
+    from ams.platform.sync import uid_allocator
+
+    return uid_allocator(state)
+
+
+def _optional_uids(state: StateDir) -> _Allocator | None:
+    """The allocator when this host has one, else ``None``.
+
+    Only ``plan`` uses this. A plan is a read, and reading a state directory
+    copied off the box (no ``/etc/subuid`` entry for this user, no setuid
+    helpers) must still print something useful -- it says the directory is
+    unreadable rather than dying on the allocator.
+    """
+    try:
+        return _default_uids(state)
+    except Exception as e:  # noqa: BLE001 - any host problem means "no admin ns here"
+        log.debug(
+            "no uid allocator on this host (%s: %s); planning without one", type(e).__name__, e
+        )
+        return None
+
+
+def _with_rows(the_plan: PoolPlan, rows: dict[str, Any] | None) -> PoolPlan:
+    """Fold the status table this run already fetched into the plan it prints."""
+    from dataclasses import replace
+
+    members = tuple(replace(m, running=_is_up(rows, m.id)) for m in the_plan.members)
+    running = None if rows is None else tuple(sorted(sid for sid in rows if _is_up(rows, sid)))
+    return replace(the_plan, members=members, running=running)
+
+
+# --------------------------------------------------------------------------- steps
+
+
+def _check_collisions(run: _Adoption) -> None:
+    """Refuse *before* the first move when a name already exists in the pool.
+
+    ``mv`` would happily overwrite, and the file it would overwrite is a
+    database. The two directories are compared by name only -- deciding which of
+    two ``kvservice.db`` files is the real one is not a decision a tool gets to
+    make.
+    """
+    block = run.pool_block
+    for member in run.plan.members:
+        if not member.data_readable:
+            raise PoolAdoptError(
+                f"{member.id}: cannot list {member.legacy_data}, so adoption cannot know what "
+                "would move. Check the directory's ownership and the harness's subuid range."
+            )
+        if not member.needs_adopt:
+            continue
+        existing, readable = _list_dir(
+            member.target_data, service_id=run.pool_id, uids=run.uids, run_admin_fn=run.run_admin_fn
+        )
+        if not readable:
+            raise PoolAdoptError(
+                f"{run.pool_id}: cannot list {member.target_data}; refusing to move data into a "
+                "directory whose contents are unknown"
+            )
+        clash = sorted(set(existing) & set(member.data_entries + member.staged_entries))
+        if clash:
+            raise PoolAdoptError(
+                f"{member.id}: {member.target_data} already holds {clash}; adoption will not "
+                "overwrite a database. Move or delete the copy in the pool root by hand, then "
+                "run adopt again."
+            )
+    log.debug("%s: no name collisions between the members and the pool root (block %s)",
+              run.pool_id, block.uid_start)
+
+
+def _ensure_pool_dirs(run: _Adoption) -> None:
+    """``<pool-root>/data/<member>`` for every member, owned by the pool's uid.
+
+    Non-recursive chown on purpose: the pool root may already hold a staged repo
+    and a venv, and ``chown -R`` over those is minutes of io to fix nothing.
+    """
+    root = run.state.service_root(run.pool_id)
+    data = root / DATA_DIRNAME
+    targets = [str(data / m.id) for m in run.plan.members]
+    block = run.pool_block
+    run.run_admin_fn(
+        ["mkdir", "-m", oct(DATA_DIR_MODE)[2:], "-p", str(root), *targets], block
+    ).check()
+    run.run_admin_fn(
+        ["chown", f"{INNER_UID}:{INNER_GID}", str(root), str(data), *targets], block
+    ).check()
+    run.actions.append("pool-data")
+
+
+def _stop_member(run: _Adoption, member: MemberPlan) -> None:
+    """Stop the member, then wait for the supervisor to agree that it is down."""
+    if run.control is None or not _is_up(run.rows, member.id):
+        return
+    from ams.control import ControlError
+
+    try:
+        response = run.control.stop(member.id)
+    except ControlError as e:  # pragma: no cover - the socket answered a moment ago
+        raise PoolAdoptError(
+            f"{member.id}: cannot stop it ({e}); refusing to move its data"
+        ) from None
+    if not response.get("ok"):
+        raise PoolAdoptError(
+            f"{member.id}: the supervisor refused to stop it "
+            f"({response.get('error') or response}); refusing to move its data"
+        )
+    run.stopped.append(member.id)
+    run.actions.append(f"stop:{member.id}")
+    end = run.now() + STOP_DEADLINE_S
+    while True:
+        rows = _control_rows(run.control)
+        if not _is_up(rows, member.id):
+            run.rows = rows
+            return
+        if run.now() >= end:
+            raise PoolAdoptError(
+                f"{member.id} is still running {STOP_DEADLINE_S:.0f}s after 'stop'; "
+                "refusing to move the data of a live process"
+            )
+        run.sleep(STOP_POLL_S)
+
+
+def _move_member_data(run: _Adoption, member: MemberPlan) -> None:
+    """The two-hop move. See the module docstring for why there are two."""
+    staging = staging_dir(run.state, member.id)
+    if member.data_entries:
+        staging.mkdir(parents=True, exist_ok=True)
+        os.chmod(staging, STAGING_MODE)
+        block = run.uids.allocate(member.id)
+        sources = [str(member.legacy_data / name) for name in member.data_entries]
+        run.run_admin_fn(["mv", "-n", "-t", str(staging), "--", *sources], block).check()
+        run.run_admin_fn(["chown", "-R", "0:0", str(staging)], block).check()
+        log.info(
+            "%s: moved %d entr(ies) out of %s into the staging directory",
+            member.id,
+            len(sources),
+            member.legacy_data,
+        )
+
+    if not staging.is_dir():
+        return
+    staged = sorted(p.name for p in staging.iterdir())
+    if not staged:
+        _rmdir(staging)
+        return
+    pool_block = run.pool_block
+    run.run_admin_fn(
+        ["mv", "-n", "-t", str(member.target_data), "--", *[str(staging / n) for n in staged]],
+        pool_block,
+    ).check()
+    run.run_admin_fn(
+        ["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(member.target_data)], pool_block
+    ).check()
+    _rmdir(staging)
+    for name in staged:
+        run.moved.append(f"{member.id}:{name}")
+        log.info("%s: %s is now %s", member.id, name, member.target_data / name)
+    run.actions.append(f"data:{member.id}")
+
+
+def _rmdir(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError as e:  # pragma: no cover - a leftover here is not a failure
+        log.warning("could not remove the staging directory %s: %s", path, e)
+
+
+def _copy_member_secrets(run: _Adoption, member: MemberPlan) -> None:
+    """``secrets/<member>/NAME`` -> ``secrets/<pool>/NAME__<MANGLED>``.
+
+    Byte-exact rather than ``SecretStore.set``: that method normalizes human
+    input (it strips one trailing newline and rejects an empty value), which is
+    right for ``ams secret set`` and wrong for a copy -- a value that already
+    went through it must not be normalized a second time. The value is read into
+    memory and written straight back out; it is never logged, never put in an
+    argv, and never returned.
+    """
+    if not member.secrets:
+        return
+    directory = run.secrets.service_dir(run.pool_id)
+    for parent in (run.secrets.dir, directory):
+        parent.mkdir(parents=True, exist_ok=True)
+        if stat.S_IMODE(parent.stat().st_mode) != 0o700:
+            os.chmod(parent, 0o700)
+    for source, target in member.secrets:
+        src_path = run.secrets.path(member.id, source)
+        dst_path = directory / target
+        if dst_path.exists():
+            log.info("%s: %s already has a value; leaving it alone", run.pool_id, target)
+            continue
+        try:
+            payload = src_path.read_bytes()
+        except OSError as e:
+            raise PoolAdoptError(f"{member.id}: cannot read secret {source}: {e}") from None
+        tmp = dst_path.with_name(f".{target}.tmp{os.getpid()}")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, SECRET_FILE_MODE)  # O_CREAT's mode is subject to the umask
+            os.replace(tmp, dst_path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        finally:
+            del payload
+        run.secrets_copied.append(f"{member.id}:{source} -> {target}")
+        log.info("%s: copied secret %s to %s/%s", member.id, source, run.pool_id, target)
+    run.actions.append(f"secrets:{member.id}")
+
+
+def _remove_member_declaration(run: _Adoption, member: MemberPlan) -> None:
+    """Unlink ``services/<member>/service.toml``. The root is left alone."""
+    if not member.decl_exists:
+        return
+    path = run.state.service_decl_path(member.id)
+    try:
+        path.unlink()
+    except FileNotFoundError:  # pragma: no cover - it existed a moment ago
+        return
+    except OSError as e:
+        raise PoolAdoptError(f"{member.id}: cannot remove {path}: {e}") from None
+    run.removed.append(member.id)
+    run.actions.append(f"undeclare:{member.id}")
+    log.info("%s: removed the pre-pool declaration %s (the root is left in place)", member.id, path)
+
+
+# --------------------------------------------------------------------------- cli
+
+
+def add_subparser(ops: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    """Add ``pool`` (with ``plan`` and ``adopt``) to ``ams platform``'s verbs."""
+    parser = ops.add_parser(
+        "pool",
+        help="inspect and adopt a pool: move N services' data into one pool root",
+        description=(
+            "A pool runs N manifests in one process. 'plan' prints what adoption would "
+            "move; 'adopt' moves it: each member's data/ into the pool root, its secrets "
+            "under <NAME>__<MEMBER>, and its now-redundant service.toml away. Adoption is "
+            "idempotent, refuses while the pool is running, and never deletes a legacy root."
+        ),
+    )
+    sub = parser.add_subparsers(dest="pool_command", required=True)
+    p_plan = sub.add_parser("plan", help="print what 'pool adopt' would move; writes nothing")
+    p_adopt = sub.add_parser("adopt", help="move each member's data, secrets and declaration")
+    p_adopt.add_argument(
+        "--dry-run", action="store_true", help="print the plan instead of moving anything"
+    )
+    for p in (p_plan, p_adopt):
+        p.add_argument("id", metavar="pool-id", help="the pool name ('core') or id ('pool-core')")
+        p.add_argument("--state-dir", type=Path, default=None, help="overrides $AMS_STATE_DIR")
+        p.add_argument("--log-level", default="INFO")
+    return parser
+
+
+def cmd_pool(args: argparse.Namespace) -> int:
+    """``ams platform pool {plan,adopt}``."""
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    state = StateDir(args.state_dir) if args.state_dir else StateDir.from_env()
+    dry_run = args.pool_command == "plan" or bool(getattr(args, "dry_run", False))
+    try:
+        result = (
+            plan(
+                state,
+                args.id,
+                uids=_optional_uids(state),
+                run_admin_fn=run_admin,
+                control=SocketControl(state),
+            )
+            if dry_run
+            else adopt(state, args.id)
+        )
+    except (PoolAdoptError, StateCorrupt) as e:
+        print(f"ERROR {e}", file=sys.stderr)
+        return EXIT_PRECONDITION
+    except (RuntimeError, OSError, ValueError) as e:
+        # An admin-namespace failure (SpawnError), an exhausted subuid range or
+        # an unwritable state dir. One line for the operator, not a traceback --
+        # and never a partial success reported as one: adoption is idempotent,
+        # so the fix is to repair the host and run it again.
+        print(f"ERROR {type(e).__name__}: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    if isinstance(result, PoolPlan):
+        for line in result.lines():
+            print(line)
+        return EXIT_OK
+    print(result.summary())
+    for action in result.actions:
+        print(f"  {action}")
+    return result.exit_code
+
+
+def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - thin wrapper
+    """``python -m ams.platform.pool {plan,adopt} <pool-id>``."""
+    parser = argparse.ArgumentParser(prog="ams platform pool")
+    sub = parser.add_subparsers(dest="command", required=True)
+    add_subparser(sub)
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    return cmd_pool(args)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

@@ -1,6 +1,6 @@
 """``ams platform`` — the operator front door for the replica platform.
 
-Four verbs, deliberately thin:
+Five verbs, deliberately thin:
 
 - ``ams platform sync`` — one tick of :mod:`ams.platform.sync`. This is what
   ``deploy/ams-platform-sync.timer`` runs every 60 s; running it by hand is the
@@ -11,6 +11,8 @@ Four verbs, deliberately thin:
   (delegates to :func:`ams.platform.bootstrap.main`).
 - ``ams platform rollback`` — re-deploy one service at an earlier commit
   (delegates to :mod:`ams.platform.rollback`, which owns its own flags).
+- ``ams platform pool {plan,adopt}`` — move N services' data, secrets and
+  declarations into one pool root (delegates to :mod:`ams.platform.pool`).
 
 Streams follow the harness convention: **stdout** is the JSON-lines escalation
 channel an agent parses, **stderr** is the human log. ``status`` is the one
@@ -27,6 +29,8 @@ from pathlib import Path
 from typing import Any
 
 from ams.platform import sync as sync_mod
+from ams.platform.pool import add_subparser as add_pool
+from ams.platform.pool import cmd_pool
 from ams.platform.rollback import add_subparser as add_rollback
 from ams.platform.rollback import cmd_rollback
 from ams.platform.sync import (
@@ -98,6 +102,7 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPa
     p_boot.add_argument("-v", "--verbose", action="store_true")
 
     add_rollback(ops)
+    add_pool(ops)
     return parser
 
 
@@ -107,6 +112,7 @@ def cmd_platform(args: argparse.Namespace) -> int:
         "status": _cmd_status,
         "bootstrap": _cmd_bootstrap,
         "rollback": cmd_rollback,
+        "pool": cmd_pool,
     }
     return handlers[args.platform_command](args)
 
@@ -179,6 +185,46 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return EXIT_OK if all(services[sid].get("stage") != "failed" for sid in wanted) else EXIT_ERROR
 
 
+MEMBER_INDENT = "  "
+
+
+def _pool_cell(rec: Any) -> str | None:
+    """The POOL column for one record: ``(N)`` on a pool, its name on a member.
+
+    ``None`` means "this row has nothing to do with a pool", and a fleet where
+    every row answers ``None`` is rendered without the column at all -- so a
+    platform with no pools keeps byte-for-byte the output it had before pools
+    existed (PLAN-pool §3.4).
+    """
+    if rec.get("pool_members"):
+        return f"({len(rec['pool_members'])})"
+    pool = rec.get("pool")
+    return str(pool) if pool else None
+
+
+def _ordered(
+    rows: Sequence[tuple[str, Any]], services: dict[str, Any]
+) -> list[tuple[str, Any, bool]]:
+    """Pools first, each followed by its own members; everything else after.
+
+    A pool and its members are one process and one deploy unit, so reading them
+    apart -- which a flat alphabetical listing does -- is what the indent exists
+    to prevent.
+    """
+    by_id = dict(rows)
+    out: list[tuple[str, Any, bool]] = []
+    placed: set[str] = set()
+    for pool_id in sorted(sid for sid, rec in rows if rec.get("pool_members")):
+        out.append((pool_id, by_id[pool_id], False))
+        placed.add(pool_id)
+        for member in sorted(services[pool_id].get("pool_members") or []):
+            if member in by_id and member not in placed:
+                out.append((member, by_id[member], True))
+                placed.add(member)
+    out += [(sid, rec, False) for sid, rec in rows if sid not in placed]
+    return out
+
+
 def format_status(services: dict[str, Any], wanted: Sequence[str]) -> list[str]:
     """One aligned row per service, plus the error lines underneath.
 
@@ -188,23 +234,40 @@ def format_status(services: dict[str, Any], wanted: Sequence[str]) -> list[str]:
     rows = [(sid, services[sid]) for sid in wanted if sid in services]
     if not rows:
         return ["no services"]
-    width = max(len(sid) for sid, _ in rows)
+    ordered = _ordered(rows, services)
+    cells = {sid: _pool_cell(rec) for sid, rec, _ in ordered}
+    has_pools = any(cell is not None for cell in cells.values())
+    width = max(len(MEMBER_INDENT) * indented + len(sid) for sid, _, indented in ordered)
+    pool_width = max((len(cell or "-") for cell in cells.values()), default=1)
+    rendered = {sid for sid, _, _ in ordered}
+
     lines: list[str] = []
-    for sid, rec in rows:
+    for sid, rec, indented in ordered:
         sha = str(rec.get("sha") or "-")[:12]
         flags = []
         if rec.get("manual_restart"):
             flags.append("manual_restart")
         if rec.get("escalated"):
             flags.append("escalated")
-        lines.append(
-            f"{sid:<{width}}  {str(rec.get('stage')):<11}  {sha:<12}  "
-            f"since={rec.get('stage_since') or '-'}" + (f"  [{', '.join(flags)}]" if flags else "")
-        )
+        label = (MEMBER_INDENT if indented else "") + sid
+        columns = [f"{label:<{width}}", f"{str(rec.get('stage')):<11}", f"{sha:<12}"]
+        if has_pools:
+            columns.append(f"{cells[sid] or '-':<{pool_width}}")
+        columns.append(f"since={rec.get('stage_since') or '-'}")
+        lines.append("  ".join(columns) + (f"  [{', '.join(flags)}]" if flags else ""))
         if rec.get("error"):
             lines.append(f"{'':<{width}}  error: {rec['error']}")
         if rec.get("prev_sha"):
             lines.append(f"{'':<{width}}  last healthy: {str(rec['prev_sha'])[:12]}")
+        # `ams platform status <member>` is the common way to ask about one
+        # service, and on its own a member row says nothing about the process
+        # that actually runs it. One line, only when the pool is not on screen.
+        pool = rec.get("pool")
+        if pool and not rec.get("pool_members"):
+            pool_id = sync_mod.pool_id_for(str(pool))
+            if pool_id not in rendered:
+                stage = str((services.get(pool_id) or {}).get("stage") or "unknown")
+                lines.append(f"{'':<{width}}  pool: {pool_id} ({stage})")
     return lines
 
 

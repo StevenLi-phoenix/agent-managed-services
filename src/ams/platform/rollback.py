@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 import urllib.error
@@ -62,25 +63,43 @@ from typing import IO, Any, Protocol
 
 from ams.platform.bootstrap import BootstrapError
 from ams.platform.bootstrap import place_jwt_key as place_jwt_key  # noqa: PLC0414 - patch point
+from ams.platform.pool import DOWN_STATUSES as DOWN_STATUSES  # noqa: PLC0414 - re-export
 from ams.platform.sources import SourceError, SourceMirror
 from ams.platform.static import StaticError, load_ams_overlay
 from ams.platform.sync import (
     EXIT_ERROR,
     EXIT_OK,
     FAILED,
+    POOL_ID_PREFIX,
+    POOL_JSON_NAME,
+    POOL_RUNNER_NAME,
     STATE_VERSION,
     SVC_SECRET_NAME,
     SyncConfig,
     SyncError,
     discover_manifests,
     mounts_dir,
+    pool_id_for,
+    pool_runner_source,
+    pool_shadow_dir,
     registry_dir,
     state_path,
     uid_allocator,
 )
 from ams.platform.sync import _write_if_changed as write_if_changed
 from ams.platform.sync import _write_json_if_changed as write_json_if_changed
-from ams.platform.translate import TranslateError, Translation, emit_toml, translate
+from ams.platform.sync import make_pool_data_dirs as make_pool_data_dirs  # noqa: PLC0414 - patched
+from ams.platform.sync import place_pool_file as place_pool_file  # noqa: PLC0414 - patch point
+from ams.platform.translate import (
+    PoolTranslation,
+    TranslateError,
+    Translation,
+    build_pool,
+    emit_toml,
+    pool_member,
+    pool_port_name,
+    translate,
+)
 from ams.runtime import RuntimeStore, python_venv_dir
 from ams.runtime import provision as provision  # noqa: PLC0414 - patch point
 from ams.schema import DeclError, ServiceDecl
@@ -102,11 +121,12 @@ EXIT_PRECONDITION = 2
 STOP_SLACK_S = 10.0
 STOP_POLL_S = 0.25
 
-#: Statuses that mean "no process is running under this id", which is all the
-#: staging step needs to know. ``waiting`` is in the set on purpose: it means the
+#: ``DOWN_STATUSES`` -- statuses that mean "no process is running under this
+#: id", which is all the staging step needs to know -- is imported from
+#: :mod:`ams.platform.pool` above and re-exported here, where callers and tests
+#: have always read it. ``waiting`` is in the set on purpose: it means the
 #: supervisor is holding the service back because a ``depends_on`` dependency is
 #: not healthy yet, so there is nothing running and nothing to wait for.
-DOWN_STATUSES = frozenset({"stopped", "failed", "waiting"})
 
 
 class RollbackError(RuntimeError):
@@ -268,6 +288,72 @@ def _find_translation(
     )
 
 
+def _manifest_rel(checkout: Path, manifest: Path) -> str:
+    try:
+        return manifest.parent.relative_to(checkout).as_posix()
+    except ValueError:  # pragma: no cover - the manifest came from the checkout
+        return manifest.parent.name
+
+
+def _find_pool_translation(
+    checkout: Path, pool: str, cfg: SyncConfig, sha: str, services_dir: Path
+) -> tuple[PoolTranslation, dict[str, Translation]]:
+    """Rebuild pool ``<pool>`` from its members' manifests **as they were at ``sha``**.
+
+    There is no manifest for a pool: it is N manifests that each carry
+    ``pool = "<name>"`` in their overlay, and the declaration exists only after
+    ``build_pool`` has seen all of them together. So a pool rollback re-derives
+    the group at the target commit exactly the way a sync tick derives it at the
+    head -- per-member ``translate`` with ``TranslateContext.pool`` set, then one
+    ``build_pool`` over the union of the members' extra secret names.
+
+    All or nothing: a member that does not translate raises, because half a pool
+    at one commit and half at another is not a declaration that can be built.
+    """
+    entries: list[tuple[Path, Any, Translation]] = []
+    for manifest in discover_manifests(checkout, cfg.manifest_globs):
+        try:
+            overlay = load_ams_overlay(manifest.parent)
+        except (StaticError, OSError, UnicodeDecodeError) as e:
+            log.debug("%s: unreadable overlay at %s (%s); skipping", manifest, sha[:12], e)
+            continue
+        if overlay.pool != pool:
+            continue
+        try:
+            ctx = cfg.context_for(
+                sha=sha, services_dir=services_dir, extra_secret_names=overlay.secrets, pool=pool
+            )
+            translation = translate(manifest.read_text(encoding="utf-8"), ctx)
+        except (TranslateError, DeclError, OSError, UnicodeDecodeError) as e:
+            raise RollbackError(
+                f"pool {pool!r}: member manifest {manifest.parent.name} does not translate at "
+                f"{sha[:12]} ({type(e).__name__}: {e}); a pool is rolled back whole, so this "
+                "commit is not a target the pool can reach"
+            ) from None
+        entries.append((manifest, overlay, translation))
+    if not entries:
+        raise RollbackError(
+            f'no manifest carries pool = "{pool}" at {sha[:12]}; that commit predates the '
+            "pool, or the overlay lines were added after it"
+        )
+
+    extra = sorted({name for _m, overlay, _t in entries for name in overlay.secrets})
+    ctx = cfg.context_for(
+        sha=sha, services_dir=services_dir, extra_secret_names=tuple(extra), pool=pool
+    )
+    try:
+        built = build_pool(
+            pool,
+            [pool_member(t, _manifest_rel(checkout, m)) for m, _o, t in entries],
+            ctx,
+        )
+    except (TranslateError, DeclError) as e:
+        raise RollbackError(
+            f"pool {pool!r} cannot be built at {sha[:12]}: {type(e).__name__}: {e}"
+        ) from None
+    return built, {t.id: t for _m, _o, t in entries}
+
+
 def _wait_stopped(
     state: StateDir,
     service_id: str,
@@ -326,6 +412,19 @@ class _Run:
     stream: IO[str]
     actions: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Set only when ``service_id`` is a pool: the rebuilt group, and each
+    #: member's own translation (its mount route and registry identity, which
+    #: pooling does not change).
+    pool: PoolTranslation | None = None
+    member_translations: dict[str, Translation] = field(default_factory=dict)
+
+    @property
+    def is_pool(self) -> bool:
+        return self.pool is not None
+
+    @property
+    def members(self) -> tuple[str, ...]:
+        return tuple(m.id for m in self.pool.members) if self.pool is not None else ()
 
     def note(self, action: str) -> None:
         self.actions.append(action)
@@ -373,6 +472,19 @@ def rollback(
         known = ", ".join(sorted(document["services"])) or "(none)"
         raise RollbackError(f"no platform record for {service_id!r}; known services: {known}")
 
+    # A pooled member has no tree, no venv and no declaration of its own: the
+    # pool's process serves it, and rolling "just this member" back would mean
+    # deploying two commits in one address space. The pool is the unit (§5.9.1).
+    member_pool = record.get("pool")
+    if member_pool and not service_id.startswith(POOL_ID_PREFIX):
+        pool_id = pool_id_for(str(member_pool))
+        raise RollbackError(
+            f"{service_id} runs inside pool {pool_id!r}: its members share one process, one "
+            f"tree and one venv, so the pool is the rollback unit. Roll the whole pool back "
+            f"with 'ams platform rollback {pool_id}' -- and if only this member's commit is "
+            "bad, revert it upstream instead."
+        )
+
     from_sha = record.get("sha")
     target = to_sha or record.get("prev_sha")
     if not target:
@@ -399,9 +511,21 @@ def rollback(
             f"cannot materialize {target[:12]} from {mirror.mirror_dir}: {type(e).__name__}: {e}"
         ) from None
 
-    _manifest, translation, decl = _find_translation(
-        checkout, service_id, cfg, target, state.services_dir
-    )
+    pool_translation: PoolTranslation | None = None
+    member_translations: dict[str, Translation] = {}
+    if service_id.startswith(POOL_ID_PREFIX):
+        pool_name = str(member_pool or service_id[len(POOL_ID_PREFIX) :])
+        pool_translation, member_translations = _find_pool_translation(
+            checkout, pool_name, cfg, target, state.services_dir
+        )
+        decl = pool_translation.decl
+        translation = Translation(
+            id=service_id, kind="service", decl=decl, mount={}, registry=None
+        )
+    else:
+        _manifest, translation, decl = _find_translation(
+            checkout, service_id, cfg, target, state.services_dir
+        )
 
     run = _Run(
         state=state,
@@ -421,7 +545,11 @@ def rollback(
         now=now,
         sleep=sleep,
         stream=stream,
+        pool=pool_translation,
+        member_translations=member_translations,
     )
+    if run.is_pool:
+        log.info("%s has %d member(s): %s", service_id, len(run.members), ", ".join(run.members))
     log.info("rolling %s back from %s to %s", service_id, (from_sha or "-")[:12], target[:12])
     error = _perform(run)
     return _finish(run, path, error)
@@ -515,10 +643,82 @@ def _step_stage(run: _Run) -> str | None:
     return None
 
 
+def _pool_files(run: _Run) -> str | None:
+    """A pool's extra on-disk state: member sidecars, ``pool.json``, the runner.
+
+    Order mirrors ``sync._declare_pool`` exactly -- sidecars, then the two files
+    inside the pool root, then (back in the caller) ``service.toml``, whose
+    arrival is what makes the reload start the process. What is deliberately
+    *not* here: the members' secrets (a rollback never writes a secret, D16) and
+    the adoption guard (adoption is an operator step and it has already run, or
+    the pool would never have been declared in the first place).
+    """
+    assert run.pool is not None
+    try:
+        block = run.uids.allocate(run.service_id)
+    except (RuntimeError, OSError, ValueError) as e:
+        return f"declare: uid block: {type(e).__name__}: {e}"
+
+    for member_id in run.members:
+        translation = run.member_translations.get(member_id)
+        if translation is None:  # pragma: no cover - built from the same entries
+            continue
+        try:
+            if translation.mount and write_json_if_changed(
+                mounts_dir(run.state) / f"{member_id}.json", translation.mount
+            ):
+                run.note(f"mount:{member_id}")
+            if translation.registry is not None and write_json_if_changed(
+                registry_dir(run.state) / f"{member_id}.json", translation.registry
+            ):
+                run.note(f"registry-sidecar:{member_id}")
+            # A member that was standalone at the *target* commit would have had
+            # its own declaration then; leaving it on disk beside the pool's
+            # would start a second process serving the same identity.
+            decl_path = run.state.service_decl_path(member_id)
+            if decl_path.exists():
+                decl_path.unlink()
+                run.note(f"unpool-decl:{member_id}")
+        except OSError as e:
+            return f"declare: {member_id}: {type(e).__name__}: {e}"
+
+    root = run.state.service_root(run.service_id)
+    document = json.dumps(dict(run.pool.pool_json), indent=2, sort_keys=True) + "\n"
+    try:
+        _place_pool_root_file(run, POOL_JSON_NAME, document.encode("utf-8"), block)
+        _place_pool_root_file(run, POOL_RUNNER_NAME, pool_runner_source().read_bytes(), block)
+        make_pool_data_dirs(root, run.members, block)
+    except (OSError, RuntimeError) as e:
+        return f"declare: pool files: {type(e).__name__}: {e}"
+    run.note("pool-files")
+    return None
+
+
+def _place_pool_root_file(run: _Run, name: str, content: bytes, block: UidBlock) -> None:
+    """Push one harness-authored file into the pool root and shadow it.
+
+    Unconditional, unlike the sync tick's version: a rollback runs once, by
+    hand, and the file it is replacing is the one from the commit being rolled
+    away from. The harness-owned shadow copy is what the *next* sync tick
+    compares against, so writing the file without updating it would make that
+    tick push the same bytes again.
+    """
+    place_pool_file(run.state.service_root(run.service_id), name, content, block)
+    shadow = pool_shadow_dir(run.state) / run.service_id / name
+    shadow.parent.mkdir(parents=True, exist_ok=True)
+    tmp = shadow.with_name(f".{name}.tmp{os.getpid()}")
+    tmp.write_bytes(content)
+    os.replace(tmp, shadow)
+
+
 def _step_declare(run: _Run) -> str | None:
     """Rewrite both sidecars and the declaration at the target commit."""
+    if run.is_pool:
+        error = _pool_files(run)
+        if error is not None:
+            return error
     try:
-        if write_json_if_changed(
+        if run.translation.mount and write_json_if_changed(
             mounts_dir(run.state) / f"{run.service_id}.json", run.translation.mount
         ):
             run.note("mount")
@@ -626,9 +826,55 @@ def wait_healthy(
         sleep(interval_s)
 
 
+def _member_health_path(run: _Run, member_id: str) -> str:
+    """The member's own probe path: its registry sidecar, then its translation.
+
+    The sidecar on disk is preferred because that is what the sync loop's own
+    gate reads, and a rollback that gated on something else could call a pool
+    healthy that the next tick calls failed.
+    """
+    path = registry_dir(run.state) / f"{member_id}.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(document, dict) and document.get("health_path"):
+            return str(document["health_path"])
+    except (OSError, json.JSONDecodeError):
+        log.debug("%s: no usable registry sidecar at %s", member_id, path)
+    translation = run.member_translations.get(member_id)
+    registry = (translation.registry if translation is not None else None) or {}
+    return str(registry.get("health_path", "/health"))
+
+
+def _step_pool_health(run: _Run) -> str | None:
+    """Gate on **every member's** probe, on its own port.
+
+    One process, N members: the pool's admin probe answering says the runner is
+    up, not that each member's app was built and mounted. PLAN-pool §4.5 lets a
+    member fail to build without taking the process down, so a pool that gated
+    only on the runner would report a rollback healthy while one of its services
+    was serving nothing.
+    """
+    from ams.ports import PortAllocator
+
+    ports = PortAllocator(run.state.ports_state).get(run.service_id)
+    for member_id in run.members:
+        name = pool_port_name(member_id)
+        port = ports.get(name)
+        if port is None:
+            return f"health: {run.service_id} has no allocated port named {name!r} for {member_id}"
+        url = f"http://127.0.0.1:{port}{_member_health_path(run, member_id)}"
+        if not wait_healthy(url, run.cfg.health_deadline_s, run.cfg.health_interval_s):
+            return f"health: {member_id}: {url} not 200 within {run.cfg.health_deadline_s:.0f}s"
+        run.note(f"health:{member_id}")
+    return None
+
+
 def _step_health(run: _Run) -> str | None:
     """Gate on the service's own probe, exactly as the sync loop does."""
     from ams.ports import PortAllocator
+
+    if run.is_pool:
+        return _step_pool_health(run)
 
     port = PortAllocator(run.state.ports_state).get(run.service_id).get("main")
     if port is None:
@@ -662,6 +908,25 @@ def _finish(run: _Run, path: Path, error: str | None) -> RollbackReport:
     # declare the field yet, so it survives only until the next tick rewrites
     # the file -- see the wiring note in the module's task report.
     record["rolled_back_from"] = run.from_sha
+    for member_id in run.members:
+        # A member row that still claimed the newer commit would be a lie the
+        # whole platform reads: the member's code lives in the pool's tree and
+        # that tree has just moved. Only the sha-ish fields are touched -- the
+        # member's stage follows the pool's, and the next tick re-derives both.
+        member_record = run.document["services"].get(member_id)
+        if not isinstance(member_record, dict):
+            continue
+        member_record["sha"] = run.to_sha
+        member_record["deployed_sha"] = run.to_sha
+        member_record["stage"] = stage
+        member_record["error"] = error
+        member_record["updated_at"] = stamp
+        member_record["stage_since"] = stamp
+        member_record["escalated"] = False
+        member_record["rolled_back_from"] = run.from_sha
+        if stage == HEALTHY:
+            member_record["prev_sha"] = None
+
     if stage == HEALTHY:
         # `prev_sha` means "the last commit that reached healthy", and after a
         # successful rollback that commit is the one now in `sha`. Leaving the

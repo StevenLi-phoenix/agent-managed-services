@@ -603,26 +603,15 @@ def layer0_declarations(state: StateDir, *, port_name: str = "main") -> dict[str
 
 
 def render_declaration(decl: ServiceDecl, *, what: str) -> str:
-    """``service.toml`` text: a header comment, then :func:`emit_toml`'s output
-    with the ``[logging]`` table spliced in ahead of ``[stop]``.
+    """``service.toml`` text: a header comment, then :func:`emit_toml`'s output.
 
-    ``emit_toml`` does not render ``[logging]`` (it is shared with the manifest
-    translator, whose 21 golden files predate the field). Rather than change a
-    module another task owns, the two lines are inserted here, in the same slot
-    ``examples/platform/caddy/service.toml`` puts them. The round trip through
-    ``ams.schema.loads`` is asserted by the tests, so a drift in either half
-    fails loudly.
+    ``emit_toml`` renders ``[logging]`` itself, ahead of ``[stop]`` and only
+    when the format is not the default -- so the 21 manifest goldens, which
+    predate the field, are unchanged, and this function no longer has to splice
+    the table in. The round trip through ``ams.schema.loads`` is asserted by the
+    tests, so a drift in either half fails loudly.
     """
-    body = emit_toml(decl)
-    if decl.logging.format != "auto":
-        lines = body.split("\n")
-        try:
-            at = lines.index("[stop]")
-        except ValueError:  # pragma: no cover - emit_toml always writes [stop]
-            raise BootstrapError("emit_toml produced no [stop] table") from None
-        lines[at:at] = ["[logging]", f'format = "{decl.logging.format}"', ""]
-        body = "\n".join(lines)
-    return _HEADER.format(what=what) + "\n" + body
+    return _HEADER.format(what=what) + "\n" + emit_toml(decl)
 
 
 _WHAT = {

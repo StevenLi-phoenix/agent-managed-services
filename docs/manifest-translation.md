@@ -197,3 +197,22 @@ unaffected: these names still end up in the declaration's `secrets = [...]`
 field exactly like `SVC_SECRET` (D16), never in a sidecar.
 
 See `DECISIONS.md` for which of the 21 manifests actually need one, and why.
+
+## `pool`: N manifests translated into one declaration
+
+`load_ams_overlay` also reads an optional `pool = "<name>"` key from
+`service.ams.toml` (`Overlay.pool`, `static.overlay_pool`). A manifest naming
+a pool is still translated individually — `translate()` is called once per
+manifest with `TranslateContext.pool` set to the unprefixed name, which
+redirects every absolute path (`root_for`, and `_rewrite_data_path`'s new
+`data_subdir` parameter) into the pool's root instead of the manifest's own
+— but the sync loop never writes that manifest's `service.toml`. Instead it
+collects every `PoolMember` extracted from those individual translations
+(`translate.pool_member`) and calls `translate.build_pool(pool, members,
+ctx)` once, which is what actually produces the pool's `ServiceDecl` and its
+`pool.json` sidecar (the runner's own config, distinct from `mount.json`/
+`registry.json`). `mangle_member` turns a hyphenated member id into the env
+suffix its `POOL_PORT_<SUFFIX>` and `SVC_SECRET__<SUFFIX>` names use, and
+`build_pool` raises if two members' ids mangle alike. Full contract,
+including the identity-env split that makes one process env safe for N
+members: `docs/platform-pools.md`.

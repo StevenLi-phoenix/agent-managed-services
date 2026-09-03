@@ -169,3 +169,36 @@ fetched → translated → provisioned → declared → reloaded → registered 
 `failed` is terminal for the tick, not for the service: the next sync retries
 from the first stage whose inputs changed. A service at `failed` never blocks
 another service — every service has its own record.
+
+## Pools: two additive `mount.json` keys, one additive `pool.json`, two additive `platform-state.json` fields
+
+A pooled member's `mount.json` gains two OPTIONAL keys, both absent by
+default so an unpooled service's sidecar is byte-identical to before pools
+existed:
+
+| key | type | meaning |
+| --- | --- | --- |
+| `port_owner` | string \| null | the service id whose port allocation actually holds this mount's port — a pool id. Absent/null means "my own id", today's behaviour for every non-pooled service. |
+
+`port_name` is unchanged in shape, but a pooled member's value is its own id
+(mangled if it contains a hyphen — `translate.pool_port_name`) rather than
+the constant `"main"`, since N members share the one declaration's `ports`
+table and each needs a name of its own.
+
+A pool's own `<root>/pool.json` is a **new** sidecar, version 1, read only by
+`pool_runner.py` (never by `sync.py`'s callers besides the declare phase that
+writes it, and by `backup.discover` to label a database by member). Its
+shape, and the runner's env-swap contract, are documented in full in
+`docs/platform-pools.md` rather than duplicated here.
+
+`platform-state.json`'s per-service record gains two additive fields,
+omitted by `as_json` when unset (same precedent as `deployed_sha`, D26):
+
+| key | type | meaning |
+| --- | --- | --- |
+| `pool` | string \| null | on a *member* record: the pool it runs inside, unprefixed (`"core"`) |
+| `pool_members` | list of strings | on a *pool* record: the member ids sharing this process, sorted |
+
+`ams platform status` reads `pool_members` to sort pools first with their
+members indented underneath, and adds a `POOL` column only when at least one
+record carries either key.

@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "pool": "core",
+  "sha": "0123456789abcdef0123456789abcdef01234567",
+  "members": [
+    {
+      "id": "kvservice",
+      "app": "kvservice.main:build_app",
+      "factory": true,
+      "port_name": "kvservice",
+      "port_env": "POOL_PORT_KVSERVICE",
+      "health_path": "/health",
+      "secret_env": {
+        "SVC_SECRET": "SVC_SECRET__KVSERVICE"
+      },
+      "env": {
+        "AMS_DATA_DIR": "/home/harness/state/services/pool-core/root/data/kvservice",
+        "AUTH_URL": "http://127.0.0.1:19101",
+        "GIT_COMMIT": "0123456789abcdef0123456789abcdef01234567",
+        "KV_DB_PATH": "/home/harness/state/services/pool-core/root/data/kvservice/kvservice.db",
+        "REGISTRY_URL": "http://127.0.0.1:19100",
+        "SVC_AUDIENCE": "kvservice",
+        "SVC_CAPABILITIES": "keyvalue",
+        "SVC_HEALTH_PATH": "/health",
+        "SVC_M2M_PUBLIC_KEY_PATH": "/home/harness/state/services/pool-core/root/etc/jwt-rs256.pub",
+        "SVC_NAME": "kvservice",
+        "SVC_OWNER": "steven",
+        "SVC_ROOT_PATH": "/kv"
+      }
+    },
+    {
+      "id": "timeservice",
+      "app": "timeservice.main:build_app",
+      "factory": true,
+      "port_name": "timeservice",
+      "port_env": "POOL_PORT_TIMESERVICE",
+      "health_path": "/health",
+      "secret_env": {
+        "SVC_SECRET": "SVC_SECRET__TIMESERVICE"
+      },
+      "env": {
+        "AMS_DATA_DIR": "/home/harness/state/services/pool-core/root/data/timeservice",
+        "AUTH_URL": "http://127.0.0.1:19101",
+        "GIT_COMMIT": "0123456789abcdef0123456789abcdef01234567",
+        "REGISTRY_URL": "http://127.0.0.1:19100",
+        "SVC_AUDIENCE": "timeservice",
+        "SVC_CAPABILITIES": "time",
+        "SVC_DISPLAY_NAME": "Time Service",
+        "SVC_HEALTH_PATH": "/health",
+        "SVC_M2M_PUBLIC_KEY_PATH": "/home/harness/state/services/pool-core/root/etc/jwt-rs256.pub",
+        "SVC_NAME": "timeservice",
+        "SVC_OWNER": "lishuyu",
+        "SVC_ROOT_PATH": "/time"
+      }
+    }
+  ]
+}

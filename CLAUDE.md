@@ -7,11 +7,12 @@ The agent *is* the harness loop; systemd only keeps the harness alive. On top of
 that core, `src/ams/platform/` turns ams into the runtime for the `api` monorepo:
 mirror → translate → provision → declare → reload → route → register → gate.
 
-Read first: `.claude/state/DECISIONS.md` (the why, D1–D27 + open items),
+Read first: `.claude/state/DECISIONS.md` (the why, D1–D29 + open items),
 `.claude/state/PROGRESS.md` (what is done / next), `.claude/state/PLAN-allin.md`
-(the four waves), `docs/platform.md` (the end-to-end story),
-`docs/service-declaration.md`, `docs/platform-sidecars.md`,
-`docs/manifest-translation.md`.
+(the four waves), `.claude/state/PLAN-pool.md` (the pools feature),
+`docs/platform.md` (the end-to-end story), `docs/service-declaration.md`,
+`docs/platform-sidecars.md`, `docs/manifest-translation.md`,
+`docs/platform-pools.md` (N services sharing one process).
 
 ## Layout — core (src/ams, ~7k lines, stdlib only, Python 3.12)
 - `schema.py` — `service.toml` → frozen dataclasses (`ServiceDecl`, `RuntimeSpec` kinds none|venv|uv|pnpm|bun|nix, `HealthSpec`, `StopSpec`, `LimitsSpec`, `RestartSpec`, `LoggingSpec`, top-level `depends_on`); `validate`, `loads/load`, `expand_ports`. Reserved env names rejected.
@@ -35,28 +36,31 @@ Read first: `.claude/state/DECISIONS.md` (the why, D1–D27 + open items),
 ## Layout — platform (src/ams/platform, ~9k lines)
 - `sources.py` — `SourceMirror`: bare mirror `<store>/repos/<n>.git`, canonical checkout `<store>/src/<n>/<sha>/` (`git archive | tar`), `stage()` = `cp -a --reflink=auto` into `<root>/repo` inside the admin ns, `.ams-sha` marker, `gc(keep)`, `changed_paths()`, `validate_url` (no credentials, no ssh).
 - `yamlsubset.py` — restricted YAML parser; every unsupported construct raises `YamlSubsetError` naming line + construct.
-- `translate.py` — `translate(manifest, ctx) -> Translation(decl, mount, registry)`; `emit_toml`; loopback gate in `TranslateContext.__post_init__`; `DEPENDS_ON = ("registry",)`. Rejects rather than guesses.
-- `sync.py` — the one-shot tick and `ServiceRecord` / `PlatformState` (`<state>/platform/state.json`). Stages `fetched → translated → provisioned → declared → reloaded → registered → healthy | failed`, monotonic; a tick that changes nothing writes nothing.
-- `cli.py` — `ams platform sync|status|bootstrap|rollback`.
+- `translate.py` — `translate(manifest, ctx) -> Translation(decl, mount, registry)`; `emit_toml`; loopback gate in `TranslateContext.__post_init__`; `DEPENDS_ON = ("registry",)`. Rejects rather than guesses. Pools: `PoolMember`, `PoolTranslation`, `build_pool(pool, members, ctx)`, `pool_member(translation, manifest_dir_rel)`, `mangle_member(id)`, `TranslateContext.pool*` fields — see `docs/platform-pools.md`.
+- `sync.py` — the one-shot tick and `ServiceRecord` / `PlatformState` (`<state>/platform/state.json`). Stages `fetched → translated → provisioned → declared → reloaded → registered → healthy | failed`, monotonic; a tick that changes nothing writes nothing. Pools: groups manifests sharing a `pool` overlay key into one `_Pending`/`ServiceRecord` (`pool`/`pool_members` fields), stages+provisions the pool once, and refuses to declare a pool with un-adopted legacy member data (the adoption guard, naming `ams platform pool adopt`).
+- `cli.py` — `ams platform sync|status|bootstrap|rollback|pool`.
 - `bootstrap.py` — RS256 keypair once into `<store>/platform/`, Layer-0 secrets into the SecretStore, registry/auth declarations, `place_jwt_key` per service root.
 - `layer0.py` — the 17-stage bring-up; `Layer0Error(stage, …)` carries the partial report.
-- `gateway.py` — renders `<state>/gateway/{Caddyfile,sites/<id>.caddy}` from the mount sidecars + live ports. Output is `caddy fmt`-canonical.
-- `static.py` — `publish_static` for `kind: static`, and `load_ams_overlay` (the **only** reader of `service.ams.toml`).
+- `gateway.py` — renders `<state>/gateway/{Caddyfile,sites/<id>.caddy}` from the mount sidecars + live ports. Output is `caddy fmt`-canonical. `resolve_ports` follows a mount's optional `port_owner` (a pool id) so a pooled member's port comes off the pool's allocation.
+- `static.py` — `publish_static` for `kind: static`, and `load_ams_overlay` (the **only** reader of `service.ams.toml`); `Overlay.pool` / `overlay_pool` for the pool grouping key.
 - `registryclient.py` — `create_identity` (409 = success), `upsert_acl`, `wait_healthy`; stdlib urllib, deployer's retry backoff.
-- `policy.py` — `PlatformPolicy` (dedupe by normalized cause, post-sync health gate, Caddy rules, registry-heartbeat suppression), `EscalationDeduper`, `DedupingEscalation`.
-- `backup.py` — `discover → snapshot → upload → prune`, plus `restore`; stdlib sqlite backup in the admin ns, rclone via `RCLONE_CONFIG_R2_*` env.
-- `rollback.py` — `rollback(state, store, id, *, cfg, to_sha=None)`; stop → stage → declare → reload → restart → health gate.
+- `policy.py` — `PlatformPolicy` (dedupe by normalized cause, post-sync health gate, Caddy rules, registry-heartbeat suppression), `EscalationDeduper`, `DedupingEscalation`. `_pool_suffix` appends `" (pool of N: a, b, c)"` to a pooled crash-loop escalation.
+- `backup.py` — `discover → snapshot → upload → prune`, plus `restore`; stdlib sqlite backup in the admin ns, rclone via `RCLONE_CONFIG_R2_*` env. `Target.label` (pool member id when found under `<root>/data/<member>/`) keeps a pooled member's R2 key byte-identical to its pre-pool key.
+- `rollback.py` — `rollback(state, store, id, *, cfg, to_sha=None)`; stop → stage → declare → reload → restart → health gate. Refuses a pooled member id, naming the pool; rolling back a pool id re-derives it from its members' manifests at the target sha and gates per member.
+- `pool.py` — `plan`/`adopt` (`ams platform pool plan|adopt <pool>`): moves a member's `data/`, secrets and stale declaration into its pool root via a two-hop staged move (member uid block → harness-owned staging dir → pool uid block, since one admin fork maps only one uid block). Idempotent, refuses while the pool is running, never deletes a legacy root. **`src/ams` never imports this pool's runner asset** (see `assets/` below) — `pool.py` itself is ordinary `ams` code; only `pool_runner.py` is fastapi/uvicorn-touching data.
+- `assets/pool_runner.py` — package **data**, no `__init__.py` in `assets/`: the N-services-in-one-process runner a pool's own venv python executes. `src/ams` only ever `read_bytes()`/`write_bytes()` it; a portable test asserts importing every `ams.*` module never pulls `fastapi`/`uvicorn` into `sys.modules`.
 
 ## CLI surface
-`ams validate | run [--no-isolation] [--provision] [--policy default|platform] | provision [id…] | ctl <op> [id] | check-host | secret {set,rm,list,check} | platform {sync,status,bootstrap,rollback}`.
+`ams validate | run [--no-isolation] [--provision] [--policy default|platform] | provision [id…] | ctl <op> [id] | check-host | secret {set,rm,list,check} | platform {sync,status,bootstrap,rollback,pool {plan,adopt}}`.
 
 ## Tests (~16k lines)
 - `tests/*.py` portable: `.venv/bin/python -m pytest -q`.
 - `tests/linux/*` marked `linux`, only meaningful via `scripts/remote-test.sh [subdir] [args]` (rsync + pytest as `harness` under `systemd-run -p Delegate=yes`). Use a **distinct remote subdir per parallel agent**.
 - **No two test modules may share a basename.** pytest's default `prepend` import mode derives module names from the basename and `tests/` has no `__init__.py`, so a duplicate aborts collection for the whole suite. Convention: `tests/linux/test_<x>_live.py` or `_linux.py` (`test_platform_sources_linux.py`, `test_platform_static_live.py`, `test_userns_portable.py`).
-- Goldens: `tests/golden/platform/` (21 manifests + `<id>.toml` / `.mount.json` / `.registry.json` per service — the manifests are **copied in**, because `api/` is gitignored and not rsynced to the Linux host) and `tests/golden/gateway/{path,subdomain,static,tls,logdir}`.
-- Fixtures: `tests/fixtures/uv-e2e-app`. `tests/conftest.py` skips `linux`-marked tests without a delegated cgroup.
-- Baseline at the end of wave 4: **993 passed / 110 skipped** locally (2026-09-03).
+- Goldens: `tests/golden/platform/` (21 manifests + `<id>.toml` / `.mount.json` / `.registry.json` per service — the manifests are **copied in**, because `api/` is gitignored and not rsynced to the Linux host) and `tests/golden/gateway/{path,subdomain,static,tls,logdir}`. Pools: `tests/golden/platform/pool/` (a 2-member `kvservice`+`timeservice` pool: `pool-core.toml`, `pool-core.pool.json`, the two members' `.yaml` + `.mount.json`).
+- Fixtures: `tests/fixtures/uv-e2e-app`, `tests/fixtures/pool-members` (a fixture pool venv/app pair for the runner's Linux test). `tests/conftest.py` skips `linux`-marked tests without a delegated cgroup.
+- Pools test modules (portable): `test_schema_portnames.py`, `test_pool_runner_static.py`, `test_platform_pool_translate.py`, `test_platform_overlay_pool.py`, `test_platform_gateway_pool.py`, `test_platform_sync_pool.py`, `test_platform_backup_pool.py`, `test_platform_policy_pool.py`, `test_platform_pool_adopt.py`; Linux-only: `tests/linux/test_pool_runner_live.py`, `tests/linux/test_pool_adopt_live.py`.
+- Baseline: **1193 passed / 122 skipped** locally (2026-09-03, `.venv/bin/python -m pytest -q`), pools T1–T8 landed.
 
 ## Target host (racknerd, Ubuntu 24.04)
 - Harness user `harness` uid 1000, subuid/subgid `100000:65536`; `/home/harness`
@@ -87,3 +91,5 @@ Read first: `.claude/state/DECISIONS.md` (the why, D1–D27 + open items),
 - **Create the registry identity before starting a translated Layer-1 service.** No `SVC_DEV` means the SDK registers inside the FastAPI lifespan, and a 404 there is a uvicorn startup failure.
 - A field that must survive a sync rewrite has to be declared on `ServiceRecord`: `PlatformState.load` keeps only the keys the dataclass declares.
 - Production tree on the box is `/home/harness/ams`, only via the deploy script.
+- **Deploy the new ams before pushing `pool` overlays to the mirror.** An un-upgraded host's overlay reader rejects the unknown `pool` key, and the 60 s sync timer marks every affected member `failed` on its next tick (`docs/platform-pools.md`).
+- **In a pool, identity env (`SVC_NAME`, `SVC_SECRET`, `SVC_ENDPOINT`, …) is only present during a member's build/lifespan phases; a request-time read of `SVC_*` is a bug.** The pool runner swaps identity keys in and back out around build, lifespan startup and lifespan shutdown only — outside those phases the process env holds the non-identity union, not any one member's identity. `SVC_ENDPOINT` was the one known request-time read (`sdk/ui.py login_redirect`, `mailbox/main.py _sso_redirect`); T11 fixed both by deriving the return-to from the request instead.

@@ -250,6 +250,11 @@ def resolve_ports(mounts: Iterable[Mapping[str, Any]], allocator: _PortSource) -
     allocates the number at runtime and the manifest's production port is
     meaningless here. This is the one place that indirection is followed, so
     `render()` can take a flat ``{service_id: port}`` mapping.
+
+    A pooled member's mount carries two OPTIONAL keys: ``port_owner`` (the
+    allocator row that actually holds the port — a pool process id) and
+    ``port_name`` on that row. Both absent/null mean today's behaviour: look
+    the member's own id up under ``"main"`` (PLAN-pool §3.3, §5.4).
     """
     out: dict[str, int] = {}
     for mount in mounts:
@@ -257,10 +262,12 @@ def resolve_ports(mounts: Iterable[Mapping[str, Any]], allocator: _PortSource) -
             continue
         service_id = _require_str(mount, "id")
         port_name = mount.get("port_name") or "main"
-        allocated = allocator.get(service_id)
+        owner = mount.get("port_owner") or service_id
+        allocated = allocator.get(owner)
         if port_name not in allocated:
             raise GatewayError(
-                f"{service_id}: no allocated port named {port_name!r} (have: {sorted(allocated)})"
+                f"{service_id}: no allocated port named {port_name!r} on {owner!r} "
+                f"(have: {sorted(allocated)})"
             )
         out[service_id] = allocated[port_name]
     return out

@@ -468,6 +468,24 @@ def _is_static_mount(state: StateDir, service_id: str) -> bool:
     return isinstance(data, dict) and data.get("kind") == "static"
 
 
+def _pool_suffix(record: dict[str, Any]) -> str:
+    """`" (pool of N: a, b, c)"`, or `""` when the record names no pool members.
+
+    A pool's `ServiceRecord` carries `pool_members` (PLAN-pool §5.7, written by
+    `ams.platform.sync` -- not this module's job to write, only to read
+    defensively). Reading it here turns "one process crashed" into "N services
+    are down", which is the whole point of surfacing it in the crash-loop
+    escalation rather than leaving an operator to go look up the pool roster.
+    """
+    members = record.get("pool_members")
+    if not isinstance(members, list):
+        return ""
+    names = [m for m in members if isinstance(m, str)]
+    if not names:
+        return ""
+    return f" (pool of {len(names)}: {', '.join(names)})"
+
+
 def _parse_iso_z(value: Any) -> float | None:
     """`2026-09-02T13:04:07Z` -> epoch seconds, or None for anything else.
 
@@ -713,7 +731,7 @@ class PlatformPolicy:
             event.service_id,
             f"{event.service_id}: {ctx.consecutive_failures} consecutive failures within "
             f"{int(self.health_grace_s)}s of a sync (sha={sha}, prev_sha={prev}); "
-            f"suggested action: rollback to prev_sha",
+            f"suggested action: rollback to prev_sha{_pool_suffix(record)}",
             Severity.ERROR,
             "crash loop after sync",
             now,
