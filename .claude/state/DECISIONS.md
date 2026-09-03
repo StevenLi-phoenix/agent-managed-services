@@ -1228,3 +1228,71 @@ report in `JsonLinesEscalation`'s shape. Choices and what was rejected:
   commits. It is strictly more work (hash 21 subtrees per tick vs one `git diff`)
   and answers a narrower question -- it cannot see a shared-prefix change at all
   without hashing those too, which is the fan-out case that matters most.
+
+### D27. Start order: a `waiting` state in the supervisor, gated on health (2026-09-02)
+
+`depends_on` is a top-level list of service ids. A service with dependencies is
+not spawned until every one of them is `running` **and** `healthy`; until then it
+sits in `status="waiting"` with `waiting_for` naming what it is holding out for.
+`health.kind="none"` degrades "healthy" to "running", because there is no probe
+to pass — which is precisely why the registry and every Layer-1 service declare a
+real http/tcp check.
+
+- **Why health and not merely "spawned".** The incident (racknerd, 2026-09-02
+  ~19:00 UTC) was not that the registry had not been forked; it was that it had
+  not yet bound its socket. 11 services took `Connection refused` from
+  `sdk.registry.start()` inside FastAPI startup — which is fatal, not retried —
+  and burned all 5 retries within 90 s. A gate that only waited for a pid would
+  have changed nothing.
+- **Why the supervisor and not the SDK.** *Rejected:* teach `sdk.registry.start()`
+  in the `api` repo to retry a refused connection. It fixes these 11 services and
+  nothing else: ordering is a property of the fleet, not of one client library,
+  and ams has to host services whose SDK we do not own (Caddy today, anything
+  tomorrow). It is also the wrong repo — a supervisor that cannot express "after
+  X" is the actual gap.
+- **Why not systemd-style `After=`.** *Rejected:* order by "has been started"
+  without a readiness condition. That is the semantics that produced the incident
+  in the first place; systemd needs `Type=notify` or an explicit
+  `ExecStartPre`-style probe to get what we get from `health`, and we already own
+  a health monitor per service.
+- **Reusing `restart_at` as the re-check timer.** The wait is re-evaluated by
+  setting `restart_at = now + 1 s` and letting `_run_timers` call `start()` again,
+  which re-runs the gate. No new timer field, and the `_poll_timeout` invariant
+  (D13 addendum: fold in only deadlines `_run_timers` acts on) holds unchanged —
+  the deadline is always in the future, so it can never clamp the poll timeout to
+  0. *Rejected:* a dedicated `dep_check_at` field, which would have meant a fifth
+  term in `_poll_timeout` and a fifth chance to get the spin guard wrong.
+- **Start gating only: no stop or restart cascade.** If a dependency later goes
+  unhealthy or exits, its dependents keep running untouched. A cascade is a much
+  larger blast radius (one registry restart would bounce 11 services) and the
+  services are written to tolerate a registry that comes and goes *after*
+  startup — it is only startup that is fatal. Deliberately a Phase-B question.
+  A dependent that is *itself* restarting does re-wait: the gate runs on every
+  start, not just the first.
+- **Unknown dependency = wait, plus one escalation.** A declaration may honestly
+  be registered after its dependents (a reload walks the directory in name
+  order), so refusing to start would be wrong. A typo looks identical from here,
+  hence the escalation — deduplicated by message so a 1 Hz re-check does not
+  flood the agent. *Rejected:* failing the service outright, which would make
+  reload order load-bearing.
+- **Cycle = `failed`, once, both members.** Detected by DFS over the registered
+  declarations at every start. Unlike an unknown id, a cycle cannot resolve
+  itself, so waiting would be an unexplained hang; `failed` plus an escalation
+  naming the path (`a -> b -> a`) is the honest report. Self-reference is
+  rejected earlier, by the schema.
+- **Shutdown is the reverse topological order** (Kahn layers, ties in
+  registration order, cycles collapsed into one final layer). Tearing a
+  dependency down while its dependents still serve is the same outage at the
+  other end of the lifecycle. Best effort: the whole sequence shares the existing
+  shutdown deadline, so one service ignoring `SIGTERM` cannot hold the fleet
+  hostage. With no `depends_on` anywhere there is one layer and the behaviour is
+  byte-for-byte the previous one.
+- **The translator injects it; Layer 0 and the gateway do not get it.** Every
+  translated manifest gets `depends_on = ["registry"]`
+  (`translate.DEPENDS_ON`). `registry` is the root. `auth` deliberately does
+  **not** depend on it: its only registry use is `email_client_from_env()`, and
+  `M2MClient.start()` just constructs an httpx client — no call at startup, so
+  auth is fine with the registry down (read in
+  `api/components/auth/src/auth/{main,email_client}.py`). Caddy proxies whatever
+  happens to be up. Anything else would risk a cycle or would hold the gateway
+  down for the whole of Layer 0's start.

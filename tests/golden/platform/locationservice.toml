@@ -1,6 +1,7 @@
 id = "locationservice"
 name = "Location Service"
 secrets = ["SVC_SECRET"]
+depends_on = ["registry"]
 
 [start]
 argv = ["uvicorn", "locationservice.main:build_app", "--factory", "--host", "127.0.0.1", "--port", "${PORT_main}"]

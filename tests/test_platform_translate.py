@@ -170,6 +170,25 @@ def test_registry_sidecar_matches_golden(service_id: str):
 
 
 @pytest.mark.parametrize("service_id", SERVICE_IDS)
+def test_every_service_waits_for_the_registry(service_id: str):
+    """Layer-1 services register during FastAPI startup; a refused connection
+    there is a fatal "Application startup failed", not a retry (racknerd,
+    2026-09-02). The gate is the harness's answer, so it is not optional."""
+    decl = tr(service_id).decl
+    assert decl is not None
+    assert decl.depends_on == ("registry",)
+    assert 'depends_on = ["registry"]' in emit_toml(decl)
+
+
+def test_the_registry_dependency_is_in_every_service_golden():
+    """One assertion over the files themselves: a regenerated golden that lost
+    the line would otherwise only fail for the one service that changed."""
+    for service_id in SERVICE_IDS:
+        text = (GOLDEN / f"{service_id}.toml").read_text(encoding="utf-8")
+        assert 'depends_on = ["registry"]' in text, service_id
+
+
+@pytest.mark.parametrize("service_id", SERVICE_IDS)
 def test_emit_toml_round_trips(service_id: str):
     decl = tr(service_id).decl
     assert decl is not None
@@ -554,3 +573,23 @@ def test_unsupported_constructs_raise_naming_the_field(
 def test_a_manifest_that_is_not_a_mapping_is_refused():
     with pytest.raises(TranslateError):
         translate("- a\n- b\n", ctx())
+
+
+def test_layer_zero_and_the_gateway_do_not_depend_on_the_registry(tmp_path):
+    """The gate must not be able to deadlock the fleet it protects.
+
+    ``registry`` is the root, ``auth`` starts fine without it (its only registry
+    use is the M2M email client, which builds an httpx client and makes no call
+    at startup -- ``components/auth/src/auth/email_client.py``), and Caddy is
+    declared by the gateway module and proxies whatever is up. A dependency on
+    ``registry`` in any of the three would either be a cycle or would keep the
+    gateway down for the whole of Layer 0's start.
+    """
+    from ams.platform import bootstrap, gateway
+    from ams.state import StateDir
+
+    state = StateDir(tmp_path / "state")
+    for service_id, decl in bootstrap.layer0_declarations(state).items():
+        assert decl.depends_on == (), service_id
+    caddy = loads(gateway.caddy_declaration(state, tmp_path / "store"))
+    assert caddy.depends_on == ()

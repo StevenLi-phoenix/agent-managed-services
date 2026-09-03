@@ -235,3 +235,51 @@ def test_logging_format_rejects_unknown_values_and_keys():
     with pytest.raises(DeclError) as bad_key:
         loads(MINIMAL + "[logging]\nlevel = 3\n")
     assert "logging" in str(bad_key.value)
+
+
+# ------------------------------------------------------------------ depends_on
+
+
+def with_depends_on(value: str) -> str:
+    """MINIMAL with a top-level ``depends_on`` -- above [start], or TOML nests it."""
+    return f'id = "demo"\ndepends_on = {value}\n[start]\nargv = ["sleep", "1"]\n'
+
+
+def test_depends_on_defaults_to_empty_and_parses_a_list_of_ids():
+    assert loads(MINIMAL).depends_on == ()
+    assert loads(with_depends_on('["registry", "auth"]')).depends_on == ("registry", "auth")
+
+
+def test_depends_on_preserves_declaration_order():
+    """Not sorted: the order is what a reader (and `waiting_for`) sees."""
+    assert loads(with_depends_on('["zzz", "aaa"]')).depends_on == ("zzz", "aaa")
+
+
+@pytest.mark.parametrize(
+    "value,needle",
+    [
+        ('["Registry"]', "must match"),
+        ('["has space"]', "must match"),
+        ('[""]', "must match"),
+        ('["demo"]', "cannot depend on itself"),
+        ('["registry", "registry"]', "listed twice"),
+    ],
+)
+def test_depends_on_rejects_bad_entries(value: str, needle: str):
+    with pytest.raises(DeclError) as e:
+        loads(with_depends_on(value))
+    assert "depends_on" in str(e.value)
+    assert needle in str(e.value)
+
+
+def test_depends_on_must_be_a_list_of_strings():
+    for value in ('"registry"', "[1]", "{ a = 1 }"):
+        with pytest.raises(DeclError) as e:
+            loads(with_depends_on(value))
+        assert "depends_on" in str(e.value)
+
+
+def test_depends_on_is_validated_on_direct_construction_too():
+    """The dataclass is the boundary, not `loads` -- bootstrap builds decls directly."""
+    with pytest.raises(DeclError):
+        ServiceDecl(id="a", start=StartSpec(argv=("x",)), depends_on=("a",))

@@ -784,3 +784,55 @@ declaration is byte-identical and nothing restarts it. A docs-only commit is now
 whole-fleet no-op; a `components/sdk/` or `shared/` change fans out to everything;
 `components/registry` does not. This closes the "`GIT_COMMIT` restarts the fleet"
 finding recorded above.
+
+## Start-order dependencies (`depends_on`) — 2026-09-02
+
+Cause of the work: at ~19:00 UTC the racknerd harness restarted
+(`KillMode=control-group`), all 18 services were started at once, and the 11
+platform services that call `sdk.registry.start()` during FastAPI startup got
+`RegistryError: register failed: Connection refused` → "Application startup
+failed". Each crashed 5× inside 90 s and the supervisor gave up on all of them.
+ams had no notion of start order.
+
+Added: top-level `depends_on = ["registry", ...]` in `service.toml`
+(`ams.schema`, validated locally — id pattern, no self-reference, no
+duplicates), a `waiting` status in the supervisor, and `depends_on = ["registry"]`
+injected into every translated Layer-1 declaration
+(`ams.platform.translate.DEPENDS_ON`). The 19 service goldens each grew exactly
+that one line; the diff was inspected line by line. Layer 0 and the gateway
+declare nothing — verified in `api/components/auth`: auth's only registry use is
+`email_client_from_env()`, whose `M2MClient.start()` builds an httpx client and
+makes no call, so auth starts fine with the registry down.
+
+Mechanics: `Supervisor.start()` gates on `_check_start_gate`. A service whose
+dependencies are not all running+healthy is parked (`status="waiting"`,
+`waiting_for=(...)`, `attempt` untouched) with `restart_at = now + dep_poll_s`
+(1 s, overridable per Supervisor for tests) — reusing the existing restart timer
+is what keeps the `_poll_timeout` invariant true, since the deadline is always
+in the future and `_run_timers` is exactly what acts on it. `_dependency_layers`
+(Kahn) drives a reverse-topological `shutdown()`: dependents are stopped and
+given a chance to exit before their dependencies, best effort inside the one
+existing shutdown deadline. `status()` gained `waiting_for`; the CLI summary
+line prints it when non-empty.
+
+Verified: full local suite **990 passed, 0 failed** (the 2 concurrent agents'
+tests included; the skip count moved 86 -> 109 during the task as they added
+Linux-marked tests), ruff clean on every file touched. Remote
+`scripts/remote-test.sh ams-deps tests/linux/test_e2e.py tests/linux/test_isolated.py`
+**34 passed**; the portable supervisor/schema/translate files also run green
+there (290 passed, 3 runs). New tests: `tests/test_supervisor_deps.py` (21) plus
+schema and translate cases.
+
+Open (n=1 in 3 runs, NOT a regression from this change): on racknerd under the
+load of a 4-file run, `test_supervisor.py::test_failure_restarts_with_backoff_then_gives_up`
+failed with `attempt == 5` while `consecutive_failures == 3`. Hypothesis, not
+confirmed: a slow loop iteration lets the `reset_at` timer fire while the
+service is reaped-but-still-draining (`spawned is not None`), clearing the
+streak — the same load-dependent family as the two flakes already recorded
+above. It passes alone and passed both reruns of the identical command. Do not
+"fix" it by widening the assertion without reproducing the mechanism first.
+
+Not done deliberately: no stop/restart cascade when a dependency dies later
+(Phase-B question), and `platform/rollback.py` still treats only
+`("stopped", "failed")` as down — a service parked in `waiting` reads as neither
+there. Out of this task's scope; worth a look when rollback is next touched.

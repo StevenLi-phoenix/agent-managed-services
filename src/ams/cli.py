@@ -527,6 +527,8 @@ class PeriodicSummary:
             f"healthy={row['healthy']}",
             f"failures={row['consecutive_failures']}",
         ]
+        if row.get("waiting_for"):
+            parts.append("waiting_for=" + ",".join(row["waiting_for"]))
         if row["ports"]:
             parts.append("ports=" + ",".join(f"{n}:{p}" for n, p in sorted(row["ports"].items())))
         mem = self._memory_current(service_id)

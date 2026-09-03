@@ -1,6 +1,7 @@
 id = "llmpricing"
 name = "LLM Live Pricing"
 secrets = ["SVC_SECRET"]
+depends_on = ["registry"]
 
 [start]
 argv = ["uvicorn", "llmpricing.main:build_app", "--factory", "--host", "127.0.0.1", "--port", "${PORT_main}"]

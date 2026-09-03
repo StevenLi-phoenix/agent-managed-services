@@ -170,6 +170,13 @@ class ServiceDecl:
     # Names of secrets the harness injects into the environment at spawn. Values
     # live in the harness-private secret store (`ams secret set`), never here.
     secrets: tuple[str, ...] = ()
+    # Ids of services that must be running *and* healthy before this one is
+    # spawned. Start gating only: a dependency that later dies does not stop its
+    # dependents (see docs/service-declaration.md). Whether the ids exist cannot
+    # be known here -- a declaration is loaded alone -- so the supervisor
+    # validates them against its own table and treats an unknown id as
+    # permanently unsatisfied (escalated, then waited on).
+    depends_on: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "env", MappingProxyType(dict(self.env)))
@@ -290,6 +297,10 @@ def from_dict(data: Mapping[str, Any]) -> ServiceDecl:
             if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
                 raise DeclError("secrets: expected a list of environment variable names")
             kwargs[key] = tuple(value)
+        elif key == "depends_on":
+            if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+                raise DeclError("depends_on: expected a list of service ids")
+            kwargs[key] = tuple(value)
         else:
             kwargs[key] = value
     if "start" not in kwargs:
@@ -352,6 +363,15 @@ def validate(d: ServiceDecl) -> None:  # noqa: C901 - one flat checklist is clea
         if name in seen:
             raise _err("secrets", f"{name!r} listed twice")
         seen.add(name)
+    seen_deps: set[str] = set()
+    for dep in d.depends_on:
+        if not isinstance(dep, str) or not SERVICE_ID_RE.match(dep):
+            raise _err("depends_on", f"{dep!r} must match {SERVICE_ID_RE.pattern}")
+        if dep == d.id:
+            raise _err("depends_on", f"{dep!r} cannot depend on itself")
+        if dep in seen_deps:
+            raise _err("depends_on", f"{dep!r} listed twice")
+        seen_deps.add(dep)
     for ref in sorted(port_refs(d)):
         if ref not in d.ports:
             raise _err("env", f"references ${{PORT_{ref}}} but ports.{ref} is not declared")

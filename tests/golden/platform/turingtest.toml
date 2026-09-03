@@ -1,6 +1,7 @@
 id = "turingtest"
 name = "Turing Test"
 secrets = ["SVC_SECRET"]
+depends_on = ["registry"]
 
 [start]
 argv = ["uvicorn", "turingtest.main:build_app", "--factory", "--host", "127.0.0.1", "--port", "${PORT_main}"]

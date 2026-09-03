@@ -61,7 +61,7 @@ from ams.spawn import SpawnedService, Spawner, SpawnRequest
 log = logging.getLogger("ams.supervisor")
 service_log = logging.getLogger("ams.services")
 
-Status = Literal["stopped", "starting", "running", "stopping", "failed", "backoff"]
+Status = Literal["stopped", "starting", "running", "stopping", "failed", "backoff", "waiting"]
 # Runtime layer hook: decl -> (extra env vars, PATH entries to prepend).
 ExtraEnvFn = Callable[[ServiceDecl], tuple[dict[str, str], tuple[str, ...]]]
 STREAMS: tuple[Stream, ...] = ("stdout", "stderr")
@@ -78,6 +78,10 @@ EOF_GRACE_S = 2.0
 LOOP_TIMEOUT_S = 0.25
 # Largest exponent used for exponential backoff; 2**1024 overflows float().
 MAX_BACKOFF_SHIFT = 30
+# How often a service parked in "waiting" re-examines its dependencies. Cheap
+# (a dict lookup per dependency) and reuses the restart timer, so a waiting
+# service costs one wakeup per second and never clamps _poll_timeout to 0.
+DEP_POLL_S = 1.0
 
 _SELF_PIPE = "self-pipe"
 
@@ -135,6 +139,14 @@ class ServiceState:
     restart_pending: bool = False
     reset_at: float | None = None  # monotonic time at which the failure streak clears
     last_exit_failed: bool = False  # did the most recent exit count as a failed run?
+    # Dependencies (``decl.depends_on``) not yet running+healthy. Non-empty only
+    # while status == "waiting"; surfaced by status() so an operator can see what
+    # a parked service is holding out for.
+    waiting_for: tuple[str, ...] = ()
+    # Last dependency problem escalated for this service (unknown id, cycle).
+    # Escalating on every 1 s re-check would flood the agent, so the message is
+    # remembered and only a *different* one is sent again.
+    dep_alert: str = ""
 
     @property
     def id(self) -> str:
@@ -165,6 +177,7 @@ class Supervisor:
         extra_env_for: ExtraEnvFn | None = None,
         reset_window_min_s: float = RESET_WINDOW_MIN_S,
         eof_grace_s: float = EOF_GRACE_S,
+        dep_poll_s: float = DEP_POLL_S,
     ) -> None:
         self.spawner = spawner
         self.policy: DecisionPolicy = policy if policy is not None else DefaultPolicy()
@@ -173,6 +186,7 @@ class Supervisor:
         self._extra_env_for = extra_env_for or (lambda _decl: ({}, ()))
         self._reset_window_min_s = reset_window_min_s
         self._eof_grace_s = eof_grace_s
+        self._dep_poll_s = max(dep_poll_s, 0.01)
 
         self.services: dict[str, ServiceState] = {}
         self._by_pid: dict[int, str] = {}
@@ -237,6 +251,9 @@ class Supervisor:
         if reset_failures:
             st.consecutive_failures = 0
             st.reset_at = None
+            # The edit may be the fix for the cycle or typo we escalated about,
+            # and the next attempt must be free to report the new situation.
+            st.dep_alert = ""
         log.info("replaced declaration for %s (ports=%s)", service_id, st.ports)
         return st
 
@@ -249,12 +266,16 @@ class Supervisor:
     # ------------------------------------------------------------- lifecycle
 
     def start(self, service_id: str) -> None:
-        """Spawn the service.
+        """Spawn the service, or park it in ``waiting`` until its deps are up.
 
         Raises ``RuntimeError`` if a process from a previous run is still
         alive: replacing it here would drop it from ``_by_pid``, leave it
         running unsupervised, and report its eventual exit as an orphan. Use
         ``restart()`` (or ``stop()`` then ``start()``) instead.
+
+        A declaration with ``depends_on`` is gated: nothing is spawned (and
+        ``attempt`` is not consumed) until every dependency is running and
+        healthy. See :meth:`_check_start_gate`.
         """
         st = self._get(service_id)
         if st.spawned is not None and not st.reaped:
@@ -268,6 +289,8 @@ class Supervisor:
             # Reaped but not fully drained: finalize now so we never leak the
             # old pipes across a restart. The process itself is already gone.
             self._finalize(st, force=True)
+        if not self._check_start_gate(st):
+            return
         st.attempt += 1
         try:
             # Inside the guard on purpose. extra_env_for is the runtime + secrets
@@ -302,6 +325,8 @@ class Supervisor:
         self._register(svc.stdout_fd, (st.id, "stdout"))
         self._register(svc.stderr_fd, (st.id, "stderr"))
         st.status = "starting" if st.decl.health.kind != "none" else "running"
+        st.waiting_for = ()
+        st.dep_alert = ""
         if st.monitor is not None:
             st.monitor.start(now)
         log.info("started %s pid=%d attempt=%d", st.id, svc.pid, st.attempt)
@@ -318,6 +343,7 @@ class Supervisor:
         if st.spawned is None or st.reaped:
             if st.spawned is None:
                 st.status = "stopped" if not for_restart else st.status
+                st.waiting_for = ()
             if st.monitor is not None:
                 st.monitor.stop()
             return
@@ -355,6 +381,152 @@ class Supervisor:
         else:
             self.stop(service_id, for_restart=True)
 
+    # ------------------------------------------------------------ dependencies
+
+    def _check_start_gate(self, st: ServiceState) -> bool:
+        """May ``st`` be spawned right now? False means it was parked instead.
+
+        Three outcomes, and the caller only has to know whether it may spawn:
+
+        - no ``depends_on``, or every dependency running+healthy -> True;
+        - ``st`` sits on a dependency cycle -> ``failed``, escalated once, and
+          never retried. A cycle cannot resolve itself, so waiting would be a
+          silent hang;
+        - otherwise -> ``waiting``, with ``restart_at`` one poll interval out.
+          ``_run_timers`` re-enters ``start()`` then, which re-runs this gate.
+          Reusing the restart timer is what keeps the ``_poll_timeout``
+          invariant intact: the only deadline we add is one the timer pass acts
+          on, and it is always in the future, so it can never clamp the poll
+          timeout to zero.
+        """
+        if not st.decl.depends_on:
+            st.waiting_for = ()
+            return True
+        cycle = self._cycle_through(st.id)
+        if cycle:
+            st.waiting_for = ()
+            st.restart_at = None
+            st.status = "failed"
+            self._escalate_dependency(
+                st,
+                f"{st.id} is on a dependency cycle ({' -> '.join(cycle)}); refusing to start it",
+                Severity.CRITICAL,
+            )
+            return False
+        unmet = self._unmet_dependencies(st)
+        if not unmet:
+            st.waiting_for = ()
+            return True
+        st.waiting_for = unmet
+        st.status = "waiting"
+        st.restart_at = self._clock() + self._dep_poll_s
+        unknown = tuple(d for d in unmet if d not in self.services)
+        if unknown:
+            # Not fatal: a declaration may legitimately be registered after its
+            # dependents (a reload adds services in directory order), so the
+            # honest behaviour is to keep waiting and tell the agent why.
+            self._escalate_dependency(
+                st,
+                f"{st.id} depends on unregistered service(s) {list(unknown)}; "
+                "waiting until they appear",
+                Severity.ERROR,
+            )
+        else:
+            log.info("%s waiting for %s", st.id, ", ".join(unmet))
+        return False
+
+    def _unmet_dependencies(self, st: ServiceState) -> tuple[str, ...]:
+        """Dependencies of ``st`` that are not running *and* healthy, in order."""
+        return tuple(
+            dep_id for dep_id in st.decl.depends_on if not self._is_ready(self.services.get(dep_id))
+        )
+
+    @staticmethod
+    def _is_ready(dep: ServiceState | None) -> bool:
+        """Is ``dep`` good enough to start something that depends on it?
+
+        Running *and* healthy. ``health.kind="none"`` has no probe to pass, so
+        being up is all it can ever report -- that is the whole reason the
+        registry and every Layer-1 service declare a real http/tcp check: the
+        live incident this gate exists for was a service that had forked but was
+        not yet accepting connections.
+        """
+        if dep is None or dep.spawned is None or dep.status != "running":
+            return False
+        return dep.healthy is True or dep.decl.health.kind == "none"
+
+    def _cycle_through(self, service_id: str) -> tuple[str, ...]:
+        """The ``depends_on`` cycle ``service_id`` sits on, or ``()``.
+
+        Depth-first walk over the registered declarations only; an unknown id is
+        a dead end (it cannot close a cycle we can see, and it is reported
+        separately). Self-references are already rejected by the schema, so the
+        shortest cycle found here has length two.
+        """
+        path: list[str] = []
+        visiting: set[str] = set()
+
+        def walk(node: str) -> tuple[str, ...] | None:
+            st = self.services.get(node)
+            if st is None:
+                return None
+            path.append(node)
+            visiting.add(node)
+            for dep in st.decl.depends_on:
+                if dep == service_id:
+                    return (*path, service_id)
+                if dep not in visiting:
+                    found = walk(dep)
+                    if found is not None:
+                        return found
+            path.pop()
+            visiting.discard(node)
+            return None
+
+        return walk(service_id) or ()
+
+    def _dependency_layers(self) -> list[tuple[str, ...]]:
+        """Registered services grouped so a layer only depends on earlier ones.
+
+        Kahn's algorithm over ``depends_on``, restricted to registered ids (an
+        unknown dependency cannot constrain an order we can execute). Ties keep
+        registration order, so the result is deterministic. Anything left when
+        no layer can be peeled is a cycle and goes into one final layer --
+        shutdown has to stop those too, and any order within a cycle is as
+        defensible as another.
+        """
+        remaining = {
+            sid: {d for d in st.decl.depends_on if d in self.services}
+            for sid, st in self.services.items()
+        }
+        done: set[str] = set()
+        layers: list[tuple[str, ...]] = []
+        while remaining:
+            layer = tuple(sid for sid, deps in remaining.items() if deps <= done)
+            if not layer:
+                layers.append(tuple(remaining))
+                break
+            layers.append(layer)
+            done.update(layer)
+            for sid in layer:
+                del remaining[sid]
+        return layers
+
+    def _escalate_dependency(self, st: ServiceState, detail: str, severity: Severity) -> None:
+        """Tell the agent about a dependency problem, at most once per message.
+
+        Bypasses the policy for the same reason terminal states do (D11): a
+        service that cannot start because of how the *declarations* relate to
+        each other is a fact about the fleet, not a log line to be classified.
+        """
+        if st.dep_alert == detail:
+            return
+        st.dep_alert = detail
+        log.log(int(severity), "%s", detail)
+        event = LogLine(st.id, "stderr", detail, severity)
+        self._pending.append(event)
+        self._escalate(event, Decision(Action.ESCALATE, "dependency gate"), self._ctx(st))
+
     def kill(self, service_id: str) -> None:
         """Hard kill; no grace period. The exit is still reaped by the loop."""
         st = self._get(service_id)
@@ -365,6 +537,7 @@ class Supervisor:
             st.monitor.stop()
         if st.spawned is None:
             st.status = "stopped"
+            st.waiting_for = ()
             return
         if st.reaped:  # already dead, just not drained yet
             st.status = "stopping"
@@ -388,6 +561,7 @@ class Supervisor:
                 "consecutive_failures": st.consecutive_failures,
                 "uptime_s": st.uptime(now) if st.spawned is not None else None,
                 "healthy": st.healthy,
+                "waiting_for": list(st.waiting_for),
                 "ports": dict(st.ports),
                 "cgroup": str(cgroup) if cgroup is not None else None,
             }
@@ -475,14 +649,36 @@ class Supervisor:
         log.info("reload complete: %s", summary)
 
     def shutdown(self, timeout_s: float | None = None) -> None:
-        """Stop every service gracefully, escalate to kill_tree, then clean up."""
+        """Stop every service gracefully, escalate to kill_tree, then clean up.
+
+        Dependents go first. ``depends_on`` says B needs A, so tearing A down
+        while B is still serving is the same outage the start gate exists to
+        avoid, only at the other end of the lifecycle. Services are stopped in
+        reverse dependency-layer order and each layer is given the chance to
+        exit before the next one is signalled -- *best effort*: the whole
+        sequence shares one deadline (``grace`` + 1 s, as before), so a layer
+        that will not die cannot hold the rest of the shutdown hostage past it.
+        With no ``depends_on`` anywhere there is exactly one layer and this is
+        the previous behaviour verbatim.
+        """
         grace = timeout_s
         if grace is None:
             grace = max((s.decl.stop.timeout_s for s in self.services.values()), default=5.0)
-        for sid, st in list(self.services.items()):
-            if st.spawned is not None or st.status in ("starting", "running", "backoff"):
-                self.stop(sid)
         deadline = self._clock() + grace + 1.0
+        for layer in reversed(self._dependency_layers()):
+            for sid in layer:
+                st = self.services[sid]
+                if st.spawned is not None or st.status in (
+                    "starting",
+                    "running",
+                    "backoff",
+                    "waiting",
+                ):
+                    self.stop(sid)
+            while self._clock() < deadline:
+                if not any(self.services[sid].spawned is not None for sid in layer):
+                    break
+                self.run_once(0.05)
         while self._clock() < deadline:
             if not any(s.spawned is not None for s in self.services.values()):
                 break

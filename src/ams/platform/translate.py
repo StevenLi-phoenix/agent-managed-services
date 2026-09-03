@@ -49,6 +49,8 @@ __all__ = [
     "emit_toml",
     "PORT_NAME",
     "SIDECAR_VERSION",
+    "DEPENDS_ON",
+    "REGISTRY_SERVICE_ID",
 ]
 
 SIDECAR_VERSION = 1
@@ -58,6 +60,16 @@ PORT_NAME = "main"
 #: Q8: manifest ``memory_max`` where present, else this, never below the floor.
 DEFAULT_MEMORY_MAX = "150M"
 MEMORY_FLOOR = "120M"
+#: Every translated (Layer-1) service registers with the registry during its
+#: FastAPI startup (``sdk.registry.start()``), and a refused connection there is
+#: a hard "Application startup failed" -- observed on racknerd on 2026-09-02,
+#: when a harness restart brought all 18 services up at once and 11 of them
+#: burned their whole retry budget before the registry was listening. So every
+#: translated declaration waits for the registry to be *healthy*. Layer 0 itself
+#: (registry, auth) and the gateway are declared by ``bootstrap``/``gateway``
+#: and depend on nothing.
+REGISTRY_SERVICE_ID = "registry"
+DEPENDS_ON = (REGISTRY_SERVICE_ID,)
 
 _LOOPBACK_URL_RE = re.compile(r"^http://127\.0\.0\.1:(\d{1,5})$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
@@ -545,6 +557,7 @@ def _translate_service(  # noqa: C901 - one flat mapping is clearer than five ho
         ),
         restart=RestartSpec(policy=_RESTART_MAP[restart_raw], backoff_s=float(restart_sec)),
         secrets=secrets,
+        depends_on=DEPENDS_ON,
     )
 
     mount = _mount(doc.get("mount"), service_id, "service", ())
@@ -686,6 +699,8 @@ def emit_toml(decl: ServiceDecl) -> str:
         lines.append(f"name = {_toml_str(decl.name)}")
     if decl.secrets:
         lines.append(f"secrets = {_toml_value(list(decl.secrets))}")
+    if decl.depends_on:
+        lines.append(f"depends_on = {_toml_value(list(decl.depends_on))}")
 
     lines += ["", "[start]", f"argv = {_toml_value(list(decl.start.argv))}"]
     lines.append(f"workdir = {_toml_str(decl.start.workdir)}")
