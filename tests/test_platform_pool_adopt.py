@@ -92,6 +92,8 @@ class FakeAdmin:
         self.calls: list[tuple[str, ...]] = []
         self.blocks: list[UidBlock] = []
         self.chowns: list[tuple[str, str]] = []
+        #: Paths that exist but that even the admin namespace cannot enumerate.
+        self.unlistable: set[str] = set()
 
     def __call__(self, argv: Any, block: UidBlock, **_kw: Any) -> AdminResult:
         args = tuple(str(a) for a in argv)
@@ -123,25 +125,44 @@ class FakeAdmin:
             else:
                 rest.append(arg)
         for target in rest:
-            path = Path(target)
-            path.mkdir(parents=True, exist_ok=True)
-            os.chmod(path, mode)
+            # os.*, never Path.*: the fake stands in for the admin namespace,
+            # which `deny()` does not (and on the box could not) block.
+            os.makedirs(target, exist_ok=True)
+            os.chmod(target, mode)
         return self._ok(args)
 
     def _chown(self, args: tuple[str, ...]) -> AdminResult:
         rest = [a for a in args[1:] if a != "-R"]
         owner, paths = rest[0], rest[1:]
         for path in paths:
-            if not Path(path).exists():  # pragma: no cover - defensive
+            if not os.path.exists(path):  # pragma: no cover - defensive
                 raise AssertionError(f"chown on a path that does not exist: {path}")
             self.chowns.append((owner, path))
         return self._ok(args)
 
     def _find(self, args: tuple[str, ...]) -> AdminResult:
+        """GNU ``find``'s three outcomes, including the two that look alike.
+
+        A missing start path exits 1 having printed nothing; an unreadable one
+        exits 1 having printed *itself*; a readable one exits 0. Conflating the
+        first two is the bug this fake exists to expose (an absent
+        ``data/<member>`` is empty, not unknown).
+        """
         directory = Path(args[1])
-        if not directory.is_dir():
+        mindepth = int(args[args.index("-mindepth") + 1]) if "-mindepth" in args else 0
+        # Deliberately os.path, not Path.is_dir: the fake is the *admin* namespace
+        # and must answer even where the harness itself is denied by `deny()`.
+        if not os.path.isdir(directory):
             return AdminResult(argv=args, returncode=1, stdout=b"", stderr=b"no such directory")
-        entries = sorted(str(p) for p in directory.iterdir())
+        head = [] if mindepth > 0 else [str(directory)]
+        if str(directory) in self.unlistable:
+            return AdminResult(
+                argv=args,
+                returncode=1,
+                stdout=b"".join(e.encode() + b"\0" for e in head),
+                stderr=b"Permission denied",
+            )
+        entries = head + sorted(str(directory / n) for n in os.listdir(directory))
         return AdminResult(
             argv=args,
             returncode=0,
@@ -155,8 +176,8 @@ class FakeAdmin:
         dest = Path(rest[rest.index("-t") + 1])
         sources = rest[rest.index("--") + 1 :]
         for src in sources:
-            target = dest / Path(src).name
-            if target.exists() and no_clobber:  # pragma: no cover - refused before we get here
+            target = dest / os.path.basename(src)
+            if os.path.exists(target) and no_clobber:  # pragma: no cover - refused earlier
                 continue
             os.replace(src, target)
         return self._ok(args)
@@ -331,6 +352,176 @@ def _tree(root: Path) -> dict[str, bytes]:
     return {
         str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()
     }
+
+
+# ------------------------------------------------------- unreadable directories
+#
+# The live cutover on racknerd died here (`.claude/state/diagnosis-pool-cutover.md`):
+# a freshly staged pool root has `data/` at 0750 owned by the *pool's* uid, so
+# the harness cannot stat inside it, and `pathlib` re-raises EACCES out of
+# `Path.is_dir()` -- it swallows only ENOENT/ENOTDIR/EBADF/ELOOP. Every probe
+# below therefore has to fall through to the admin namespace instead of raising.
+
+
+def deny(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
+    """Make every harness-side probe at or under ``denied`` raise EACCES.
+
+    This is what a 0750 directory owned by another uid looks like from the
+    harness: not "absent", not "empty" -- an exception out of the probe itself.
+    The admin-namespace fake is deliberately unaffected, because on the box the
+    admin namespace *can* read these paths.
+    """
+    roots = tuple(Path(d) for d in denied)
+    reals = {name: getattr(Path, name) for name in ("is_dir", "iterdir", "exists", "stat")}
+
+    def blocked(path: Path) -> bool:
+        return any(path == root or root in path.parents for root in roots)
+
+    def guard(name: str) -> Any:
+        real = reals[name]
+
+        def wrapper(self: Path, *args: Any, **kwargs: Any) -> Any:
+            if blocked(self):
+                raise PermissionError(13, "Permission denied", str(self))
+            return real(self, *args, **kwargs)
+
+        return wrapper
+
+    for name in reals:
+        monkeypatch.setattr(Path, name, guard(name))
+
+
+def test_plan_lists_an_unstattable_data_dir_through_the_admin_ns(
+    fleet: Fleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deny(monkeypatch, *(legacy_data(fleet, m) for m in MEMBERS))
+
+    result = plan(fleet.state, POOL, uids=fleet.uids, run_admin_fn=fleet.admin)
+
+    alpha = next(m for m in result.members if m.id == "alpha")
+    assert alpha.data_entries == ("alpha.db",), "the admin ns knows what the harness cannot see"
+    assert alpha.data_readable is True
+
+
+def test_plan_without_an_admin_ns_reports_unreadable_rather_than_empty(
+    fleet: Fleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No allocator (a state dir copied off the box): say so, never say 'empty'."""
+    deny(monkeypatch, *(legacy_data(fleet, m) for m in MEMBERS))
+
+    result = plan(fleet.state, POOL)
+
+    alpha = next(m for m in result.members if m.id == "alpha")
+    assert alpha.data_readable is False
+    assert alpha.data_entries == ()
+    assert "UNREADABLE" in "\n".join(result.lines())
+
+
+def test_adopt_moves_data_when_the_pool_root_cannot_be_stat_ed(
+    fleet: Fleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The racknerd failure, reproduced: `<pool-root>/data` exists and is 0750.
+
+    ``sync`` creates it (``ensure_service_root`` + ``make_pool_data_dirs``) and
+    chowns it to the pool's block, so the very first adoption of every pool
+    lands on a directory the harness cannot stat into.
+    """
+    pool_root = fleet.state.service_root(POOL_ID)
+    (pool_root / DATA_DIRNAME).mkdir(parents=True)
+    deny(monkeypatch, pool_root)
+
+    report = run_adopt(fleet)
+
+    assert report.noop is False
+    for member in MEMBERS:
+        moved = pool_data(fleet, member) / f"{member}.db"
+        assert moved.read_bytes() == b"SQLite format 3\x00" + member.encode()
+
+
+def test_an_absent_target_directory_is_empty_not_unknown(
+    fleet: Fleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`data/<member>` that was never created holds nothing, so nothing collides."""
+    pool_root = fleet.state.service_root(POOL_ID)
+    (pool_root / DATA_DIRNAME).mkdir(parents=True)
+    deny(monkeypatch, pool_root)
+
+    assert not os.path.exists(pool_root / DATA_DIRNAME / "alpha")
+    report = run_adopt(fleet)
+
+    assert sorted(report.moved) == [f"{m}:{m}.db" for m in MEMBERS]
+
+
+def test_a_target_directory_that_exists_but_cannot_be_listed_refuses(
+    fleet: Fleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unlistable is not empty: refuse rather than move data onto unknown files."""
+    pool_root = fleet.state.service_root(POOL_ID)
+    target = pool_root / DATA_DIRNAME / "alpha"
+    target.mkdir(parents=True)
+    fleet.admin.unlistable.add(str(target))
+    deny(monkeypatch, pool_root)
+
+    with pytest.raises(PoolAdoptError) as excinfo:
+        run_adopt(fleet)
+
+    assert "alpha" in str(excinfo.value)
+    assert "cannot be listed" in str(excinfo.value)
+    assert (legacy_data(fleet, "alpha") / "alpha.db").exists(), "nothing may move"
+
+
+def test_a_collision_is_still_caught_through_the_admin_ns(
+    fleet: Fleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal must survive the fallback, or the fix would trade one bug for a worse one."""
+    target = pool_data(fleet, "alpha")
+    target.mkdir(parents=True)
+    (target / "alpha.db").write_bytes(b"a different database")
+    deny(monkeypatch, fleet.state.service_root(POOL_ID))
+
+    with pytest.raises(PoolAdoptError) as excinfo:
+        run_adopt(fleet)
+
+    assert "alpha.db" in str(excinfo.value)
+    assert (target / "alpha.db").read_bytes() == b"a different database"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_a_real_0000_directory_does_not_raise_out_of_plan(fleet: Fleet) -> None:
+    """The same probe again with real permission bits rather than a monkeypatch.
+
+    Only ``plan`` and the collision check are exercised here, not the whole
+    move: the fake admin namespace runs as the unprivileged test user and so
+    genuinely cannot ``mkdir`` inside a 0000 directory, where the real one holds
+    CAP_DAC_OVERRIDE and can. That half is proved on the box by
+    ``tests/linux/test_pool_adopt_live.py``; what this pins down portably is
+    that a real EACCES from ``Path.is_dir()`` never escapes.
+    """
+    data = fleet.state.service_root(POOL_ID) / DATA_DIRNAME
+    data.mkdir(parents=True)
+    os.chmod(data, 0o000)
+    try:
+        result = plan(fleet.state, POOL, uids=fleet.uids, run_admin_fn=fleet.admin)
+        pool_mod._check_collisions(
+            pool_mod._Adoption(
+                state=fleet.state,
+                pool=POOL,
+                pool_id=POOL_ID,
+                plan=result,
+                uids=fleet.uids,
+                run_admin_fn=fleet.admin,
+                control=None,
+                secrets=store_for(fleet.state),
+                rows=None,
+                sleep=lambda _s: None,
+                now=lambda: 0.0,
+            )
+        )
+    finally:
+        os.chmod(data, 0o750)
+
+    assert [m.id for m in result.members] == list(MEMBERS)
+    assert all(m.data_readable for m in result.members)
 
 
 # --------------------------------------------------------------------------- adopt

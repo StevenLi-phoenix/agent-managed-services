@@ -591,15 +591,30 @@ samples 60 s apart, fleet idle at both ends.
 
 | metric | before | after | target |
 | --- | --- | --- | --- |
-| Python processes | 16 | 5 (4 standalone + 1 pool) | — |
-| pool cgroup `memory.current` MiB | n/a | *(T10)* | ≤ 150 MiB |
+| Python processes | 18 (n=3) | *(T10 — blocked)* | — |
+| pool cgroup `memory.current` MiB | n/a | *(T10 — blocked)* | ≤ 150 MiB |
 | — reference: T0, 6 apps serving, one loop | n/a | 66 MiB (n=3) | extrapolates to ~85–100 MiB at N=15 |
-| sum of Layer-1 cgroups MiB | ~700 | *(T10)* | ≤ 300 MiB |
-| all-services cgroup total MiB | 1105 | *(T10)* | ≤ 600 MiB |
-| `free -m` available | 694 | *(T10)* | ≥ 1200 MiB |
-| pool thread count | n/a | *(T10 — do not reuse T0's number)* | < `pids_max` |
-| p50 latency, `/time/health` via Caddy | *(T10)* | *(T10)* | no regression |
-| cold start to all-members-healthy, s | *(T10)* | *(T10)* | < `start_period_s` |
+| sum of Layer-1 cgroups MiB | 712 (n=3) | *(T10 — blocked)* | ≤ 300 MiB |
+| all-services cgroup total MiB | 866–867 (n=3) | *(T10 — blocked)* | ≤ 600 MiB |
+| `free -m` available | 653–657 (n=3) | *(T10 — blocked)* | ≥ 1200 MiB |
+| pool thread count | n/a | *(T10 — blocked; do not reuse T0's number)* | < `pids_max` |
+| p50 latency, `/time/health` via Caddy | 2.9 ms (n=3, 2.2–3.0) | *(T10 — blocked)* | no regression |
+| cold start to all-members-healthy, s | 120–150 (n=1, 30 s polling) | *(T10 — blocked)* | < `start_period_s` |
+
+The **before** column was re-taken on 2026-09-03 at 07:57–07:59 UTC with an
+archived script, `.claude/state/evidence/ams-measure.sh`, because the script
+behind `evidence/pool-before-2026-09-03.txt` was not kept and its definitions
+of `python_processes` and the two memory sums could not be restated. That
+archived file reads 40–100 MiB higher on the same unchanged fleet three hours
+earlier; the gap is method plus reclaim drift, not a real change. Use the row
+above, and the same script, for the "after".
+
+**The "after" column is blocked, not pending.** `ams platform pool adopt core`
+fails on the live host before it moves anything — an unguarded
+`Path.is_dir()` in `_list_dir` (`src/ams/platform/pool.py:335`) re-raises
+`EACCES` on the pool root's 0750 `data/`, which the harness cannot traverse.
+The fleet is undamaged. See `.claude/state/diagnosis-pool-cutover.md` for the
+reproduction and `.claude/state/pool-migration.md` for the full cutover log.
 
 **The thread count is the one T0 number that must not be carried over.** T0
 ran with `SVC_DEV=1`, which disables the SDK's registry calls, so its 3–4

@@ -318,40 +318,110 @@ def _split0(raw: bytes) -> list[str]:
     return [chunk.decode("utf-8", "surrogateescape") for chunk in raw.split(b"\0") if chunk]
 
 
+@dataclass(frozen=True)
+class Listing:
+    """What is directly under one directory, and how much of that is known.
+
+    Three states, not two, because two of them look identical to a caller that
+    only asks "did the listing work?" and mean opposite things:
+
+    - ``exists=False`` -- the directory is not there. It holds nothing, so
+      nothing in it can collide with anything. This is the ordinary state of
+      ``<pool-root>/data/<member>`` before the first adoption.
+    - ``readable=False`` -- it is there and *nothing* could enumerate it,
+      neither the harness nor the admin namespace. Refuse: moving data into a
+      directory whose contents are unknown is how a database gets overwritten.
+    - otherwise ``entries`` is the complete list.
+
+    Collapsing the first two into "could not list" is exactly the second trap
+    named in ``.claude/state/diagnosis-pool-cutover.md``: it turns a fresh pool
+    root into a refusal for a reason that is not true.
+    """
+
+    entries: tuple[str, ...] = ()
+    exists: bool = True
+    readable: bool = True
+
+
 def _list_dir(
     directory: Path,
     *,
     service_id: str,
     uids: _Allocator | None,
     run_admin_fn: _AdminFn | None,
-) -> tuple[tuple[str, ...], bool]:
-    """Names directly under ``directory``, and whether the answer is trustworthy.
+) -> Listing:
+    """Names directly under ``directory``, from the harness or the admin ns.
 
-    The harness owns neither a service root nor a pool root, so a 0750 directory
-    is unlistable from here; the admin namespace is the fallback, exactly as
-    ``sync.legacy_data_is_nonempty`` does it. "Could not list" is never reported
-    as "empty": that is how data gets orphaned.
+    **Every** harness-side probe here is guarded, the stat as much as the read.
+    ``pathlib`` swallows only ENOENT/ENOTDIR/EBADF/ELOOP, so ``Path.is_dir()``
+    *re-raises* EACCES -- and both a service root and a pool root are 0750 owned
+    by a uid the harness does not have, which is where the live cutover died
+    (`.claude/state/diagnosis-pool-cutover.md`). An unreadable directory is not
+    an error here; it is the normal case, and the admin namespace is the answer.
+
+    "Could not list" is never reported as "empty": that is how data gets
+    orphaned. It is also never reported for a directory that is merely absent.
     """
-    if not directory.is_dir():
-        return (), True
     try:
-        return tuple(sorted(p.name for p in directory.iterdir())), True
+        if not directory.is_dir():
+            return Listing(exists=False)
+        return Listing(entries=tuple(sorted(p.name for p in directory.iterdir())))
     except OSError as e:
-        log.debug("%s: cannot list %s from the harness (%s); using the admin ns",
-                  service_id, directory, e)
+        log.debug(
+            "%s: cannot inspect %s from the harness (%s); using the admin ns",
+            service_id,
+            directory,
+            e,
+        )
     if uids is None or run_admin_fn is None:
-        return (), False
+        return Listing(readable=False)
     try:
         block = uids.allocate(service_id)
     except (RuntimeError, OSError, ValueError) as e:  # pragma: no cover - host only
         log.warning("%s: cannot allocate a uid block to list %s (%s)", service_id, directory, e)
-        return (), False
+        return Listing(readable=False)
+    # `-mindepth 0` makes find print the start path itself before its children,
+    # which is what separates "absent" (exits non-zero having printed nothing)
+    # from "there but unreadable" (exits non-zero having printed itself).
     result = run_admin_fn(
-        ["find", str(directory), "-mindepth", "1", "-maxdepth", "1", "-print0"], block
+        ["find", str(directory), "-mindepth", "0", "-maxdepth", "1", "-print0"], block
     )
-    if not result.ok:
-        return (), False
-    return tuple(sorted(Path(p).name for p in _split0(result.stdout))), True
+    paths = _split0(result.stdout)
+    itself = str(directory)
+    entries = tuple(sorted(Path(p).name for p in paths if p != itself))
+    if result.ok:
+        return Listing(entries=entries, exists=itself in paths or bool(entries))
+    if itself in paths:
+        log.warning(
+            "%s: %s exists but the admin ns could not list it (rc=%d): %s",
+            service_id,
+            directory,
+            result.returncode,
+            result.stderr.decode("utf-8", "replace").strip() or "(no stderr)",
+        )
+        return Listing(entries=entries, readable=False)
+    log.info(
+        "%s: %s does not exist (find rc=%d); it holds nothing",
+        service_id,
+        directory,
+        result.returncode,
+    )
+    return Listing(exists=False)
+
+
+def _exists(path: Path, *, unknown: bool) -> bool:
+    """``path.exists()`` that cannot raise. ``unknown`` is the EACCES answer.
+
+    Same trap as :func:`_list_dir`: these paths can sit under a directory the
+    harness has no ``x`` on, and ``Path.exists()`` re-raises EACCES. Each caller
+    picks the answer that fails safe for it, and the choice is written down at
+    the call site.
+    """
+    try:
+        return path.exists()
+    except OSError as e:
+        log.warning("cannot stat %s (%s); assuming exists=%s", path, e, unknown)
+        return unknown
 
 
 def _control_rows(control: Control | None) -> dict[str, Any] | None:
@@ -407,10 +477,8 @@ def plan(
     for member in member_ids:
         legacy_root = state.service_root(member)
         legacy = legacy_root / DATA_DIRNAME
-        entries, readable = _list_dir(
-            legacy, service_id=member, uids=uids, run_admin_fn=run_admin_fn
-        )
-        staged, _ = _list_dir(
+        listing = _list_dir(legacy, service_id=member, uids=uids, run_admin_fn=run_admin_fn)
+        staged = _list_dir(
             staging_dir(state, member), service_id=member, uids=uids, run_admin_fn=run_admin_fn
         )
         # Names only: which of the member's secrets still need a copy under the
@@ -430,12 +498,16 @@ def plan(
                 legacy_root=legacy_root,
                 legacy_data=legacy,
                 target_data=pool_root / DATA_DIRNAME / member,
-                data_entries=entries,
-                staged_entries=staged,
-                data_readable=readable,
+                data_entries=listing.entries,
+                staged_entries=staged.entries,
+                data_readable=listing.readable,
                 secrets=pairs_full,
                 secrets_present=present,
-                decl_exists=state.service_decl_path(member).exists(),
+                # unknown=True: a declaration that might be there is treated as
+                # there, so adoption tries to remove it and says so if it
+                # cannot. The opposite guess leaves a second declaration behind,
+                # which is a second process serving one identity.
+                decl_exists=_exists(state.service_decl_path(member), unknown=True),
                 running=_is_up(rows, member),
             )
         )
@@ -621,15 +693,19 @@ def _check_collisions(run: _Adoption) -> None:
             )
         if not member.needs_adopt:
             continue
-        existing, readable = _list_dir(
+        target = _list_dir(
             member.target_data, service_id=run.pool_id, uids=run.uids, run_admin_fn=run.run_admin_fn
         )
-        if not readable:
+        if not target.readable:
             raise PoolAdoptError(
-                f"{run.pool_id}: cannot list {member.target_data}; refusing to move data into a "
-                "directory whose contents are unknown"
+                f"{member.id}: {member.target_data} exists but its contents cannot be listed, "
+                "not even from the admin namespace; refusing to move data into a directory "
+                "whose contents are unknown"
             )
-        clash = sorted(set(existing) & set(member.data_entries + member.staged_entries))
+        # A target that does not exist yet holds nothing and collides with
+        # nothing -- `_ensure_pool_dirs` creates it a few lines later. Only a
+        # directory that is really there can really clash.
+        clash = sorted(set(target.entries) & set(member.data_entries + member.staged_entries))
         if clash:
             raise PoolAdoptError(
                 f"{member.id}: {member.target_data} already holds {clash}; adoption will not "
@@ -696,8 +772,13 @@ def _move_member_data(run: _Adoption, member: MemberPlan) -> None:
     """The two-hop move. See the module docstring for why there are two."""
     staging = staging_dir(run.state, member.id)
     if member.data_entries:
-        staging.mkdir(parents=True, exist_ok=True)
-        os.chmod(staging, STAGING_MODE)
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            os.chmod(staging, STAGING_MODE)
+        except OSError as e:
+            raise PoolAdoptError(
+                f"{member.id}: cannot prepare the staging directory {staging}: {e}"
+            ) from None
         block = run.uids.allocate(member.id)
         sources = [str(member.legacy_data / name) for name in member.data_entries]
         run.run_admin_fn(["mv", "-n", "-t", str(staging), "--", *sources], block).check()
@@ -709,9 +790,20 @@ def _move_member_data(run: _Adoption, member: MemberPlan) -> None:
             member.legacy_data,
         )
 
-    if not staging.is_dir():
+    # The staging directory is harness-owned, so the fast path answers here --
+    # but it is read through the same guarded helper as everything else, because
+    # a run that died mid-chown can leave it owned by a uid this process is not.
+    parked = _list_dir(
+        staging, service_id=member.id, uids=run.uids, run_admin_fn=run.run_admin_fn
+    )
+    if not parked.exists:
         return
-    staged = sorted(p.name for p in staging.iterdir())
+    if not parked.readable:
+        raise PoolAdoptError(
+            f"{member.id}: cannot list the staging directory {staging}; its contents belong to "
+            "an interrupted adoption and must be moved into the pool root by hand"
+        )
+    staged = list(parked.entries)
     if not staged:
         _rmdir(staging)
         return
@@ -750,14 +842,20 @@ def _copy_member_secrets(run: _Adoption, member: MemberPlan) -> None:
     if not member.secrets:
         return
     directory = run.secrets.service_dir(run.pool_id)
-    for parent in (run.secrets.dir, directory):
-        parent.mkdir(parents=True, exist_ok=True)
-        if stat.S_IMODE(parent.stat().st_mode) != 0o700:
-            os.chmod(parent, 0o700)
+    try:
+        for parent in (run.secrets.dir, directory):
+            parent.mkdir(parents=True, exist_ok=True)
+            if stat.S_IMODE(parent.stat().st_mode) != 0o700:
+                os.chmod(parent, 0o700)
+    except OSError as e:
+        raise PoolAdoptError(f"{run.pool_id}: cannot prepare {directory}: {e}") from None
     for source, target in member.secrets:
         src_path = run.secrets.path(member.id, source)
         dst_path = directory / target
-        if dst_path.exists():
+        # unknown=False: an unstattable target is treated as absent, and the
+        # O_EXCL create below is what actually decides -- so an existing value
+        # is still never overwritten, whichever way the stat went.
+        if _exists(dst_path, unknown=False):
             log.info("%s: %s already has a value; leaving it alone", run.pool_id, target)
             continue
         try:
@@ -765,7 +863,12 @@ def _copy_member_secrets(run: _Adoption, member: MemberPlan) -> None:
         except OSError as e:
             raise PoolAdoptError(f"{member.id}: cannot read secret {source}: {e}") from None
         tmp = dst_path.with_name(f".{target}.tmp{os.getpid()}")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
+        except FileExistsError:  # pragma: no cover - a concurrent adoption
+            raise PoolAdoptError(
+                f"{run.pool_id}: {tmp} already exists; another adoption is running"
+            ) from None
         try:
             with os.fdopen(fd, "wb") as fh:
                 fh.write(payload)

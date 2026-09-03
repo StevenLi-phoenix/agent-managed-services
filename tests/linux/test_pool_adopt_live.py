@@ -38,7 +38,7 @@ from typing import Any
 import pytest
 
 from ams.platform.pool import adopt, plan, staging_dir
-from ams.platform.sync import STATE_VERSION, state_path
+from ams.platform.sync import STATE_VERSION, make_pool_data_dirs, state_path
 from ams.secrets import SecretStore
 from ams.spawn import DATA_DIRNAME
 from ams.state import StateDir
@@ -116,6 +116,31 @@ def _write_platform_state(state: StateDir) -> None:
         json.dumps({"version": STATE_VERSION, "services": services}, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+
+
+def _make_staged_pool_root(state: StateDir) -> Path:
+    """The pool root exactly as a sync tick leaves it, before adoption runs.
+
+    This is the state the live cutover actually met and that the first version
+    of this module missed by starting from *no* pool root at all: sync stages
+    the tree (``ensure_service_root``) and then creates ``data/<member>`` for
+    every member (``make_pool_data_dirs``), both inside the admin namespace and
+    both chowned to the pool's block. The result is ``drwxr-x---
+    <pool-uid>:<pool-gid>``, which the harness cannot stat into -- the exact
+    directory that made ``pool adopt`` die with an unhandled ``PermissionError``
+    on racknerd (`.claude/state/diagnosis-pool-cutover.md`).
+
+    Both real functions are called rather than imitated, so this reproduces what
+    sync does rather than what this module thinks sync does.
+    """
+    root = state.service_root(POOL_ID)
+    ensure_service_root(root, POOL_BLOCK)
+    make_pool_data_dirs(root, MEMBERS, POOL_BLOCK)
+    with pytest.raises(PermissionError):
+        # The precondition, asserted rather than assumed: if this ever stops
+        # raising, the reproduction has silently stopped reproducing.
+        (root / DATA_DIRNAME / MEMBERS[0]).is_dir()
+    return root
 
 
 def _make_legacy_member(state: StateDir, member: str) -> Path:
@@ -212,6 +237,7 @@ def adopted() -> Any:
     """One real adoption, shared by the assertions below."""
     state = _state()
     state.service_dir(POOL_ID).mkdir(parents=True, exist_ok=True)
+    _make_staged_pool_root(state)
     for member in MEMBERS:
         _make_legacy_member(state, member)
     SecretStore(state.root).set("alpha", "SVC_SECRET", SECRET_VALUE)
