@@ -57,9 +57,7 @@ class _ScriptedHandler(BaseHTTPRequestHandler):
                     "body": raw_body,
                 }
             )
-            status, payload = (
-                server.script.pop(0) if server.script else server.default_response
-            )
+            status, payload = server.script.pop(0) if server.script else server.default_response
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -247,9 +245,7 @@ def test_create_identity_rejects_invalid_health_path():
     try:
         client = RegistryClient(base_url, ADMIN_TOKEN)
         with pytest.raises(RegistryError, match="health_path"):
-            client.create_identity(
-                "files", SERVICE_SECRET, audience="files", health_path="health"
-            )
+            client.create_identity("files", SERVICE_SECRET, audience="files", health_path="health")
         assert server.requests == []
     finally:
         _stop(server, thread)

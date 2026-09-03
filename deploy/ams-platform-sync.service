@@ -25,11 +25,35 @@ Environment=PATH=/home/harness/venv/bin:/home/harness/.local/bin:/usr/local/bin:
 # staging and provisioning steps create a user namespace (run_admin / provision)
 # and only this interpreter is allowed to.
 # Layer-0 ports are fixed, not allocated (D22, ams.platform.bootstrap.LAYER0_PORTS).
+# --repo is the LOCAL bare mirror, not github.com: StevenLi-phoenix/api is
+# private and the harness holds no credential for it (a token in a fetch URL is
+# what sources.validate_url refuses). scripts/platform-bootstrap.sh pushes the
+# mirror; everything downstream is the real code path. See platform-layer0.md §6.
+# --ref ams-platform, not main: that branch carries the SDK root-logger patch
+# (level-tagged logs, PLAN-allin Q5a) and the service.ams.toml overlays that name
+# each service's third-party secrets. Upstream main stays fetchable in the mirror.
+# --only, not the whole fleet: 2 GB and one vCPU cannot hold all 21 services
+# (T4.1's measured verdict, .claude/state/platform-fleet.md), and ams has no
+# start ordering yet, so an unattended tick that pulls in a new manifest would
+# start it into a thundering herd. The list grows as services are brought up and
+# measured by hand. Remove it once the fleet fits and ordering exists.
 ExecStart=/home/harness/venv/bin/python3 -m ams platform sync \
-    --repo https://github.com/StevenLi-phoenix/api \
-    --ref main \
+    --repo /home/harness/store/upstream/api.git \
+    --ref ams-platform \
     --registry-url http://127.0.0.1:20100 \
-    --auth-url http://127.0.0.1:20101
+    --auth-url http://127.0.0.1:20101 \
+    --only commentservice --only emailservice --only kvservice \
+    --only llmgateway --only logservice --only messageservice \
+    --only notificationservice --only wechatservice --only timeservice
+# `oss` and `secretsservice` are deliberately NOT in that list. Neither can
+# start in the replica: oss calls ensure_bucket() against R2 inside its FastAPI
+# lifespan and dies on the placeholder credentials, and secretsservice requires
+# SECRETS_MASTER_KEY, which no manifest or service.ams.toml declares (T4.1).
+# Both are recorded `failed` + `escalated` in the platform state, which is the
+# honest record. Leaving them in would spend 2 x 90 s of health gate on every
+# 60 s tick -- back-to-back ticks on one vCPU -- for a condition a retry cannot
+# fix, which is the same reasoning as the missing `Restart=` below. Put them
+# back the moment a real credential is set.
 # One tick fetches, may run `uv sync` for several services and then waits on
 # each health gate. The per-step timeouts inside the job (git fetch, uv sync,
 # the health deadline) are all tighter; this is the outer backstop for a tick

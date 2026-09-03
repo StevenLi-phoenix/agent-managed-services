@@ -281,8 +281,12 @@ def test_auth_health_is_tcp_because_auth_has_no_health_route(state):
     assert decls[bs.REGISTRY_ID].health.path == "/health"
     for decl in decls.values():
         assert decl.health.start_period_s == 120.0
-        assert decl.limits.memory_max == "200M"
         assert decl.limits.pids_max == 64
+    # The registry gets a bigger cap than auth: T4.1's live bring-up OOM-killed
+    # it at 200M when the whole fleet registered at once, and every Layer-1
+    # service registers inside its own lifespan, so its death is the fleet's.
+    assert decls[bs.REGISTRY_ID].limits.memory_max == "700M"
+    assert decls[bs.AUTH_ID].limits.memory_max == "200M"
 
 
 def test_no_github_oauth_placeholders_are_invented(state):
@@ -306,13 +310,13 @@ def test_env_paths_all_live_under_the_service_root(state):
 def test_a_drifted_declaration_is_repaired_and_reported(state, store, openssl):
     bs.bootstrap(state, store)
     path = state.service_decl_path(bs.REGISTRY_ID)
-    path.write_text(path.read_text().replace('memory_max = "200M"', 'memory_max = "1G"'))
+    path.write_text(path.read_text().replace('memory_max = "700M"', 'memory_max = "1G"'))
 
     result = bs.bootstrap(state, store)
 
     assert result.updated == ("decl:registry",)
     assert result.created == ()
-    assert 'memory_max = "200M"' in path.read_text()
+    assert 'memory_max = "700M"' in path.read_text()
 
 
 # --------------------------------------------------------------------------- idempotence

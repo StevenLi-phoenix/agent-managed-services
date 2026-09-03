@@ -931,9 +931,7 @@ def test_no_secret_value_reaches_any_output_on_failure(
     assert ADMIN_TOKEN not in haystack
 
 
-def test_an_unset_svc_secret_stops_the_rollback_before_the_restart(
-    env: Env, upstream: Any
-) -> None:
+def test_an_unset_svc_secret_stops_the_rollback_before_the_restart(env: Env, upstream: Any) -> None:
     src, first, second = upstream
     seed(env, src, second, prev_sha=first)
     env.secrets.remove(SERVICE_ID, "SVC_SECRET")

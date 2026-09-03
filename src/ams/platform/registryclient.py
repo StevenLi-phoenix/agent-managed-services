@@ -155,8 +155,7 @@ class IdentityResult:
 def _validate_id(value: str, field: str) -> str:
     if not isinstance(value, str) or not value or len(value) > _MAX_ID_LEN:
         raise RegistryError(
-            f"invalid {field} {value!r}: must be 1-{_MAX_ID_LEN} chars matching "
-            "^[a-z][a-z0-9-]*$"
+            f"invalid {field} {value!r}: must be 1-{_MAX_ID_LEN} chars matching ^[a-z][a-z0-9-]*$"
         )
     if not _ID_RE.match(value):
         raise RegistryError(f"invalid {field} {value!r}: must match ^[a-z][a-z0-9-]*$")
@@ -250,9 +249,7 @@ class RegistryClient:
                 if status < 400 or status in extra_success_statuses:
                     return status, data
                 if status not in RETRYABLE_STATUSES:
-                    raise RegistryError(
-                        f"{what} failed: HTTP {status} {_safe_text(data)}"
-                    )
+                    raise RegistryError(f"{what} failed: HTTP {status} {_safe_text(data)}")
                 last_detail = f"HTTP {status} {_safe_text(data)}"
 
             if attempt <= len(RETRY_DELAYS):

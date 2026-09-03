@@ -168,7 +168,7 @@ def _plain_scalar(line_no: int, raw: str) -> Any:
     if text in _AMBIGUOUS_BOOL:
         raise _err(
             line_no,
-            f"bare {text!r} is a YAML 1.1 boolean; quote it (\"{text}\") to mean the string",
+            f'bare {text!r} is a YAML 1.1 boolean; quote it ("{text}") to mean the string',
         )
     if _INT_RE.match(text):
         return int(text)

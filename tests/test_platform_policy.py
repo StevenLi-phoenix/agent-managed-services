@@ -367,6 +367,24 @@ CADDY_CASES = [
         Action.SUPPRESS,
         id="certificate-warn",
     ),
+    # The other two warnings a live Caddy emits every start/stop (T4.1, seen on
+    # racknerd): both are statements about a setting the operator chose.
+    pytest.param(
+        {"level": "warn", "logger": "admin", "msg": "admin endpoint disabled"},
+        Action.SUPPRESS,
+        id="admin-off-warn",
+    ),
+    pytest.param(
+        {"level": "warn", "msg": "exiting; byeee!! \U0001f44b", "signal": "SIGTERM"},
+        Action.SUPPRESS,
+        id="sigterm-goodbye-warn",
+    ),
+    # ...but a real admin-API failure on the same logger still escalates.
+    pytest.param(
+        {"level": "error", "logger": "admin", "msg": "admin endpoint failed to start"},
+        Action.ESCALATE,
+        id="admin-error-falls-through",
+    ),
     pytest.param(
         {"level": "error", "logger": "http", "msg": "upstream dial failed"},
         Action.ESCALATE,

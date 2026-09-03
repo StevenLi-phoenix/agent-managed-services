@@ -913,3 +913,62 @@ concurrent task while this ran), ruff check + format clean on
 `<!-- TABLE:FLEET -->` placeholders when this task finished, so README carries
 the Layer-0 numbers (n=1, `platform-layer0.md`) and points at the fleet doc for
 the rest.
+
+## T4.1 (live) — fleet bring-up + resource report (2026-09-02/03)
+
+Full transcript with every table: `.claude/state/platform-fleet.md`. Decisions
+and rejected alternatives: `DECISIONS.md` **D28**.
+
+**20 ams services and 2 static sites run on racknerd** under the live harness,
+driven by `ams-platform-sync.timer` (enabled, 60 s) from the local bare mirror at
+ref `ams-platform`. 15 services heartbeat into the replica registry with
+`last_seen` 9–24 s old, and every one of them answers `GET /health` 200 through
+Caddy — including **five subdomain mounts and two static `file_server` mounts,
+which had never been exercised outside golden files** (platform-layer0.md §9).
+
+Counts: tier 1 **9 of 11** (`oss`, `secretsservice` down), tier 2 **6 of 8**
+(`resume`, `displayservice` down), statics **2 of 2**. All four failures are
+credential or manifest gaps, not resources — see the fleet report §3.
+
+**Resource verdict:** the harness cgroup holds all 20 services in
+**1 097 969 664 B (1047 MiB)** with **650 MiB still available** and 148 MiB of
+swap in use. The 300 MB stop-floor was never reached. Tier-1 `services/*` sit at
+45.6–47.8 MiB each (n=9) and tier-2 `apps/*` at 56.5–66.4 MiB (n=6), so Q8's
+"~60 MB per uvicorn" held; what Q8 missed was the registry.
+
+**The bring-up's sharpest finding:** the registry OOM-killed itself twice inside
+its own cgroup — at the 200M cap (`anon-rss:202988kB`) and again at 320M
+(`anon-rss:325416kB`) — while the fleet registered simultaneously, and because
+every Layer-1 service registers inside its FastAPI lifespan, each kill took the
+whole tier down. Memory tracking the cap looks exactly like a leak, so it was
+measured rather than assumed: at a 700M cap the burst peaked at **397 852 672 B
+(379.4 MiB)** at t≈30 s and `memory.current` then sat at ~64 MB for five minutes.
+Burst, not leak. `_REGISTRY_MEMORY_MAX = "700M"` in `bootstrap.py`; auth stays at
+200M.
+
+Also fixed here: `PlatformPolicy` now suppresses the two remaining Caddy start-up
+warnings (`admin endpoint disabled`, `exiting; byeee!!`) that platform-layer0.md
+§7 classified as noise and `_TLS_MSG_RE` did not match — verified as zero Caddy
+escalations from the fixed harness pid, against one per start before.
+
+Both timer properties are proven live: a second consecutive tick is
+`unchanged=9 reloaded=False` with a **byte-identical pid list**, and a one-line
+commit to `api/apps/timeservice/README.md` produced `unchanged=8`,
+`reload: timeservice changed; restarting`, `+0 ~1 -0 =15 errors=0`, and a pid
+diff of exactly one line. D26's per-service change detection works end to end.
+
+Two open items this task found and did **not** fix, both recorded in D28:
+`_health_gate` escalates every `kind: static` mount once per sha because
+`declared` is a static's terminal stage (the fix needs `policy.py` to read the
+mount sidecar's `kind`, which is more than the constants this task's scope
+allowed); and `resume`/`displayservice` cannot start because they read their DB
+path from a code default of `/var/lib/<name>/` that no manifest sets, so the
+translator's `/var/lib → <root>/data` rewrite has nothing to rewrite.
+
+`depends_on` (T4.5) landed mid-task and closed the start-ordering gap this
+bring-up had already hit twice: after the harness picked it up, nine services
+logged `waiting for registry` and every one started on attempt 1.
+
+Local suite **993 passed / 110 skipped**, ruff clean. `api/` carries two new
+commits on `ams-platform` (the README fixture and its follow-up); nothing pushed
+to GitHub.

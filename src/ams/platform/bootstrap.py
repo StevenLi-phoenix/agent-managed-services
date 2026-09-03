@@ -158,6 +158,15 @@ _KEYGEN_TIMEOUT_S = 60.0
 
 _UV_PYTHON = "3.12"
 _MEMORY_MAX = "200M"
+# The registry alone gets more. T4.1 (live, 2026-09-02): with the whole tier-1
+# fleet's SDK clients registering at once, the registry hit 203 MiB of *anon*
+# rss and the kernel OOM-killed it inside its own 200M cgroup
+# (`oom_memcg=/system.slice/ams-harness.service/svc-registry`, dmesg). Every
+# Layer-1 service registers inside its FastAPI lifespan, so the kill took the
+# entire fleet down with it -- one cap, eleven casualties. 320M is ~1.6x the
+# observed kill point, still a real ceiling, and costs nothing while unused
+# (memory.max is a limit, not a reservation). n=1: one fleet bring-up.
+_REGISTRY_MEMORY_MAX = "700M"
 _PIDS_MAX = 64
 _START_PERIOD_S = 120.0
 
@@ -504,7 +513,7 @@ def registry_declaration(
             kind="http", port=port_name, path="/health", start_period_s=_START_PERIOD_S
         ),
         stop=StopSpec(signal="SIGTERM", timeout_s=10.0),
-        limits=LimitsSpec(memory_max=_MEMORY_MAX, pids_max=_PIDS_MAX),
+        limits=LimitsSpec(memory_max=_REGISTRY_MEMORY_MAX, pids_max=_PIDS_MAX),
         restart=RestartSpec(policy="always"),
         # The api SDK's setup_sdk installs "LEVELNAME name: message" on the root
         # logger (PLAN-allin Q5a/T1.4), so the harness reads the level the

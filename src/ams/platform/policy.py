@@ -382,6 +382,17 @@ def _placeholder_ctx(service_id: str) -> ServiceContext:
 # different logger and must keep its default treatment.
 CADDY_ACCESS_LOGGER = "http.log.access"
 _TLS_MSG_RE = re.compile(r"\b(tls|certificates?|acme)\b", re.IGNORECASE)
+# Caddy's other two start-up/shutdown WARNINGs, both statements of fact about a
+# configuration the operator chose. Added at T4.1 after the live run: with only
+# `_TLS_MSG_RE` in place, `admin off` (D21/Q3) escalated on every Caddy start
+# and the SIGTERM line on every stop — 2 of the 4 warnings
+# `.claude/state/platform-layer0.md` §7 classified as noise. Matched on the
+# message, not the logger, because `admin` is also the logger of real admin-API
+# errors we do want to hear about.
+_DELIBERATE_MSG_RE = re.compile(
+    r"(admin endpoint disabled|exiting; byeee)",
+    re.IGNORECASE,
+)
 
 
 def _guarded_json(text: str) -> dict[str, Any] | None:
@@ -623,6 +634,10 @@ class PlatformPolicy:
             # certificates to get. Caddy still warns about what it is not doing.
             return _Refined(
                 Decision(Action.SUPPRESS, "TLS/certificate warning; Phase A is plain HTTP (D21)")
+            )
+        if is_warn and _DELIBERATE_MSG_RE.search(subject):
+            return _Refined(
+                Decision(Action.SUPPRESS, "caddy start/stop warning about a deliberate setting")
             )
         return None
 

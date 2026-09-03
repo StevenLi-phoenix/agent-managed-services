@@ -52,7 +52,7 @@ signal = "SIGTERM"
 timeout_s = 10.0
 
 [limits]
-memory_max = "200M"
+memory_max = "700M"
 pids_max = 64
 
 [restart]

@@ -493,7 +493,7 @@ REJECTIONS: list[tuple[str, str, str, str, str]] = [
         "env name reserved by the harness",
         "resume",
         "    SVC_ROOT_PATH: /resume",
-        "    SVC_ROOT_PATH: /resume\n    PORT_MAIN: \"1\"",
+        '    SVC_ROOT_PATH: /resume\n    PORT_MAIN: "1"',
         "process.environment.PORT_MAIN",
     ),
     (
