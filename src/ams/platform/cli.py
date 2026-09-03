@@ -1,6 +1,6 @@
 """``ams platform`` — the operator front door for the replica platform.
 
-Three verbs, deliberately thin:
+Four verbs, deliberately thin:
 
 - ``ams platform sync`` — one tick of :mod:`ams.platform.sync`. This is what
   ``deploy/ams-platform-sync.timer`` runs every 60 s; running it by hand is the
@@ -9,6 +9,8 @@ Three verbs, deliberately thin:
   only, and safe with no harness running.
 - ``ams platform bootstrap`` — Layer-0 keypair, secrets and declarations
   (delegates to :func:`ams.platform.bootstrap.main`).
+- ``ams platform rollback`` — re-deploy one service at an earlier commit
+  (delegates to :mod:`ams.platform.rollback`, which owns its own flags).
 
 Streams follow the harness convention: **stdout** is the JSON-lines escalation
 channel an agent parses, **stderr** is the human log. ``status`` is the one
@@ -25,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from ams.platform import sync as sync_mod
+from ams.platform.rollback import add_subparser as add_rollback
+from ams.platform.rollback import cmd_rollback
 from ams.platform.sync import (
     EXIT_ERROR,
     EXIT_OK,
@@ -92,11 +96,18 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPa
     p_boot.add_argument("--store", metavar="DIR", help="store dir (default: $AMS_STORE_DIR)")
     p_boot.add_argument("--examples", metavar="DIR", help="also render example declarations")
     p_boot.add_argument("-v", "--verbose", action="store_true")
+
+    add_rollback(ops)
     return parser
 
 
 def cmd_platform(args: argparse.Namespace) -> int:
-    handlers = {"sync": _cmd_sync, "status": _cmd_status, "bootstrap": _cmd_bootstrap}
+    handlers = {
+        "sync": _cmd_sync,
+        "status": _cmd_status,
+        "bootstrap": _cmd_bootstrap,
+        "rollback": cmd_rollback,
+    }
     return handlers[args.platform_command](args)
 
 

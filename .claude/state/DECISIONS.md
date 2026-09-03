@@ -1394,3 +1394,135 @@ real http/tcp check.
   `stop: ControlError: ...` and the record is marked `failed` with nothing staged,
   which is the intended shape, but it has n=0 observations — the portable tests
   cover a *refused* stop, not an absent socket.
+
+### D28 (T4.1). Live fleet: a registry burst cap, two Caddy suppressions, and a throttled timer (2026-09-03)
+
+The tier-1 bring-up on racknerd. Every claim below is from a live run; the
+transcript with the tables is `.claude/state/platform-fleet.md`.
+
+- **`--ref ams-platform`, not `main`, and `--repo` is the local bare mirror.**
+  `StevenLi-phoenix/api` is private and the harness holds no credential for it
+  (platform-layer0.md §6), so the mirror at
+  `/home/harness/store/upstream/api.git` is the only source `sources.validate_url`
+  will accept. The branch is the one carrying the SDK root-logger patch
+  (level-tagged logs, PLAN-allin Q5a) and T3.4's `service.ams.toml` overlays;
+  upstream `main` stays fetchable in the same mirror, so nothing was lost.
+  *Rejected:* running `main` and accepting untagged SDK log levels — T3.2 already
+  measured what that costs (every `logger.warning` classified INFO), and the
+  overlays are the only place the fleet's third-party secret names exist.
+  *Rejected:* a deploy key or a token in the fetch URL — `validate_url` refuses
+  it by design, and a private-repo credential on the replica is a Phase-B
+  decision, not a bring-up convenience.
+
+- **The registry's memory cap is `700M`; auth stays at `200M`.** The single
+  sharpest finding of this task, and it was a **burst, not a leak** — measured,
+  not assumed. Registry was OOM-killed twice inside its own cgroup
+  (`oom_memcg=/system.slice/ams-harness.service/svc-registry`, dmesg): at a 200M
+  cap with `anon-rss:202988kB`, and again at a 320M cap with `anon-rss:325416kB`.
+  Memory tracking the cap that closely looks exactly like a leak, so it was
+  tested rather than guessed: cap raised to 700M, the fleet restarted at once to
+  force the burst, then `memory.current` sampled every 10 s for 5 minutes.
+  `memory.peak` jumped to **397 852 672 (379.4 MiB)** at t≈30 s and never moved
+  again; `memory.current` fell back to **~64 MB** and crept 6 MB over the
+  remaining 4.5 minutes. So the registry's steady state is ~64 MB and its
+  *concurrent-registration burst* is ~379 MiB, and both earlier kills were that
+  same burst clipped at whatever ceiling existed. Because every Layer-1 service
+  registers inside its FastAPI lifespan, the registry's death is the whole
+  fleet's: one cap, eleven casualties. 700M is deliberately loose (≈1.85× the
+  measured burst) because the burst scales with the number of services
+  registering at once and Phase A has no stagger; it costs nothing while unused,
+  since `memory.max` is a limit and not a reservation, and the process
+  demonstrably sits at 64 MB. *Rejected:* keeping 200M and fixing the burst —
+  the burst is upstream registry behaviour (FastAPI + the MCP session manager +
+  9 simultaneous registrations), not something this repo can change, and a cap
+  that kills the trust root under normal fleet start is not a guard, it is an
+  outage generator. *Rejected:* a tight 512M — it is only 1.35× a burst measured
+  **once**, at 9 services, for a fleet meant to reach 21. Revisit with a real
+  measurement at full fleet size. n=2 kills, n=1 clean burst measurement.
+
+- **Two more Caddy warnings are suppressed by `PlatformPolicy`
+  (`_DELIBERATE_MSG_RE`).** platform-layer0.md §7 classified four Caddy start-up
+  WARNINGs as noise; the shipped `_TLS_MSG_RE` caught only the two that say
+  "requires TLS". Live, `admin endpoint disabled` still escalated on every start
+  and `exiting; byeee!!` on every stop — both statements of fact about settings
+  the operator chose (`admin off` is D21/Q3; the SIGTERM is an operator stop).
+  Matched on the **message**, not the logger, because `admin` is also the logger
+  of real admin-API errors, and a test pins that
+  `{"level":"error","logger":"admin"}` still escalates. Verified live: zero
+  Caddy escalations from the harness pid running the fixed policy, against one
+  per start before. *Rejected:* widening `_TLS_MSG_RE` — the suppression reason
+  it prints ("TLS/certificate warning") would then be a lie for two of the four.
+
+- **The sync timer's `ExecStart` carries an explicit `--only` list, and `oss` and
+  `secretsservice` are deliberately not in it.** Neither can start in the
+  replica for reasons a retry cannot fix: `oss` calls `ensure_bucket()` against
+  R2 inside its lifespan and dies on the placeholder credentials with
+  `SSLError ... replica-placeholder.r2.cloudflarestorage.com`; `secretsservice`
+  requires `SECRETS_MASTER_KEY`, which no manifest and no `service.ams.toml`
+  declares. Leaving them in the list spends 2 × 90 s of health gate on every 60 s
+  tick — back-to-back ticks on one vCPU — which is the same reasoning that
+  already keeps `Restart=` off the unit. Both keep their `failed` + `escalated`
+  records, which is the honest state. *Rejected:* syncing the whole fleet
+  unfiltered — 2 GB cannot hold 21 services (§2 of the fleet report) and an
+  unattended tick that picks up a new upstream manifest would start it into a
+  fleet that has no admission control.
+
+- **`service_policies` needs no manual step for the fleet, and T3.2's hand-inserted
+  row was the exception.** Checked rather than assumed: the registry has no write
+  API for M2M policy by design, but migrations `003`–`009` seed it, and the
+  replica's `registry.db` already carries all eight upstream rows (`* →
+  {emailservice,logservice,messageservice,notificationservice}`, `mailbox →
+  {kvservice,messageservice,oss}`, `pages → oss`) with `schema_version` at 10 —
+  because `ams platform bootstrap` points `REGISTRY_MIGRATIONS_DIR` at the staged
+  tree and the registry runs them at startup. The only hand-written row is
+  `('timeservice','kvservice')`, a pair no migration declares, invented for
+  T3.2's M2M proof. So the Phase-B item is not "ams must script this" but "a new
+  M2M pair still needs an upstream migration", which is upstream's design.
+  *Rejected:* scripting a `service_policies` upsert through `run_admin` + sqlite
+  for every service — it would write rows the migrations already own, and a
+  second writer to a migration-managed table is how the two drift.
+
+- **Placeholder secrets are `replica-placeholder`, set for the eight overlay
+  names, and the report says which services are therefore fake.**
+  `commentservice/DEEPSEEK_API_KEY`, `wechatservice/WECHAT_MP_APP{ID,SECRET}`,
+  `notificationservice/BARK_DEVICE_KEY`, `emailservice/RESEND_API_KEY`,
+  `oss/R2_{ACCOUNT_ID,ACCESS_KEY_ID,SECRET_ACCESS_KEY}`. A declared secret with
+  no stored value fails the service at spawn (D16), so the choice was a
+  placeholder or a dead service. Four of the five services start fine and will
+  fail only when they call their provider; `oss` is the exception and dies at
+  startup, which is a property of `oss`, not of the placeholder policy.
+  *Rejected:* leaving them unset — five services down for a reason that says
+  nothing about the platform. *Rejected:* real credentials — they are not the
+  replica's to hold (PLAN-allin "what stays manual").
+
+### Open / weak signals (live fleet, 2026-09-03)
+- **`resume` and `displayservice` cannot start, and it is a translation gap, not
+  a resource one.** Both read their DB path from a **code** default of
+  `/var/lib/<name>/`, which the manifest never sets, so `translate`'s
+  `/var/lib/<n>/ → <root>/data/` rewrite (the pilot's finding #5) has no env value
+  to rewrite and the mapped uid gets `PermissionError: '/var/lib/resume'`. The
+  five tier-2 services whose manifest *does* set the path (`files`,
+  `locationservice`, `mailbox`, `pages`, `turingtest`) are unaffected. The fix is
+  either an upstream manifest line or a translator that injects `<SVC>_DB_PATH`
+  when the manifest omits it — `translate.py` was out of this task's scope, and
+  the second option is a guess about a variable name, so neither was taken. n=2
+  services observed.
+- **The registry burst number is n=1 at 9 services.** 379 MiB was measured once,
+  for nine simultaneous registrations. Nothing has measured it at 21, and the
+  relationship between service count and burst size is **unknown** — do not
+  linearly extrapolate it into a cap for the full fleet, and do not delete the
+  700M headroom on the strength of the 64 MB steady state.
+- **`depends_on` closed the start-ordering gap during this task, and the fix is
+  T4.5's, not this one's.** Before it, a harness restart started all Layer-1
+  services alongside the registry; each SDK client registers inside its lifespan,
+  so `Connection refused` → `Application startup failed` → 5 attempts → the whole
+  tier-1 fleet parked in `failed`. Observed twice. After the harness picked up
+  `depends_on = ["registry"]`, nine services logged `waiting for registry` and
+  every one started on **attempt 1** [verified, n=1 restart].
+- **A code deploy between two sync ticks can make every declaration unloadable.**
+  Seen live: the translator started emitting `depends_on` while the *running*
+  harness process still had the old `schema.py` imported, so its reload rejected
+  all nine freshly written declarations (`unknown top-level keys ['depends_on']`,
+  `errors=9`) and restarted nothing. The services kept running on their in-memory
+  declarations, so nothing broke — but a harness restart in that window would
+  have failed to start nine services. Nothing detects this today. n=1.

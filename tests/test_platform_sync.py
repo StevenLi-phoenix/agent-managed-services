@@ -499,6 +499,7 @@ def test_state_file_matches_the_sidecar_doc_shape(env: Any, upstream: Any) -> No
         "escalated",
         "manual_restart",
         "prev_sha",
+        "rolled_back_from",
         "sha",
         "stage",
         "stage_since",

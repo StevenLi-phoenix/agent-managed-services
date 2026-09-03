@@ -270,6 +270,11 @@ class ServiceRecord:
     stage: str = FAILED
     error: str | None = None
     manual_restart: bool = False
+    #: Set by :mod:`ams.platform.rollback` to the commit this service was moved
+    #: *away* from. Declared here so a sync tick's rewrite of the file preserves
+    #: it -- :meth:`PlatformState.load` keeps only fields the dataclass declares
+    #: (D27/T4.3), so an undeclared key would be dropped on the next flush.
+    rolled_back_from: str | None = None
     escalated: bool = False
     updated_at: str = ""
     stage_since: str = ""

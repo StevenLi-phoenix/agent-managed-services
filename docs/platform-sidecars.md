@@ -115,7 +115,9 @@ One file for the whole fleet, rewritten atomically by the sync loop.
     "files": {
       "sha": "9f1c0b2e4a6d8f0011223344556677889900aabb",
       "prev_sha": "1122334455667788990011223344556677889900",
+      "deployed_sha": "9f1c0b2e4a6d8f0011223344556677889900aabb",
       "stage": "healthy",
+      "rolled_back_from": null,
       "error": null,
       "manual_restart": false,
       "escalated": false,
@@ -137,6 +139,8 @@ State record:
 | --- | --- | --- |
 | `sha` | string \| null | the commit this service is currently being driven to |
 | `prev_sha` | string \| null | the last sha that reached `healthy`. A post-sync health failure escalates with **both** shas (T3.3), so the operator sees what changed. |
+| `deployed_sha` | string \| null | the commit whose tree is actually staged at `<root>/repo`. Additive to version 1 (D26): a service the commit range did not touch is re-translated at *this* sha, so its declaration is byte-identical and nothing restarts. Falls back to the on-disk `.ams-sha` marker when absent. |
+| `rolled_back_from` | string \| null | set by `ams platform rollback` to the commit the service was moved *away* from; `null` otherwise. Additive to version 1 (D27/T4.3). It is **not** a pin: the next sync tick drives the service back to the branch head. |
 | `stage` | enum | see below |
 | `error` | string \| null | one-line reason the service is at `failed`; `null` otherwise |
 | `manual_restart` | bool | from the manifest. `true` = the sync loop applies everything but does not restart the service (self-deploy of core services). |

@@ -870,3 +870,46 @@ Wiring left for T3.1/T4.4 — two lines in `src/ams/platform/cli.py`:
 `cmd_platform`'s handler dict. Also one line in `sync.ServiceRecord`:
 `rolled_back_from: str | None = None`, without which the field a rollback writes is
 dropped the next time the sync loop rewrites the state file.
+
+Follow-up (T4.5's `waiting` status, committed f382790): `rollback.DOWN_STATUSES`
+is `{"stopped", "failed", "waiting"}` — a service parked on an unhealthy
+`depends_on` has no process, which is all the staging step needs to know, and
+treating it as neither up nor down made `_wait_stopped` spin to its deadline and
+then warn about a service that was never running. One unit case pins it
+(`test_a_service_parked_waiting_on_a_dependency_counts_as_down`: one `status`
+call, no warning). Local suite **991 passed / 110 skipped**; remote
+`scripts/remote-test.sh ams-e2e tests/linux/test_platform_e2e.py tests/test_platform_rollback.py`
+**57 passed**; remote dirs removed again.
+
+## T4.4 docs + Phase-B audit (2026-09-03)
+
+Wired T4.3's leftovers: `ams platform rollback` is now a real subcommand
+(`src/ams/platform/cli.py` imports `add_subparser`/`cmd_rollback` from
+`rollback.py`, calls `add_rollback(ops)` and routes `"rollback"` in
+`cmd_platform`), and `sync.ServiceRecord` gained `rolled_back_from: str | None`
+so the field survives the next tick's rewrite. Two tests in a new
+`tests/test_platform_cli.py` pin both (`--help` through `ams.cli.main`, and a
+state-file round trip). `docs/platform-sidecars.md`'s record table gained
+`rolled_back_from` **and** `deployed_sha` (D26's field was never documented) and
+`test_platform_sync.py`'s shape assertion was updated to match.
+
+Docs written: `docs/platform.md` (the end-to-end story — layers, on-disk layout,
+the nine steps from push to running service, the state machine, secrets, the
+gateway, Layer 0, `depends_on`, backup, rollback, the control socket, operator
+commands, known gaps), plus rewritten `README.md` and `CLAUDE.md`. Every path and
+command named in them was spot-checked with `ls` or `--help`; the only correction
+that surfaced was `make_extra_env_for` living in `secrets.py`, not `runtime.py`.
+
+`.claude/state/phase-b-prereqs.md`: 21 checklist items across edge/TLS, data
+migration, trust root, secrets and source, lifecycle gaps, capacity, and the
+three decisions the user must sign off (D18 scope, D22 fixed ports, D26 shared
+prefixes), each with the Phase-A evidence cited by state doc, what is still
+required, the risk and the rollback.
+
+Verified: local suite **993 passed / 110 skipped** (one more landed from a
+concurrent task while this ran), ruff check + format clean on
+`platform/cli.py`, `platform/sync.py` and the new test file. Fleet numbers were
+**not** available — `.claude/state/platform-fleet.md` existed as a skeleton with
+`<!-- TABLE:FLEET -->` placeholders when this task finished, so README carries
+the Layer-0 numbers (n=1, `platform-layer0.md`) and points at the fleet doc for
+the rest.
