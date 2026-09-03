@@ -90,6 +90,16 @@ def write_state(state: StateDir, services: dict, version: int = 1) -> None:
     path.write_text(json.dumps({"version": version, "services": services}), encoding="utf-8")
 
 
+def write_mount(state: StateDir, service_id: str, content: str | dict | None) -> None:
+    """Write (or corrupt) `<state>/platform/mounts/<id>.json` (`docs/platform-sidecars.md`)."""
+    path = state.root / "platform" / "mounts" / f"{service_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, dict):
+        path.write_text(json.dumps(content), encoding="utf-8")
+    else:
+        path.write_text(content or "", encoding="utf-8")
+
+
 def iso(text: str) -> str:
     return text
 
@@ -613,6 +623,42 @@ def test_health_gate_falls_back_to_updated_at(tmp_path) -> None:  # noqa: ANN001
     rec = record(stage="declared")
     del rec["stage_since"]
     write_state(state, {"files": rec})
+    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 1)
+    assert len(make_policy(state, clock=clock).flush()) == 1
+
+
+def test_health_gate_ignores_a_static_mount_stuck_at_declared(tmp_path) -> None:  # noqa: ANN001
+    """`declared` is a static mount's terminal stage (D28 open item) -- not stuck."""
+    state = state_dir(tmp_path)
+    write_state(state, {"files-web": record(stage="declared")})
+    write_mount(state, "files-web", {"version": 1, "id": "files-web", "kind": "static"})
+    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 1)
+    assert make_policy(state, clock=clock).flush() == []
+
+
+def test_health_gate_still_escalates_a_service_mount_stuck_at_declared(tmp_path) -> None:  # noqa: ANN001
+    state = state_dir(tmp_path)
+    write_state(state, {"files": record(stage="declared")})
+    write_mount(state, "files", {"version": 1, "id": "files", "kind": "service"})
+    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 1)
+    assert len(make_policy(state, clock=clock).flush()) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(None, id="absent"),
+        pytest.param("not json at all {", id="corrupt"),
+        pytest.param(json.dumps([1, 2, 3]), id="not-an-object"),
+        pytest.param(json.dumps({"id": "files-web"}), id="no-kind-key"),
+    ],
+)
+def test_health_gate_treats_a_broken_mount_sidecar_as_non_static(tmp_path, content) -> None:  # noqa: ANN001
+    """Fail-safe: a missing or malformed mount sidecar must not suppress a real gate."""
+    state = state_dir(tmp_path)
+    write_state(state, {"files-web": record(stage="declared")})
+    if content is not None:
+        write_mount(state, "files-web", content)
     clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 1)
     assert len(make_policy(state, clock=clock).flush()) == 1
 

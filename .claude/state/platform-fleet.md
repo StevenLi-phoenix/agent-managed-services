@@ -122,7 +122,7 @@ nothing was clipped.
 
 ## 3. What the bring-up found
 
-Five findings, all with a live signal. Full reasoning and rejected alternatives
+Six findings, all with a live signal. Full reasoning and rejected alternatives
 in DECISIONS **D28**.
 
 1. **The registry OOM-killed itself twice and took the fleet with it.** At its
@@ -144,20 +144,45 @@ in DECISIONS **D28**.
    | 180 | 64 397 312 | 397 852 672 |
    | 300 | 66 039 808 | 397 852 672 |
 
-   **Burst, not leak** [verified, n=1]: peak fixed at 379.4 MiB during the
+   **Burst, not leak** [verified]: peak fixed at 379.4 MiB during the
    registration storm at t≈30 s, current fell back to ~64 MB and crept 6 MB over
-   the next 4.5 minutes. Cap is now 700M (`_REGISTRY_MEMORY_MAX`), deliberately
-   ~1.85× the measured burst because the burst scales with concurrent
-   registrations and Phase A has no admission control. It costs nothing while
-   unused — the process demonstrably sits at 64–74 MB.
+   the next 4.5 minutes. Cap is now 700M (`_REGISTRY_MEMORY_MAX`); the process
+   demonstrably sits at 64–78 MB, so the headroom costs nothing while unused.
+
+   **And the burst is very nearly flat in fleet size** — measured three times at
+   the 700M cap, so the "do not extrapolate" caveat this report first carried is
+   now replaced by evidence:
+
+   | registering services | registry `memory.peak` | OOM? |
+   | --- | --- | --- |
+   | 9 | 397 852 672 (379.4 MiB) | no |
+   | 20 | 403 202 048 (384.5 MiB) | no |
+   | 20 (repeat) | 403 992 576 (385.3 MiB) | no |
+
+   Going from 9 to 20 simultaneous registrations cost **1.5%** more peak memory,
+   so the burst is dominated by fixed start-up cost (FastAPI init plus the MCP
+   session manager), not by per-registration allocation [verified, n=3]. 512M
+   would in fact have sufficed; 700M is kept because the margin is free and the
+   two kills that motivated it were expensive.
 
 2. **No start ordering meant a harness restart was a fleet outage — and
    `depends_on` fixed it, live.** Observed twice before the fix: every Layer-1
    service started alongside the registry, hit `Connection refused`, exited 3,
    and exhausted its retries. After the harness picked up T4.5's `depends_on =
-   ["registry"]`, nine services logged `waiting for registry` and every one came
-   up on **attempt 1** [verified, n=1 restart]. This report's earlier failures
-   are the evidence for why that feature was needed.
+   ["registry"]` the whole fleet restarts cleanly [verified, **n=3** harness
+   restarts, the last two with all 24 declarations]:
+
+   | restart | Layer 0 + demos start | registry healthy | dependents start | dependents on attempt 1 |
+   | --- | --- | --- | --- | --- |
+   | 02:06:39 | 02:06:39–40 | 02:06:44 | 02:06:45+ | 9 of 9 |
+   | 02:41:23 | 02:41:23–24 | 02:41:45 | 02:41:45+ | 17 of 17 |
+   | 02:50:40 | 02:50:40–41 | 02:50:51 | 02:50:52+ | 19 of 19 |
+
+   Not one dependent has crash-looped on a missing registry since. 19 of the 24
+   declarations carry `depends_on = ["registry"]`; the five that do not are
+   `registry`, `auth`, `caddy`, `hello` and `pyhello`, which is correct.
+   This report's earlier failures are the evidence for why the feature was
+   needed, and these three restarts are the evidence that it works.
 
 3. **Two Caddy start-up warnings still escalated; both are now suppressed.**
    `admin endpoint disabled` on every start and `exiting; byeee!!` on every stop
@@ -185,6 +210,16 @@ in DECISIONS **D28**.
    nothing broke — but a harness restart in that window would have failed to
    start nine services. Nothing detects this today. n=1.
 
+6. **The registry's health probe flaps under a full-fleet start.** During the
+   20-service restart the supervisor logged
+   `registry health=FAIL http 127.0.0.1:20100/health TimeoutError: timed out`
+   twice (02:43:33, 02:44:24), recovering within 35 s and 14 s. On one vCPU, 20
+   uvicorn processes importing while 20 SDK clients register is enough contention
+   that the registry cannot answer a 200 within the probe timeout. It never
+   restarted — a health failure alone does not — and the fleet came up fine, but
+   this is the contention signal to watch if the fleet grows or if anything is
+   ever made to restart on a failed probe. n=2 flaps in one restart.
+
 ### The timer: no-op and single-service redeploy [verified]
 
 `ams-platform-sync.timer` is `enabled --now`, firing every 60 s.
@@ -210,6 +245,12 @@ in DECISIONS **D28**.
   The eight untouched services logged `nothing under services/<id>/ or
   shared//components/sdk/ changed since 013b4d074914; staying at it` and were not
   re-staged, re-provisioned or re-probed.
+- **The same property holds for a declaration change that is not a code change.**
+  Syncing `oss` and `secretsservice` once so their declarations would pick up
+  `depends_on` produced `reload: oss changed; restarting`,
+  `reload: secretsservice changed; restarting` and
+  **`+0 ~2 -0 =22 errors=0`** — exactly the two services whose declaration
+  changed, twenty-two untouched, no errors.
 
 ### Why the four dead services are dead
 
@@ -283,10 +324,11 @@ Nothing else was hand-edited. No service's data dir was touched.
 
 - **n=1 for every number here.** One box, one bring-up. The longest continuous
   observation of a settled fleet is about five minutes.
-- **The registry burst is n=1 at 9 concurrent registrations.** 379.4 MiB was
-  measured once. Nothing has measured it at 21, and the relationship between
-  service count and burst size is **unknown** — do not linearly extrapolate it,
-  and do not remove the 700M headroom on the strength of the 64 MB steady state.
+- **The registry burst is now n=3 and flat (379.4 / 384.5 / 385.3 MiB at 9 / 20
+  / 20 registrations), but all three are on one box with one CPU.** The flatness
+  is good evidence that the cost is fixed rather than per-registration; it is not
+  evidence about a different host, a warmer or colder page cache, or a registry
+  serving real traffic while the fleet starts.
 - **`memory.peak` is cumulative and page-cache-contaminated.** The tier-2 peaks
   (~80 MiB) include first-touch page cache charged to whoever faulted a page in
   first, exactly as the pilot found. They are an upper bound on the start-up

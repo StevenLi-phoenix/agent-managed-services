@@ -1495,6 +1495,48 @@ transcript with the tables is `.claude/state/platform-fleet.md`.
   nothing about the platform. *Rejected:* real credentials — they are not the
   replica's to hold (PLAN-allin "what stays manual").
 
+### D28 addendum. Health-gate fix for static mounts stuck at `declared` (2026-09-02)
+- **Resolved the first D28 open item.** `PlatformPolicy._health_gate`
+  (`src/ams/platform/policy.py`) now special-cases `stage == "declared"`: it
+  reads `<state>/platform/mounts/<id>.json` and, when the sidecar parses as a
+  dict with `kind == "static"`, discards the gate marker and skips straight to
+  the next record -- the same treatment `stage == "healthy"` already gets.
+  `declared` is a static mount's real terminal stage (`docs/platform-sidecars.md`,
+  `sync._phase_declare`: "a static site has no process and no registry record,
+  so `declared` is where its state machine ends"), so reaching it is success,
+  not a sync stuck partway.
+- **Fail-safe on a missing or malformed sidecar: falls back to gating.** The
+  `json.loads`/read is wrapped in a bare `try/except (OSError,
+  UnicodeDecodeError, ValueError)` returning `False` ("not static"), so an
+  absent file, a non-dict, or a sidecar with no `kind` key all leave the
+  ordinary grace-period/escalate path untouched -- a broken sidecar must never
+  *hide* a real stuck sync, only fail to suppress one. Verified by
+  `tests/test_platform_policy.py::test_health_gate_treats_a_broken_mount_sidecar_as_non_static`
+  (absent, corrupt JSON, a JSON array, and a dict with no `kind` key -- all four
+  still escalate).
+- **Read the sidecar directly (`state.root / "platform" / "mounts" / f"{id}.json"`),
+  not via `ams.platform.sync.mounts_dir`/`load_mounts`.** The path is a stable,
+  documented contract (`docs/platform-sidecars.md`) and `policy.py` already
+  reads `platform/state.json` the same way (`platform_state_path`) rather than
+  importing a sync-module accessor; importing `sync` into `policy` would also be
+  the first `platform.policy -> platform.sync` edge in a graph where `sync`
+  currently imports nothing from `policy` (no cycle today, but no reason to
+  create the coupling for one path join). *Rejected:* caching the sidecar read
+  like `_state_document`'s mtime/size cache -- the live fleet has exactly two
+  static mounts (D28: `files-web`, `llm-web`) and, once a static record sits at
+  `declared` forever, this check runs once per `flush()` tick per static id
+  (cheap: one `stat`+read of a small file), never escalates, and therefore never
+  needs the `_gated` de-dup a healthy/failed record relies on. Revisit only if
+  the fleet's static-mount count grows enough for that read to show up in a
+  profile -- n=0 evidence it ever will.
+- Tests added: a static mount at `declared` beyond grace does not escalate; a
+  `kind: service` mount at `declared` beyond grace still escalates (matching the
+  pre-existing `test_health_gate_falls_back_to_updated_at`, which covers the
+  no-sidecar-at-all case); the four malformed-sidecar cases above.
+  Full local suite: **999 passed** (was 993; +6 = 2 scenario tests + a
+  4-way `pytest.mark.parametrize` on the malformed-sidecar test), 110 skipped,
+  ruff clean.
+
 ### Open / weak signals (live fleet, 2026-09-03)
 - **`resume` and `displayservice` cannot start, and it is a translation gap, not
   a resource one.** Both read their DB path from a **code** default of
@@ -1517,8 +1559,28 @@ transcript with the tables is `.claude/state/platform-fleet.md`.
   services alongside the registry; each SDK client registers inside its lifespan,
   so `Connection refused` → `Application startup failed` → 5 attempts → the whole
   tier-1 fleet parked in `failed`. Observed twice. After the harness picked up
-  `depends_on = ["registry"]`, nine services logged `waiting for registry` and
-  every one started on **attempt 1** [verified, n=1 restart].
+  `depends_on = ["registry"]` the fleet restarts cleanly: three harness restarts
+  (9, 17 and 19 dependents), Layer 0 first, registry healthy, then every
+  dependent on **attempt 1**, no crash loop [verified, n=3]. 19 of 24
+  declarations carry the line; the five without it are `registry`, `auth`,
+  `caddy`, `hello`, `pyhello`, which is correct.
+- **The registry burst is flat in fleet size, which the first measurement could
+  not show.** Re-measured at the 700M cap across three bring-ups: 379.4 MiB at 9
+  simultaneous registrations, 384.5 MiB at 20, 385.3 MiB at 20 again — **1.5%**
+  for going from 9 to 20. So the cost is dominated by fixed start-up (FastAPI
+  init + the MCP session manager), not by per-registration allocation, and 512M
+  would have sufficed. 700M is kept anyway: the margin is free (the process sits
+  at 64–78 MB) and the two OOM kills that motivated it cost the fleet twice.
+  This supersedes D28's earlier "do not extrapolate" caveat, which was written
+  when n=1 [verified, n=3].
+- **The registry's health probe flaps under a full-fleet start.**
+  `registry health=FAIL ... TimeoutError: timed out` twice during the 20-service
+  restart, recovering in 35 s and 14 s. On one vCPU, 20 uvicorn imports plus 20
+  registrations is enough contention that the registry cannot answer a probe in
+  time. Harmless today — a failed probe does not restart anything — but it is the
+  signal to watch before anything is made to act on a failed health check, and
+  before `start_period_s` or the probe timeout is tightened. n=2 flaps, one
+  restart.
 - **A code deploy between two sync ticks can make every declaration unloadable.**
   Seen live: the translator started emitting `depends_on` while the *running*
   harness process still had the old `schema.py` imported, so its reload rejected

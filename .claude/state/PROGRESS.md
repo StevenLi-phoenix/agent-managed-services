@@ -966,9 +966,25 @@ path from a code default of `/var/lib/<name>/` that no manifest sets, so the
 translator's `/var/lib → <root>/data` rewrite has nothing to rewrite.
 
 `depends_on` (T4.5) landed mid-task and closed the start-ordering gap this
-bring-up had already hit twice: after the harness picked it up, nine services
-logged `waiting for registry` and every one started on attempt 1.
+bring-up had already hit twice. Verified over **three** harness restarts (9, 17
+and 19 dependents): Layer 0 starts, registry goes healthy, then every dependent
+starts on attempt 1 with no crash loop. 19 of 24 declarations carry the line;
+the five without are registry/auth/caddy/hello/pyhello, which is correct. Those
+restarts also re-measured the registry burst at the 700M cap — 379.4 MiB at 9
+registrations, 384.5 and 385.3 MiB at 20 — so the burst is **flat in fleet
+size** (n=3) and dominated by fixed start-up cost, not per-registration
+allocation. One new contention signal: the registry's health probe timed out
+twice during the 20-service start and recovered on its own.
 
-Local suite **993 passed / 110 skipped**, ruff clean. `api/` carries two new
+Local suite **999 passed / 110 skipped**, ruff clean. `api/` carries two new
 commits on `ams-platform` (the README fixture and its follow-up); nothing pushed
 to GitHub.
+
+## 2026-09-02 — health-gate fix: static mounts no longer escalate at `declared`
+
+D28's first open item closed: `PlatformPolicy._health_gate` now reads
+`<state>/platform/mounts/<id>.json` and skips the gate when `stage == "declared"`
+and the sidecar's `kind == "static"` (absent/malformed sidecar fails safe = still
+gates). Local suite **999 passed / 110 skipped** (+6 tests), ruff clean; deploying
+to racknerd via `scripts/deploy-racknerd.sh` (see DECISIONS D28 for the live
+verification).

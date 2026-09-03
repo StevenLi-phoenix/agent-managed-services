@@ -446,6 +446,28 @@ def platform_state_path(state: StateDir) -> Path:
     return state.root / "platform" / "state.json"
 
 
+def _mount_sidecar_path(state: StateDir, service_id: str) -> Path:
+    """`<state>/platform/mounts/<id>.json` (`docs/platform-sidecars.md`)."""
+    return state.root / "platform" / "mounts" / f"{service_id}.json"
+
+
+def _is_static_mount(state: StateDir, service_id: str) -> bool:
+    """Whether the mount sidecar for ``service_id`` declares ``kind: static``.
+
+    A ``kind: static`` mount has no process and no registry record, so
+    ``declared`` is its terminal stage (`docs/platform-sidecars.md`,
+    `sync._phase_declare`) -- reaching it is success, not a sync stuck partway.
+    Absent or malformed sidecar -> False (fail-safe): the caller then falls back
+    to treating the record as an ordinary service, which is the behaviour that
+    existed before this check (DECISIONS D28 open item).
+    """
+    try:
+        data = json.loads(_mount_sidecar_path(state, service_id).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("kind") == "static"
+
+
 def _parse_iso_z(value: Any) -> float | None:
     """`2026-09-02T13:04:07Z` -> epoch seconds, or None for anything else.
 
@@ -720,6 +742,15 @@ class PlatformPolicy:
             marker = (service_id, str(sha), stage)
             if stage == "healthy":
                 # Reaching healthy re-arms the gate for the next sync of this sha.
+                self._gated.discard(marker)
+                continue
+            if (
+                stage == "declared"
+                and self.state is not None
+                and _is_static_mount(self.state, service_id)
+            ):
+                # A static mount's terminal stage is `declared`, not `healthy`
+                # (see `_is_static_mount`) -- it is done, not stuck.
                 self._gated.discard(marker)
                 continue
             since = _parse_iso_z(record.get("stage_since")) or _parse_iso_z(
