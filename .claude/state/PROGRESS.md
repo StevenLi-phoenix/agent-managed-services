@@ -1115,3 +1115,12 @@ dead as on racknerd), 15/15 routes 200 via Caddy, second tick 1 s. Record:
 Open (D30): standalone services still start before they are registered (one
 crash + 20 s backoff each on a fresh host); node 22 and the timer units are
 hand steps.
+
+## 2026-09-03 — releases
+
+ams: `v1.0.0` (248d7f3) pushed to the new private repo
+`github.com/StevenLi-phoenix/agent-managed-services` (origin, main). api: branch
+`ams-platform` pushed to GitHub for the first time and tagged `v2.0.0` at
+c8b1fff3 — **not merged to main**; the production deployer ignores tag pushes
+and non-main branches, so nothing deployed. Both earlier open items ("git
+remote for ams", "api branch unpushed") are closed.
