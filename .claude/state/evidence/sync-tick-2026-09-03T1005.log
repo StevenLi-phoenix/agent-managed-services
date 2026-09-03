@@ -1,0 +1,236 @@
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.sync: secretsservice still failing (health: http://127.0.0.1:20033/health not 200 within 90s); already escalated
+INFO ams.platform.sync: sync done: sha=c8b1fff30428 services=17 unchanged=15 failed=2 reloaded=True gateway_changed=0
+INFO ams.platform.cli: sha=c8b1fff30428 services=17 unchanged=15 failed=2 reloaded=True gateway_changed=0
+ams-platform-sync.service: Main process exited, code=exited, status=1/FAILURE
+ams-platform-sync.service: Failed with result 'exit-code'.
+Failed to start ams-platform-sync.service - ams platform: one sync tick (fetch, translate, provision, declare, reload, gate).
+ams-platform-sync.service: Consumed 1.107s CPU time.
+Starting ams-platform-sync.service - ams platform: one sync tick (fetch, translate, provision, declare, reload, gate)...
+INFO ams.platform.sources: api: git fetch: /usr/bin/git --git-dir /home/harness/store/repos/api.git fetch --prune --quiet origin -> rc=0 in 0.0s
+INFO ams.platform.sources: api: git rev-parse ams-platform: /usr/bin/git --git-dir /home/harness/store/repos/api.git rev-parse --verify refs/heads/ams-platform -> rc=0 in 0.0s
+INFO ams.platform.sources: api: ams-platform -> c8b1fff30428170c1aca4bf6a3165cfbd66494c6
+INFO ams.platform.sync: ams-platform -> c8b1fff30428: 21 manifest(s)
+INFO ams.platform.sync: pool core: 8 of 15 members named; a pool is one process, so all of it is selected
+INFO ams.platform.sources: api: /home/harness/store/state/services/pool-core/root/repo already at c8b1fff30428170c1aca4bf6a3165cfbd66494c6; stage is a no-op
+INFO ams.platform.sources: api: /home/harness/store/state/services/llmgateway/root/repo already at c8b1fff30428170c1aca4bf6a3165cfbd66494c6; stage is a no-op
+INFO ams.platform.registryclient: create identity 'resume': POST /api/services -> status=409 attempt=1
+INFO ams.platform.registryclient: acl upsert read/anon on resume: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: acl upsert read/user:* on resume: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: acl upsert write/admin on resume: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.sync: resume still failing (health: http://127.0.0.1:20032/health not 200 within 90s); already escalated
+INFO ams.platform.registryclient: create identity 'secretsservice': POST /api/services -> status=409 attempt=1
+INFO ams.platform.registryclient: acl upsert read/user:* on secretsservice: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: acl upsert write/user:* on secretsservice: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: acl upsert read/service:* on secretsservice: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: acl upsert write/service:* on secretsservice: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: acl upsert read/admin on secretsservice: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: acl upsert write/admin on secretsservice: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20033/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.sync: secretsservice still failing (health: http://127.0.0.1:20033/health not 200 within 90s); already escalated
+INFO ams.platform.sync: sync done: sha=c8b1fff30428 services=17 unchanged=15 failed=2 reloaded=True gateway_changed=0
+INFO ams.platform.cli: sha=c8b1fff30428 services=17 unchanged=15 failed=2 reloaded=True gateway_changed=0
+ams-platform-sync.service: Main process exited, code=exited, status=1/FAILURE
+ams-platform-sync.service: Failed with result 'exit-code'.
+Failed to start ams-platform-sync.service - ams platform: one sync tick (fetch, translate, provision, declare, reload, gate).
+ams-platform-sync.service: Consumed 1.138s CPU time, 16.6M memory peak, 0B memory swap peak.
+Starting ams-platform-sync.service - ams platform: one sync tick (fetch, translate, provision, declare, reload, gate)...
+INFO ams.platform.sources: api: git fetch: /usr/bin/git --git-dir /home/harness/store/repos/api.git fetch --prune --quiet origin -> rc=0 in 0.0s
+INFO ams.platform.sources: api: git rev-parse ams-platform: /usr/bin/git --git-dir /home/harness/store/repos/api.git rev-parse --verify refs/heads/ams-platform -> rc=0 in 0.0s
+INFO ams.platform.sources: api: ams-platform -> c8b1fff30428170c1aca4bf6a3165cfbd66494c6
+INFO ams.platform.sync: ams-platform -> c8b1fff30428: 21 manifest(s)
+INFO ams.platform.sync: pool core: 8 of 15 members named; a pool is one process, so all of it is selected
+INFO ams.platform.sources: api: /home/harness/store/state/services/pool-core/root/repo already at c8b1fff30428170c1aca4bf6a3165cfbd66494c6; stage is a no-op
+INFO ams.platform.sources: api: /home/harness/store/state/services/llmgateway/root/repo already at c8b1fff30428170c1aca4bf6a3165cfbd66494c6; stage is a no-op
+INFO ams.platform.registryclient: create identity 'resume': POST /api/services -> status=409 attempt=1
+INFO ams.platform.registryclient: acl upsert read/anon on resume: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: acl upsert read/user:* on resume: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: acl upsert write/admin on resume: POST /api/acl -> status=200 attempt=1
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>
+INFO ams.platform.registryclient: wait_healthy: GET http://127.0.0.1:20032/health -> transport error: <urlopen error [Errno 111] Connection refused>

@@ -1077,3 +1077,15 @@ the §7.3 before/after measurement table in `docs/platform-pools.md`. Three
 user-decidable defaults (15-member roster, accepted losses, per-service
 backup keys) were taken in the user's absence per PLAN-pool §10 and should be
 confirmed before or during the cutover.
+
+## 2026-09-03 — Pools: LIVE on racknerd (T10 done)
+
+`pool-core` runs 15 members in one process. Layer-1 memory 712 → 275 MiB,
+all services 866 → 464 MiB, 18 → 5 Python processes, pool 134 MiB, cold start
+21 s (n=3; `evidence/pool-{before,after}-2026-09-03.txt`, `pool-migration.md`).
+Two adoption bugs fixed live (e873270, 436d86b), two follow-ups (315b9a1:
+log-tag parsing, failed-gate hold). Tests 1224 passed / 125 skipped; remote
+Linux suite green except the known load-sensitive `test_pids_max_caps_a_fork_storm`.
+Legacy member roots + snapshot `/var/lib/ams/pre-pool-data-20260903080517.tgz`
+kept on the box for one backup cycle; delete by hand after.
+Next: user decisions (roster, R2 creds, api branch push), Phase B unchanged.

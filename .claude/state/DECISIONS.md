@@ -1848,3 +1848,35 @@ module-level session secret minted at import) and stays out of every pool.
 - **The migration is not one-command reversible.** Un-pooling means restoring
   each member's `data/` from a backup, dropping the overlay lines and syncing.
   `ams platform pool adopt` has no inverse (`pool evict` is not in scope).
+
+#### D29 addendum — live result and two post-cutover fixes (2026-09-03)
+
+**Facts (measured, racknerd, n=3 per side, `evidence/ams-measure.sh`, fleet idle):**
+Layer-1 cgroup sum 712 → 275 MiB; all services 866 → 464 MiB; Python
+processes 18 → 5; `pool-core` `memory.current` 133–134 MiB with 15 members
+(27 threads of a 288 `pids_max`); cold start to all members healthy 21 s
+(standalone fleet: 120–150 s); 13 members healthy, `resume` and
+`secretsservice` failed exactly as before pooling; M2M across the pool
+boundary verified; no route regressed. The memory projection in the Open
+section above is therefore confirmed; the sizing formulas are 4–10× generous
+and are left as ceilings.
+
+**Two adoption bugs found only live, both fixed with red-then-green tests on
+the box:** (1) `Path.is_dir()` on the pool-owned 0750 `data/` raised
+`PermissionError` (harness cannot stat into a member-uid dir) — every `Path`
+probe in `pool.py` now falls back to an admin-ns `find`, and "absent" is
+distinguished from "unlistable"; (2) the move acted on a pre-stop listing and
+WAL-mode SQLite drops `-wal`/`-shm` on clean stop, and a multi-argument `mv`
+is not atomic — each hop is now one `rename(2)` of the whole `data/` directory
+after the stop, with a resumable per-entry merge only when the target is not
+empty. *Rejected:* per-file moves with a post-stop re-list (still not atomic);
+stopping the whole fleet first (hides the defect behind procedure).
+
+**Two post-cutover fixes:** the `level-prefix` parser accepts `LEVEL [tag]
+name:` (uvicorn banners were escalated as ERROR on each pool start); a service
+that failed its health gate at an unchanged sha is held for 900 s instead of
+re-gated every tick (a no-op tick took ~3 min with two dead members).
+
+**Open:** the 900 s hold and the sizing formulas are starting values (n=1
+live observation each); latency coupling under load is unmeasured (one idle
+run: pool members 5.4 ms vs standalone control 5.8 ms via Caddy, n=20).
