@@ -324,19 +324,29 @@ def asyncio_run(coro: Any) -> Any:
 def test_check_uvicorn_api_refuses_a_stub_missing_server_lifespan(
     pool_runner: types.ModuleType,
 ) -> None:
+    """The real uvicorn 0.52.4 only sets ``Config.lifespan_class`` inside
+    ``load()`` and ``Server.lifespan`` by assignment (verified against its
+    source on the target host, spike-pool.md) -- so the check must actually
+    walk build+load+construct, not just ``hasattr`` the bare classes. This
+    stub mimics an incompatible uvicorn whose ``load()`` never sets
+    ``lifespan_class`` at all.
+    """
     stub = types.ModuleType("uvicorn")
 
     class _Config:
-        def load(self) -> None: ...
-        @property
-        def lifespan_class(self) -> Any:
-            return None
+        def __init__(self, app: Any, **kwargs: Any) -> None:
+            self.app = app
+
+        def load(self) -> None:
+            pass  # deliberately does not set self.lifespan_class
 
     class _Server:
+        def __init__(self, config: Any) -> None:
+            self.config = config
+
         def startup(self) -> None: ...
         def main_loop(self) -> None: ...
         def shutdown(self) -> None: ...
-        # deliberately missing `lifespan`
 
     stub.Config = _Config  # type: ignore[attr-defined]
     stub.Server = _Server  # type: ignore[attr-defined]
@@ -351,13 +361,15 @@ def test_check_uvicorn_api_accepts_a_complete_stub(pool_runner: types.ModuleType
     stub = types.ModuleType("uvicorn")
 
     class _Config:
-        def load(self) -> None: ...
-        @property
-        def lifespan_class(self) -> Any:
-            return None
+        def __init__(self, app: Any, **kwargs: Any) -> None:
+            self.app = app
+
+        def load(self) -> None:
+            self.lifespan_class = lambda config: object()
 
     class _Server:
-        lifespan = None
+        def __init__(self, config: Any) -> None:
+            self.config = config
 
         def startup(self) -> None: ...
         def main_loop(self) -> None: ...

@@ -371,21 +371,26 @@ def test_runner_refuses_a_stubbed_uvicorn_missing_the_internal_api(
     _run_uv(["venv", "-q", "--python", "3.12", str(stub_venv)], cwd=REPO_ROOT)
     site_packages = next((stub_venv / "lib").glob("python3.*")) / "site-packages"
     (site_packages / "uvicorn").mkdir(parents=True)
+    # `Config.load()` and construction both succeed (so the earlier checks
+    # pass), but the lifespan class it hands back is broken -- the failure
+    # this simulates is a real uvicorn whose lifespan machinery changed
+    # shape, not merely an absent method.
     (site_packages / "uvicorn" / "__init__.py").write_text(
-        "__version__ = '0.30.0'\n"
+        "class _BrokenLifespan:\n"
+        "    def __init__(self, config):\n"
+        "        raise RuntimeError('lifespan class unavailable')\n"
         "class Config:\n"
-        "    def load(self): ...\n"
-        "    @property\n"
-        "    def lifespan_class(self):\n"
-        "        return None\n"
+        "    def __init__(self, app, **kwargs):\n"
+        "        self.app = app\n"
+        "    def load(self):\n"
+        "        self.lifespan_class = _BrokenLifespan\n"
         "class Server:\n"
         "    def __init__(self, config):\n"
         "        self.config = config\n"
         "    def startup(self): ...\n"
         "    def main_loop(self): ...\n"
         "    def shutdown(self): ...\n"
-        # `lifespan` is deliberately not defined anywhere on this stub.
-        "\n",
+        "__version__ = '0.30.0'\n",
         encoding="utf-8",
     )
 

@@ -87,3 +87,11 @@ Ordering constraint for T10: do NOT push `ams-platform` to
 `<store>/upstream/api.git` before the new ams is deployed — the live overlay
 reader rejects the unknown `pool` key and the 60 s sync timer would mark all 15
 members failed.
+
+## Remote Linux suite after T1–T9 (2026-09-03, `remote-test.sh t10-live tests/linux`)
+117 passed / 5 failed in 341 s. The 4 pool-runner live tests failed (member
+ports never bound, `Connection refused`) — T2 diagnosing. The 5th,
+`test_cgroup.py::test_pids_max_caps_a_fork_storm`, failed in the full run and in
+the module run (with T2's remote provisioning running concurrently) but passed
+alone (n=3 total) — load-sensitive timing, same open signal as before, not a
+pools regression.

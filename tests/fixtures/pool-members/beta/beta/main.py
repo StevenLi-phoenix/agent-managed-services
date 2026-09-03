@@ -8,10 +8,18 @@ build-time-only reader would not see the change):
   "deliberately broken import/build" case: the runner must skip this member
   and keep serving the rest.
 - ``"lifespan"`` -- ``build_app()`` succeeds, but the *lifespan startup*
-  handler raises. Uvicorn turns a failed lifespan startup into
-  ``sys.exit(3)`` inside its own task (T0 finding 3, spike-pool.md); this is
-  the regression case for "the runner must catch ``SystemExit``, not just
-  ``Exception``, or one member's bad lifespan takes down the whole pool."
+  handler reports failure by sending ``lifespan.startup.failed`` (the ASGI
+  spec's own signal for this, and what Starlette/FastAPI send internally when
+  a real service's startup code raises). Uvicorn's ``LifespanOn`` turns that
+  into ``should_exit = True`` and ``Server.startup()`` calls ``sys.exit(3)``
+  (T0 finding 3, spike-pool.md; verified directly against uvicorn 0.52.4's
+  ``lifespan/on.py`` on the target host while chasing this fixture down --
+  a bare *raised* exception that never reaches ``send()`` at all is instead
+  swallowed by uvicorn's default ``lifespan="auto"`` as "protocol appears
+  unsupported", which is what a minimal hand-rolled ASGI app does if it just
+  raises, and is NOT what a real framework does). This is the regression case
+  for "the runner must catch ``SystemExit``, not just ``Exception``, or one
+  member's bad lifespan takes down the whole pool."
 - unset/anything else -- behaves exactly like ``alpha.main``.
 """
 
@@ -35,9 +43,16 @@ def build_app() -> Any:
                 message = await receive()
                 if message["type"] == "lifespan.startup":
                     if os.environ.get("BETA_BREAK") == "lifespan":
-                        raise RuntimeError(
-                            "beta forced to fail at lifespan startup (BETA_BREAK=lifespan)"
+                        await send(
+                            {
+                                "type": "lifespan.startup.failed",
+                                "message": (
+                                    "beta forced to fail at lifespan startup "
+                                    "(BETA_BREAK=lifespan)"
+                                ),
+                            }
                         )
+                        return
                     state["lifespan_name"] = os.environ["SVC_NAME"]
                     await send({"type": "lifespan.startup.complete"})
                 elif message["type"] == "lifespan.shutdown":

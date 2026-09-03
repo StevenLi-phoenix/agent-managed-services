@@ -233,28 +233,61 @@ def _apply_non_identity_union(members: list[dict[str, Any]]) -> None:
 
 # --------------------------------------------------------------------------- uvicorn pin
 
-_REQUIRED_UVICORN_API = (
-    ("Config", "load"),
-    ("Config", "lifespan_class"),
-    ("Server", "lifespan"),
-    ("Server", "startup"),
-    ("Server", "main_loop"),
-    ("Server", "shutdown"),
-)
+
+async def _noop_probe_app(scope: Any, receive: Any, send: Any) -> None:
+    """Never actually invoked -- exists only so ``_check_uvicorn_api`` can build
+    a throwaway ``Config``/``Server`` pair without touching a real member."""
+    return  # pragma: no cover
 
 
 def _check_uvicorn_api(uvicorn_module: Any) -> None:
     """Refuse to start against an uvicorn missing the internal API this runner
     pins to (PLAN-pool §4.4) -- a loud refusal at second zero beats a pool
-    that dies halfway through startup."""
+    that dies halfway through startup.
+
+    ``Config.lifespan_class`` and ``Server.lifespan`` are populated on the
+    *instance* by ``Config.load()`` and by our own assignment, not present on
+    the class -- verified directly against uvicorn 0.52.4's source on the
+    target host (``config.py``: ``self.lifespan_class = ...`` inside
+    ``load()``; ``server.py``: ``self.lifespan`` is never a class attribute).
+    A class-level ``hasattr`` for either would report "missing" even against
+    a fully compatible uvicorn, so this walks the real construction sequence
+    once against a no-op ASGI app that is never started or bound to a socket.
+    """
     version = getattr(uvicorn_module, "__version__", "unknown")
-    for cls_name, attr in _REQUIRED_UVICORN_API:
-        cls = getattr(uvicorn_module, cls_name, None)
-        if cls is None or not hasattr(cls, attr):
-            _fatal(
-                f"pool: uvicorn {version} lacks {cls_name}.{attr}; pool runner requires "
-                "the 0.52.x internal API"
-            )
+
+    def fail(attr: str) -> NoReturn:
+        _fatal(
+            f"pool: uvicorn {version} lacks {attr}; pool runner requires "
+            "the 0.52.x internal API"
+        )
+
+    config_cls = getattr(uvicorn_module, "Config", None)
+    server_cls = getattr(uvicorn_module, "Server", None)
+    if config_cls is None or not hasattr(config_cls, "load"):
+        fail("Config.load")
+    if server_cls is None or not all(
+        hasattr(server_cls, name) for name in ("startup", "main_loop", "shutdown")
+    ):
+        fail("Server.startup/main_loop/shutdown")
+
+    try:
+        config = config_cls(
+            _noop_probe_app, host="127.0.0.1", port=0, log_config=None, access_log=False
+        )
+        config.load()
+    except Exception:
+        fail("Config.load")
+    if not hasattr(config, "lifespan_class"):
+        fail("Config.lifespan_class")
+
+    try:
+        server = server_cls(config)
+        server.lifespan = config.lifespan_class(config)
+    except Exception:
+        fail("Server.lifespan")
+    if not hasattr(server, "lifespan"):
+        fail("Server.lifespan")
 
 
 # --------------------------------------------------------------------------- member lifecycle
@@ -289,7 +322,7 @@ def _build_member(member: dict[str, Any]) -> tuple[int, uvicorn.Server] | None:
             server.lifespan = config.lifespan_class(config)
     except (Exception, SystemExit) as exc:
         _log.error(
-            "pool: build failed: %s: %s", type(exc).__name__, exc, extra={"ams_member": mid}
+            "build failed: %s: %s", type(exc).__name__, exc, extra={"ams_member": mid}
         )
         return None
     return port, server
@@ -307,7 +340,7 @@ async def _startup_member(member: dict[str, Any], server: uvicorn.Server) -> boo
             await server.startup()
     except (Exception, SystemExit) as exc:
         _log.error(
-            "pool: startup failed: %s: %s", type(exc).__name__, exc, extra={"ams_member": mid}
+            "startup failed: %s: %s", type(exc).__name__, exc, extra={"ams_member": mid}
         )
         return False
     return True
@@ -322,7 +355,7 @@ async def _shutdown_member(member: dict[str, Any], server: uvicorn.Server) -> No
             await server.shutdown()
     except (Exception, SystemExit) as exc:
         _log.error(
-            "pool: shutdown failed: %s: %s", type(exc).__name__, exc, extra={"ams_member": mid}
+            "shutdown failed: %s: %s", type(exc).__name__, exc, extra={"ams_member": mid}
         )
 
 
@@ -400,7 +433,7 @@ async def _serve(doc: dict[str, Any]) -> int:
             failed[mid] = "startup failed"
 
     if not started:
-        _log.error("pool: no members started; exiting", extra={"ams_member": "pool"})
+        _log.error("no members started; exiting", extra={"ams_member": "pool"})
         return 1
 
     admin_app = make_admin_app(doc.get("pool", ""), started, failed)
@@ -415,7 +448,7 @@ async def _serve(doc: dict[str, Any]) -> int:
         await admin_server.startup()
     except (Exception, SystemExit) as exc:
         _log.error(
-            "pool: admin listener failed to start: %s: %s",
+            "admin listener failed to start: %s: %s",
             type(exc).__name__,
             exc,
             extra={"ams_member": "pool"},

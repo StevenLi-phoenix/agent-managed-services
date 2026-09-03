@@ -1,0 +1,9 @@
+== sample 1 07:40:51
+python_processes=19 layer1_sum_MiB=786 all_services_MiB=976 free_available_MiB=698 load=0.21
+time_health_via_caddy_ms=0.003261
+== sample 2 07:41:51
+python_processes=19 layer1_sum_MiB=757 all_services_MiB=939 free_available_MiB=556 load=0.72
+time_health_via_caddy_ms=0.003428
+== sample 3 07:42:52
+python_processes=19 layer1_sum_MiB=751 all_services_MiB=929 free_available_MiB=634 load=0.78
+time_health_via_caddy_ms=0.006842
