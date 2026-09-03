@@ -407,3 +407,108 @@ undo damage, and there is none: no data moved, no declaration removed, every
 member still serving. Reverting the mirror would only churn `llmgateway` back
 onto the older SDK. The overlays are left in place so the cutover can be
 retried the moment the fix lands.
+
+---
+
+## Step 5, second attempt — `_list_dir` fixed, adopt fails one step later (08:22–08:27 UTC)
+
+`e873270` deployed via `scripts/deploy-racknerd.sh` at ~08:22 by the owning
+task. Verified on the box: `_list_dir` now returns a `Listing` and its
+docstring names this cutover as the reason. Fleet recovery after the restart,
+polled every 30 s: 5 → 5 → 7 → 14 → **20 healthy at 150 s**, not healthy =
+`displayservice`, `oss`, `resume`, `secretsservice`. Same shape as the 08:00
+restart.
+
+`ams platform pool plan core` — unchanged, 15 members, 65 planned actions
+(30 database moves, 20 secret copies, 15 declaration removals).
+
+### The first defect is fixed
+
+`ams platform pool adopt core` now walks past the pool root's 0750 `data/`
+and reports, for all 15 members:
+
+```
+INFO ams.platform.pool: pool-core: /home/harness/store/state/services/pool-core/root/data/commentservice does not exist (find rc=1); it holds nothing
+```
+
+Absent is distinguished from unlistable, exactly as intended. `_ensure_pool_dirs`
+then created all 15 `<pool-root>/data/<member>` directories.
+
+### The second defect
+
+```
+ERROR SpawnError: mv -n -t /home/harness/store/state/platform/adopt/commentservice -- .../commentservice.db .../commentservice.db-shm .../commentservice.db-wal exited 1: mv: cannot stat '.../commentservice.db-shm': No such file or directory
+mv: cannot stat '.../commentservice.db-wal': No such file or directory
+```
+
+`adopt()` computes the plan once, before the member loop, while every member is
+**running** — so a WAL-mode SQLite database contributes three names
+(`.db`, `.db-shm`, `.db-wal`). Inside the loop `_stop_member` stops the member,
+SQLite checkpoints on clean shutdown and **deletes `-shm` and `-wal`**, and
+`_move_member_data` then moves the pre-stop list:
+
+```
+src/ams/platform/pool.py:783   sources = [str(member.legacy_data / name) for name in member.data_entries]
+src/ams/platform/pool.py:784   run.run_admin_fn(["mv", "-n", "-t", str(staging), "--", *sources], block).check()
+```
+
+Confirmed on the box at the moment of failure: `kvservice` and `logservice`
+(running) each hold `.db` + `.db-shm` + `.db-wal`; `commentservice` (just
+stopped) held none. Deterministic, not a race — all 10 members with a database
+will fail their own `mv`, one per invocation.
+
+Full analysis, three ranked fix candidates, and the rejected operator
+workaround are in **`.claude/state/diagnosis-pool-cutover.md`**. Nothing under
+`src/` touched, nothing patched on the box.
+
+### Blast radius: one service, recovered, no data lost
+
+`mv` is not atomic across its arguments: `commentservice.db` was moved into the
+staging directory before `mv` hit the missing names. The abort left
+`commentservice` stopped with `desired=down`, an empty `data/`, and its
+database parked in `<state>/platform/adopt/commentservice/`. The two-hop
+staging design is what kept the data.
+
+Recovered as root, no code involved:
+
+```
+mv -n /home/harness/store/state/platform/adopt/commentservice/commentservice.db \
+      /home/harness/store/state/services/commentservice/root/data/commentservice.db
+rmdir /home/harness/store/state/platform/adopt/commentservice
+ams ctl start commentservice
+```
+
+The parked file was already `108192:108192`, 57344 bytes, mtime 02:06 —
+byte-size and mtime identical to the copy inside
+`/var/lib/ams/pre-pool-data-20260903080517.tgz`, so the snapshot was not
+needed. `commentservice` `/health` on `127.0.0.1:20004` → 200.
+
+`ams ctl status` after recovery: **20 running + healthy**, not healthy =
+`displayservice`, `oss`, `resume`, `secretsservice` — identical to step 1.
+
+| check | result |
+| --- | --- |
+| 15 member `service.toml` declarations | all present |
+| `commentservice/root/data/commentservice.db` | restored, 57344 bytes |
+| `<state>/platform/adopt/` | empty |
+| `<state>/secrets/pool-core` | does not exist |
+| `<pool-root>/data/<member>` × 15 | created, empty, correctly owned — left in place |
+
+## Steps 6–9 — still not reached
+
+The pool was never declared and never started. No pool process, no pool cgroup,
+no `/_pool/health`, no member routed through a pool port. The "after" column of
+the measurement table in `docs/platform-pools.md` remains unmeasured and is
+marked blocked, not pending.
+
+## Host state left behind (unchanged from the first attempt except where noted)
+
+| item | state |
+| --- | --- |
+| ams code on `/home/harness/ams` | `e873270`, deployed, harness active |
+| `<store>/upstream/api.git` `ams-platform` | `c8b1fff30428…` — overlays live |
+| `ams-platform-sync.timer` | **STOPPED** (still) |
+| `ams-harness.service` | active, 20 running + healthy |
+| `commentservice` | stopped and restarted during the failed adopt; healthy |
+| pool root | staged, provisioned venv, 15 empty `data/<member>` dirs, no declaration, never started |
+| data snapshot | `/var/lib/ams/pre-pool-data-20260903080517.tgz`, still unused |

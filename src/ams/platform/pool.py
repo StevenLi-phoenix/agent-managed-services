@@ -35,8 +35,8 @@ member's block and the pool's ``data/`` by the pool's, so no single admin
 namespace holds CAP_DAC_OVERRIDE over both directories, and a direct ``mv``
 fails with EACCES on whichever end is unmapped. The move therefore runs as:
 
-    <member-root>/data/*  --(member block)-->  <state>/platform/adopt/<member>/
-    <state>/platform/adopt/<member>/*  --(pool block)-->  <pool-root>/data/<member>/
+    <member-root>/data  --(member block)-->  <state>/platform/adopt/<member>/data
+    <state>/platform/adopt/<member>/data  --(pool block)-->  <pool-root>/data/<member>
 
 Both hops are renames on one filesystem, so a 2 GiB database moves in constant
 time and is never copied. The staging directory is owned by the harness, which
@@ -45,9 +45,23 @@ teaching ``run_admin`` to map two blocks at once, was rejected: it widens the
 privilege of every admin fork in the harness to fix one operation that runs
 once per pool in the lifetime of the fleet.
 
-A run that dies between the hops leaves files in the staging directory. The next
-run drains them into the pool before it looks at the member's own ``data/``,
-which is what makes a half-finished adoption recoverable by re-running it.
+**Why each hop moves the directory rather than its files.** A rename of one
+directory is atomic and carries whatever is inside it, so nothing here ever
+acts on a list of names captured earlier. That matters because the plan is
+computed while the fleet is still *running*: a WAL-mode SQLite service has
+``x.db``, ``x.db-wal`` and ``x.db-shm`` on disk, and deletes the last two when
+it shuts down cleanly, so a name list taken before ``_stop_member`` names two
+files that no longer exist by the time the move runs. Moving them failed, and
+because a multi-argument ``mv`` is not atomic it failed *after* moving the
+database -- one member left down with an empty ``data/`` and its database in
+the staging directory. Both halves of that are in
+`.claude/state/diagnosis-pool-cutover.md`.
+
+A run that dies between the hops leaves the member's ``data/`` parked in the
+staging directory, and the next run finishes the second hop from there. The
+member's own ``data/`` is recreated empty and handed back to its uid, so the
+legacy root keeps the shape a service root has (`<root>/data` is
+``AMS_DATA_DIR``) and an operator can put a database back by hand.
 """
 
 from __future__ import annotations
@@ -88,6 +102,10 @@ EXIT_PRECONDITION = 2
 #: Where the two-hop move parks files between namespaces. Harness-owned, 0700,
 #: on the same filesystem as both roots so every hop is a rename.
 ADOPT_DIRNAME = "adopt"
+#: The member's whole ``data/`` is renamed to ``<staging>/data`` and then
+#: renamed again into the pool root. One directory, two renames, no name list:
+#: see :func:`_move_member_data`.
+PAYLOAD_DIRNAME = "data"
 STAGING_MODE = 0o700
 DATA_DIR_MODE = 0o750
 SECRET_FILE_MODE = 0o600
@@ -478,8 +496,19 @@ def plan(
         legacy_root = state.service_root(member)
         legacy = legacy_root / DATA_DIRNAME
         listing = _list_dir(legacy, service_id=member, uids=uids, run_admin_fn=run_admin_fn)
-        staged = _list_dir(
-            staging_dir(state, member), service_id=member, uids=uids, run_admin_fn=run_admin_fn
+        # Two shapes of interrupted run: this build parks the member's whole
+        # `data/` as `<staging>/data`, the build that failed on racknerd parked
+        # loose files directly in `<staging>`. Both are reported, and both are
+        # drained by the next adoption.
+        staging = staging_dir(state, member)
+        parked = _list_dir(
+            staging / PAYLOAD_DIRNAME, service_id=member, uids=uids, run_admin_fn=run_admin_fn
+        )
+        loose = _list_dir(staging, service_id=member, uids=uids, run_admin_fn=run_admin_fn)
+        staged_names = tuple(
+            sorted(
+                set(parked.entries) | {n for n in loose.entries if n != PAYLOAD_DIRNAME}
+            )
         )
         # Names only: which of the member's secrets still need a copy under the
         # pool id, and which the pool already has (sync generates SVC_SECRET__X
@@ -499,7 +528,7 @@ def plan(
                 legacy_data=legacy,
                 target_data=pool_root / DATA_DIRNAME / member,
                 data_entries=listing.entries,
-                staged_entries=staged.entries,
+                staged_entries=staged_names,
                 data_readable=listing.readable,
                 secrets=pairs_full,
                 secrets_present=present,
@@ -769,56 +798,190 @@ def _stop_member(run: _Adoption, member: MemberPlan) -> None:
 
 
 def _move_member_data(run: _Adoption, member: MemberPlan) -> None:
-    """The two-hop move. See the module docstring for why there are two."""
-    staging = staging_dir(run.state, member.id)
-    if member.data_entries:
-        try:
-            staging.mkdir(parents=True, exist_ok=True)
-            os.chmod(staging, STAGING_MODE)
-        except OSError as e:
-            raise PoolAdoptError(
-                f"{member.id}: cannot prepare the staging directory {staging}: {e}"
-            ) from None
-        block = run.uids.allocate(member.id)
-        sources = [str(member.legacy_data / name) for name in member.data_entries]
-        run.run_admin_fn(["mv", "-n", "-t", str(staging), "--", *sources], block).check()
-        run.run_admin_fn(["chown", "-R", "0:0", str(staging)], block).check()
-        log.info(
-            "%s: moved %d entr(ies) out of %s into the staging directory",
-            member.id,
-            len(sources),
-            member.legacy_data,
-        )
+    """The two-hop move: one ``rename(2)`` per hop, both after the stop.
 
-    # The staging directory is harness-owned, so the fast path answers here --
-    # but it is read through the same guarded helper as everything else, because
-    # a run that died mid-chown can leave it owned by a uid this process is not.
-    parked = _list_dir(
-        staging, service_id=member.id, uids=run.uids, run_admin_fn=run.run_admin_fn
-    )
-    if not parked.exists:
+    Neither hop takes a list of names from the plan. The plan is a forecast made
+    against a *running* fleet, and a WAL-mode SQLite service is three files
+    while it runs (``x.db``, ``x.db-wal``, ``x.db-shm``) and one file once it has
+    shut down cleanly -- so a name list captured before ``_stop_member`` is stale
+    by construction, and moving it fails on the two files the stop deleted. That
+    is the second failure in `.claude/state/diagnosis-pool-cutover.md`.
+
+    Moving the *directory* removes the question. Each hop is a single rename, so
+    it either happened or it did not: there is no half-moved database, and an
+    interrupted adoption is resumed by running it again.
+    """
+    _hop_out_of_the_member_root(run, member)
+    _hop_into_the_pool_root(run, member)
+
+
+def _hop_out_of_the_member_root(run: _Adoption, member: MemberPlan) -> None:
+    """``<member-root>/data`` -> ``<staging>/data``, in the member's namespace.
+
+    One ``mv -T``: a rename of the whole directory, whatever is in it at this
+    moment. The member's ``data/`` is then recreated empty and handed back to
+    the member's uid -- the legacy root is never deleted (§5.8) and a service
+    root without its ``AMS_DATA_DIR`` is not a service root.
+    """
+    staging = staging_dir(run.state, member.id)
+    payload = staging / PAYLOAD_DIRNAME
+    if _list_dir(
+        payload, service_id=member.id, uids=run.uids, run_admin_fn=run.run_admin_fn
+    ).exists:
+        log.info(
+            "%s: an earlier run already parked its data in %s; resuming there", member.id, payload
+        )
         return
+
+    # Re-listed here, after the stop, and never taken from the plan.
+    live = _list_dir(
+        member.legacy_data, service_id=member.id, uids=run.uids, run_admin_fn=run.run_admin_fn
+    )
+    if not live.readable:
+        raise PoolAdoptError(
+            f"{member.id}: cannot list {member.legacy_data} now that it is stopped; "
+            "refusing to move a directory whose contents are unknown"
+        )
+    if not live.exists or not live.entries:
+        log.info("%s: %s holds nothing; there is no data to adopt", member.id, member.legacy_data)
+        return
+    if live.entries != member.data_entries:
+        # Expected, not alarming: this is what a clean SQLite shutdown looks like.
+        log.info(
+            "%s: %s changed between the plan and the stop (%s -> %s); moving what is there now",
+            member.id,
+            member.legacy_data,
+            list(member.data_entries),
+            list(live.entries),
+        )
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+        os.chmod(staging, STAGING_MODE)
+    except OSError as e:
+        raise PoolAdoptError(
+            f"{member.id}: cannot prepare the staging directory {staging}: {e}"
+        ) from None
+
+    block = run.uids.allocate(member.id)
+    run.run_admin_fn(["mv", "-T", str(member.legacy_data), str(payload)], block).check()
+    # Hand the payload to the harness: it is inner 0 in *both* namespaces, and
+    # the pool's namespace cannot even chown a file owned by an unmapped uid.
+    run.run_admin_fn(["chown", "-R", "0:0", str(payload)], block).check()
+    run.run_admin_fn(
+        ["mkdir", "-m", oct(DATA_DIR_MODE)[2:], "-p", str(member.legacy_data)], block
+    ).check()
+    run.run_admin_fn(
+        ["chown", f"{INNER_UID}:{INNER_GID}", str(member.legacy_data)], block
+    ).check()
+    run.actions.append(f"data-out:{member.id}")
+    log.info(
+        "%s: %s moved to %s in one rename (%d entr(ies)); an empty data/ left behind",
+        member.id,
+        member.legacy_data,
+        payload,
+        len(live.entries),
+    )
+
+
+def _hop_into_the_pool_root(run: _Adoption, member: MemberPlan) -> None:
+    """``<staging>/data`` -> ``<pool-root>/data/<member>``, in the pool's namespace.
+
+    ``_ensure_pool_dirs`` pre-created the target empty, and ``mv -T`` onto an
+    empty directory is a rename, so the normal path is again one atomic step. A
+    target that already holds something (an interrupted earlier adoption, or a
+    pool that has already run) cannot be renamed onto, so those are merged entry
+    by entry -- never overwriting, and re-checked against what is on disk now
+    rather than against the plan.
+    """
+    staging = staging_dir(run.state, member.id)
+    payload = staging / PAYLOAD_DIRNAME
+    parked = _list_dir(
+        payload, service_id=member.id, uids=run.uids, run_admin_fn=run.run_admin_fn
+    )
     if not parked.readable:
         raise PoolAdoptError(
-            f"{member.id}: cannot list the staging directory {staging}; its contents belong to "
-            "an interrupted adoption and must be moved into the pool root by hand"
+            f"{member.id}: cannot list {payload}; its contents belong to an interrupted "
+            "adoption and must be moved into the pool root by hand"
         )
-    staged = list(parked.entries)
-    if not staged:
+    if parked.exists:
+        _land(run, member, payload, parked.entries)
+
+    # A flat staging directory is what the build that failed on racknerd could
+    # leave behind. It is drained the same way, so recovering from that build
+    # needs nothing but a re-run of this one.
+    loose = _list_dir(
+        staging, service_id=member.id, uids=run.uids, run_admin_fn=run.run_admin_fn
+    )
+    names = tuple(n for n in loose.entries if n != PAYLOAD_DIRNAME)
+    if loose.exists and names:
+        _merge(run, member, staging, names)
+    if loose.exists:
         _rmdir(staging)
+
+
+def _land(run: _Adoption, member: MemberPlan, payload: Path, entries: Sequence[str]) -> None:
+    """Put the parked directory in the pool root, whole if it can be."""
+    existing = _list_dir(
+        member.target_data, service_id=run.pool_id, uids=run.uids, run_admin_fn=run.run_admin_fn
+    )
+    if not existing.readable:
+        raise PoolAdoptError(
+            f"{member.id}: {member.target_data} exists but cannot be listed; refusing to move "
+            "data into a directory whose contents are unknown"
+        )
+    if existing.entries:
+        _merge(run, member, payload, entries)
+        _rmdir(payload)
         return
-    pool_block = run.pool_block
+    if not entries:
+        _rmdir(payload)
+        return
+    run.run_admin_fn(["mv", "-T", str(payload), str(member.target_data)], run.pool_block).check()
     run.run_admin_fn(
-        ["mv", "-n", "-t", str(member.target_data), "--", *[str(staging / n) for n in staged]],
-        pool_block,
+        ["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(member.target_data)], run.pool_block
     ).check()
-    run.run_admin_fn(
-        ["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(member.target_data)], pool_block
-    ).check()
-    _rmdir(staging)
-    for name in staged:
+    for name in entries:
         run.moved.append(f"{member.id}:{name}")
         log.info("%s: %s is now %s", member.id, name, member.target_data / name)
+    run.actions.append(f"data:{member.id}")
+
+
+def _merge(run: _Adoption, member: MemberPlan, source: Path, names: Sequence[str]) -> None:
+    """Move entries one by one into a target that already holds something.
+
+    ``-n`` plus the overlap check below means a file in the pool root is never
+    replaced; anything that could not move stays in the staging directory, which
+    is what makes a partial merge resumable rather than lost.
+    """
+    if not names:
+        return
+    existing = _list_dir(
+        member.target_data, service_id=run.pool_id, uids=run.uids, run_admin_fn=run.run_admin_fn
+    )
+    clash = sorted(set(existing.entries) & set(names))
+    if clash:
+        raise PoolAdoptError(
+            f"{member.id}: {member.target_data} already holds {clash}; adoption will not "
+            "overwrite a database. Move or delete the copy in the pool root by hand, then "
+            "run adopt again."
+        )
+    run.run_admin_fn(
+        ["mv", "-n", "-t", str(member.target_data), "--", *[str(source / n) for n in names]],
+        run.pool_block,
+    ).check()
+    run.run_admin_fn(
+        ["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(member.target_data)], run.pool_block
+    ).check()
+    left = _list_dir(source, service_id=member.id, uids=run.uids, run_admin_fn=run.run_admin_fn)
+    if left.entries:
+        raise PoolAdoptError(
+            f"{member.id}: {sorted(left.entries)} could not be moved out of {source}; they are "
+            "still there and a second 'pool adopt' will retry them"
+        )
+    for name in names:
+        if f"{member.id}:{name}" not in run.moved:
+            run.moved.append(f"{member.id}:{name}")
+            log.info("%s: %s is now %s", member.id, name, member.target_data / name)
     run.actions.append(f"data:{member.id}")
 
 

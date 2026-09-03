@@ -53,7 +53,7 @@ from ams.platform.sync import (
 from ams.platform.translate import mangle_member
 from ams.runtime import RuntimeStore, python_venv_dir
 from ams.secrets import store_for
-from ams.spawn import DATA_DIRNAME
+from ams.spawn import DATA_DIRNAME, INNER_GID, INNER_UID
 from ams.state import StateDir
 from ams.uidmap import UidBlock
 from ams.userns import AdminResult
@@ -94,11 +94,16 @@ class FakeAdmin:
         self.chowns: list[tuple[str, str]] = []
         #: Paths that exist but that even the admin namespace cannot enumerate.
         self.unlistable: set[str] = set()
+        #: Substrings; any call whose argv contains one exits non-zero, which is
+        #: how a hop is interrupted halfway through a test.
+        self.fail_on: set[str] = set()
 
     def __call__(self, argv: Any, block: UidBlock, **_kw: Any) -> AdminResult:
         args = tuple(str(a) for a in argv)
         self.calls.append(args)
         self.blocks.append(block)
+        if any(needle in " ".join(args) for needle in self.fail_on):
+            return AdminResult(argv=args, returncode=1, stdout=b"", stderr=b"injected failure")
         handler = {
             "mkdir": self._mkdir,
             "chown": self._chown,
@@ -173,6 +178,18 @@ class FakeAdmin:
     def _mv(self, args: tuple[str, ...]) -> AdminResult:
         no_clobber = "-n" in args
         rest = [a for a in args[1:] if a != "-n"]
+        if "-T" in rest:
+            # `mv -T src dst`: one rename(2). Onto an absent or empty directory
+            # it succeeds; onto a non-empty one the kernel says ENOTEMPTY.
+            src, dst = rest[rest.index("-T") + 1], rest[rest.index("-T") + 2]
+            if os.path.isdir(dst) and os.listdir(dst):
+                return AdminResult(
+                    argv=args, returncode=1, stdout=b"", stderr=b"Directory not empty"
+                )
+            if os.path.isdir(dst):
+                os.rmdir(dst)
+            os.rename(src, dst)
+            return self._ok(args)
         dest = Path(rest[rest.index("-t") + 1])
         sources = rest[rest.index("--") + 1 :]
         for src in sources:
@@ -203,6 +220,10 @@ class FakeControl:
         self.rows = rows if rows is not None else {}
         self.up = up
         self.stopped: list[str] = []
+        #: What stopping the member does to its data directory. A WAL-mode
+        #: SQLite service checkpoints and deletes `-wal`/`-shm` on a clean
+        #: shutdown, so the disk after the stop is not the disk the plan saw.
+        self.on_stop: Any = None
 
     def status(self) -> dict[str, Any]:
         if not self.up:
@@ -218,6 +239,8 @@ class FakeControl:
             raise ControlError("no harness listening on /nowhere/control.sock")
         self.stopped.append(service_id)
         self.rows[service_id] = {"status": "stopped", "pid": None}
+        if self.on_stop is not None:
+            self.on_stop(service_id)
         return {"ok": True}
 
 
@@ -670,7 +693,13 @@ def test_adopt_refuses_when_the_destination_already_holds_that_name(fleet: Fleet
 
 
 def test_a_crashed_adopt_finishes_the_move_on_the_next_run(fleet: Fleet) -> None:
-    """A file left in the staging directory is drained, not orphaned."""
+    """A file left loose in the staging directory is drained, not orphaned.
+
+    That flat layout is what the build deployed on racknerd during the failed
+    cutover could leave behind; the payload directory below is what this build
+    writes. Both are drained, because the recovery path has to work against the
+    state the *previous* build could produce.
+    """
     staging = pool_mod.staging_dir(fleet.state, "alpha")
     staging.mkdir(parents=True)
     (staging / "leftover.db").write_bytes(b"half-adopted")
@@ -679,6 +708,126 @@ def test_a_crashed_adopt_finishes_the_move_on_the_next_run(fleet: Fleet) -> None
 
     assert (pool_data(fleet, "alpha") / "leftover.db").read_bytes() == b"half-adopted"
     assert not staging.exists()
+
+
+# ------------------------------------------------------ the stop changes the disk
+#
+# Second live blocker (`.claude/state/diagnosis-pool-cutover.md`, second half):
+# `adopt` planned against a *running* fleet and then moved that name list after
+# stopping the member. A WAL-mode SQLite database is three files while the
+# service runs and one file once it has shut down cleanly, so the list was
+# stale by construction -- and a multi-argument `mv` is not atomic, so the
+# abort left one database in the staging directory and the member down.
+
+
+def wal_sidecars(fleet: Fleet, member: str) -> list[Path]:
+    return [legacy_data(fleet, member) / f"{member}.db{s}" for s in ("-wal", "-shm")]
+
+
+def running_with_wal(fleet: Fleet) -> None:
+    """Every member up, each holding a `.db` plus a live `-wal`/`-shm` pair."""
+    for i, member in enumerate(MEMBERS):
+        for path in wal_sidecars(fleet, member):
+            path.write_bytes(b"write-ahead log")
+        fleet.control.rows[member] = {"status": "running", "pid": 4000 + i}
+
+    def clean_shutdown(member: str) -> None:
+        for path in wal_sidecars(fleet, member):
+            path.unlink(missing_ok=True)
+
+    fleet.control.on_stop = clean_shutdown
+
+
+def test_the_move_acts_on_the_post_stop_directory_not_on_the_plan(fleet: Fleet) -> None:
+    running_with_wal(fleet)
+    before = plan(fleet.state, POOL, uids=fleet.uids, run_admin_fn=fleet.admin)
+    assert before.members[0].data_entries == ("alpha.db", "alpha.db-shm", "alpha.db-wal")
+
+    report = run_adopt(fleet)
+
+    for member in MEMBERS:
+        assert (pool_data(fleet, member) / f"{member}.db").read_bytes() == (
+            b"SQLite format 3\x00" + member.encode()
+        )
+        for name in (f"{member}.db-wal", f"{member}.db-shm"):
+            assert not (pool_data(fleet, member) / name).exists(), "checkpointed away by the stop"
+    assert sorted(report.moved) == [f"{m}:{m}.db" for m in MEMBERS]
+
+
+def test_a_member_whose_data_vanishes_entirely_at_the_stop_is_a_no_op(fleet: Fleet) -> None:
+    """The extreme of the same staleness: nothing left to move, so move nothing."""
+    fleet.control.rows = {m: {"status": "running", "pid": 7} for m in MEMBERS}
+
+    def wipe(member: str) -> None:
+        for path in legacy_data(fleet, member).iterdir():
+            path.unlink()
+
+    fleet.control.on_stop = wipe
+
+    report = run_adopt(fleet)
+
+    assert report.moved == ()
+    assert sorted(report.declarations_removed) == list(MEMBERS)
+    assert len(report.secrets_copied) == len(SECRET_VALUES)
+
+
+def test_an_empty_legacy_data_dir_is_a_clean_no_op(fleet: Fleet) -> None:
+    for member in MEMBERS:
+        (legacy_data(fleet, member) / f"{member}.db").unlink()
+
+    report = run_adopt(fleet)
+
+    assert report.moved == ()
+    assert report.noop is False  # the declarations and the secrets are still work
+    for member in MEMBERS:
+        assert legacy_data(fleet, member).is_dir()
+
+
+def test_the_members_data_dir_is_left_in_place_empty_and_still_its_own(fleet: Fleet) -> None:
+    """The move takes the directory, so it is put back: an empty, member-owned data/."""
+    run_adopt(fleet)
+
+    for member in MEMBERS:
+        data = legacy_data(fleet, member)
+        assert data.is_dir()
+        assert list(data.iterdir()) == []
+        assert (f"{INNER_UID}:{INNER_GID}", str(data)) in fleet.admin.chowns
+    assert not (pool_mod.staging_dir(fleet.state, "alpha")).exists()
+
+
+def test_a_failed_second_hop_parks_the_data_and_the_next_run_finishes_it(fleet: Fleet) -> None:
+    """The first hop is a rename, so an interrupted adoption is always resumable."""
+    from ams.userns import SpawnError
+
+    parked = pool_mod.staging_dir(fleet.state, "alpha") / pool_mod.PAYLOAD_DIRNAME
+    # Only the second hop fails; the first has already renamed the directory.
+    fleet.admin.fail_on.add(f"mv -T {parked} {pool_data(fleet, 'alpha')}")
+
+    with pytest.raises(SpawnError):
+        run_adopt(fleet)
+
+    assert (parked / "alpha.db").read_bytes() == b"SQLite format 3\x00alpha"
+    assert list(legacy_data(fleet, "alpha").iterdir()) == [], "the whole directory moved at once"
+
+    fleet.admin.fail_on.clear()
+    report = run_adopt(fleet)
+
+    assert (pool_data(fleet, "alpha") / "alpha.db").read_bytes() == b"SQLite format 3\x00alpha"
+    assert "alpha:alpha.db" in report.moved
+    assert not pool_mod.staging_dir(fleet.state, "alpha").exists()
+
+
+def test_a_non_empty_target_with_different_names_is_merged_not_clobbered(fleet: Fleet) -> None:
+    """The whole-directory rename cannot land on a non-empty target, so it merges."""
+    target = pool_data(fleet, "alpha")
+    target.mkdir(parents=True)
+    (target / "unrelated.db").write_bytes(b"already in the pool")
+
+    report = run_adopt(fleet)
+
+    assert (target / "alpha.db").read_bytes() == b"SQLite format 3\x00alpha"
+    assert (target / "unrelated.db").read_bytes() == b"already in the pool"
+    assert "alpha:alpha.db" in report.moved
 
 
 def test_adopt_dry_run_is_exactly_plan(fleet: Fleet) -> None:

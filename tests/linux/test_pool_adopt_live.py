@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -167,6 +168,90 @@ def _make_legacy_member(state: StateDir, member: str) -> Path:
     return db
 
 
+#: A member that really is running: it opens its database in WAL mode, commits
+#: rows that therefore live in the `-wal` file rather than in the `.db`, and
+#: waits for SIGTERM. On SIGTERM it closes the connection, which is what makes
+#: SQLite checkpoint the WAL into the database and delete `-wal`/`-shm` -- the
+#: disk change between plan time and move time that broke the live cutover.
+HOLDER = """
+import signal, sqlite3, sys, time
+db = sys.argv[1]
+conn = sqlite3.connect(db)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("CREATE TABLE IF NOT EXISTS rows (id INTEGER PRIMARY KEY, note TEXT)")
+conn.executemany(
+    "INSERT INTO rows (note) VALUES (?)", [(f"row-{i}",) for i in range(int(sys.argv[2]))]
+)
+conn.commit()
+def bye(*_a):
+    conn.close()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, bye)
+print("ready", flush=True)
+while True:
+    time.sleep(0.2)
+"""
+HOLDER_ROWS = 25
+
+
+def _make_running_member(state: StateDir, member: str) -> tuple[Path, subprocess.Popen[str]]:
+    """A legacy root whose service is *up*, holding a WAL-mode database open.
+
+    Its ``data/`` is handed to the harness rather than to the member's block --
+    the one deliberate deviation from the real layout in this module, and it
+    buys the thing that matters here: a real long-lived process really holding a
+    real ``-wal``/``-shm`` pair open. ``beta`` keeps the true cross-block
+    ownership, so nothing is lost from the coverage of the other failure.
+    """
+    root = state.service_root(member)
+    block = MEMBER_BLOCKS[member]
+    ensure_service_root(root, block)
+    data = root / DATA_DIRNAME
+    run_admin(["chown", "-R", "0:0", str(data)], block).check()
+    db = data / f"{member}.db"
+    holder: subprocess.Popen[str] = subprocess.Popen(
+        [sys.executable, "-c", HOLDER, str(db), str(HOLDER_ROWS)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout is not None
+    line = holder.stdout.readline().strip()
+    if line != "ready":  # pragma: no cover - a broken fixture
+        holder.kill()
+        errors = holder.stderr.read() if holder.stderr else ""
+        raise AssertionError(f"holder did not start: {line!r} {errors}")
+    for suffix in ("-wal", "-shm"):
+        assert (data / f"{member}.db{suffix}").exists(), f"expected a live {suffix} file"
+    state.service_decl_path(member).write_text(f'id = "{member}"\n', encoding="utf-8")
+    return db, holder
+
+
+class HolderControl:
+    """The control socket, standing in for a supervisor that owns the holder.
+
+    ``stop`` really terminates the process, so the ``-wal``/``-shm`` files
+    really disappear between the plan and the move -- which is the whole point.
+    """
+
+    def __init__(self, running: dict[str, subprocess.Popen[str]]) -> None:
+        self.running = running
+        self.rows = {m: {"status": "running", "pid": p.pid} for m, p in running.items()}
+        self.stopped: list[str] = []
+
+    def status(self) -> dict[str, Any]:
+        return {"ok": True, "services": dict(self.rows)}
+
+    def stop(self, service_id: str) -> dict[str, Any]:
+        process = self.running.get(service_id)
+        if process is not None:
+            process.terminate()
+            process.wait(timeout=30)
+        self.stopped.append(service_id)
+        self.rows[service_id] = {"status": "stopped", "pid": None}
+        return {"ok": True}
+
+
 def _stat_in_pool_ns(path: Path) -> tuple[int, str]:
     """``(uid, mode)`` as seen from the pool's admin namespace.
 
@@ -234,37 +319,59 @@ def _sqlite_rw_as_pool_uid(db: Path) -> str:
 
 @pytest.fixture(scope="module")
 def adopted() -> Any:
-    """One real adoption, shared by the assertions below."""
+    """One real adoption against one running member and one stopped member."""
     state = _state()
     state.service_dir(POOL_ID).mkdir(parents=True, exist_ok=True)
     _make_staged_pool_root(state)
-    for member in MEMBERS:
-        _make_legacy_member(state, member)
+    _db, holder = _make_running_member(state, "alpha")
+    _make_legacy_member(state, "beta")
     SecretStore(state.root).set("alpha", "SVC_SECRET", SECRET_VALUE)
     _write_platform_state(state)
 
-    # The harness genuinely cannot see into the member's data dir: that is the
+    # The harness genuinely cannot see into beta's data dir: that is the
     # precondition that makes the admin-ns listing load-bearing rather than a
     # fallback nothing exercises.
     with pytest.raises(PermissionError):
-        list((state.service_root("alpha") / DATA_DIRNAME).iterdir())
+        list((state.service_root("beta") / DATA_DIRNAME).iterdir())
 
-    before = plan(state, POOL, uids=Uids(), run_admin_fn=run_admin)
-    report = adopt(state, POOL, uids=Uids(), run_admin_fn=run_admin)
-    after = plan(state, POOL, uids=Uids(), run_admin_fn=run_admin)
+    control = HolderControl({"alpha": holder})
+    try:
+        before = plan(state, POOL, uids=Uids(), run_admin_fn=run_admin, control=control)
+        report = adopt(state, POOL, uids=Uids(), run_admin_fn=run_admin, control=control)
+        after = plan(state, POOL, uids=Uids(), run_admin_fn=run_admin)
+    finally:
+        if holder.poll() is None:  # pragma: no cover - only on a failed adoption
+            holder.kill()
+            holder.wait(timeout=10)
     _make_traversable(state)
-    return state, before, report, after
+    return state, before, report, after, control
 
 
-def test_the_plan_sees_the_databases_through_the_admin_namespace(adopted: Any) -> None:
-    _state_dir, before, _report, _after = adopted
+def test_the_plan_of_a_running_member_names_its_wal_files(adopted: Any) -> None:
+    """The plan is a forecast taken against a running fleet -- three files, not one."""
+    _state_dir, before, _report, _after, _control = adopted
     alpha = next(m for m in before.members if m.id == "alpha")
     assert alpha.data_readable is True
-    assert alpha.data_entries == ("alpha.db",)
+    assert alpha.data_entries == ("alpha.db", "alpha.db-shm", "alpha.db-wal")
+
+
+def test_the_plan_sees_a_stopped_members_database_through_the_admin_namespace(
+    adopted: Any,
+) -> None:
+    _state_dir, before, _report, _after, _control = adopted
+    beta = next(m for m in before.members if m.id == "beta")
+    assert beta.data_readable is True
+    assert beta.data_entries == ("beta.db",)
+
+
+def test_adoption_stopped_the_running_member_before_moving_it(adopted: Any) -> None:
+    _state_dir, _before, _report, _after, control = adopted
+    assert control.stopped == ["alpha"]
+    assert control.running["alpha"].poll() is not None, "the holder really exited"
 
 
 def test_every_members_database_lands_in_the_pool_root(adopted: Any) -> None:
-    state, _before, report, _after = adopted
+    state, _before, report, _after, _control = adopted
     assert sorted(report.moved) == [f"{m}:{m}.db" for m in MEMBERS]
     for member in MEMBERS:
         db = state.service_root(POOL_ID) / DATA_DIRNAME / member / f"{member}.db"
@@ -272,26 +379,56 @@ def test_every_members_database_lands_in_the_pool_root(adopted: Any) -> None:
         assert uid == 1000, "the database must be owned by the pool's block, not the member's"
 
 
+def test_the_checkpointed_wal_files_are_gone_and_did_not_break_the_move(adopted: Any) -> None:
+    """The two files the stop deleted are neither moved nor mourned."""
+    state, _before, report, _after, _control = adopted
+    for name in ("alpha.db-wal", "alpha.db-shm"):
+        assert f"alpha:{name}" not in report.moved
+        assert (
+            run_admin(
+                ["find", str(state.service_root(POOL_ID) / DATA_DIRNAME / "alpha"), "-name", name],
+                POOL_BLOCK,
+            )
+            .check()
+            .stdout
+            == b""
+        )
+
+
 def test_the_pools_uid_can_open_the_moved_database_read_write(adopted: Any) -> None:
-    state, _before, _report, _after = adopted
+    state, _before, _report, _after, _control = adopted
     db = state.service_root(POOL_ID) / DATA_DIRNAME / "alpha" / "alpha.db"
 
     notes = _sqlite_rw_as_pool_uid(db)
 
-    assert notes == "written-before-adoption-alpha;written-after-adoption"
+    rows = notes.split(";")
+    # Every row the holder committed was in the `-wal`, not the `.db`, until the
+    # stop checkpointed it. Losing them is exactly what moving the database
+    # without its WAL would look like, so this count is the real assertion.
+    assert len(rows) == HOLDER_ROWS + 1
+    assert rows[0] == "row-0"
+    assert rows[-1] == "written-after-adoption"
 
 
-def test_the_legacy_root_survives_and_the_declaration_does_not(adopted: Any) -> None:
-    state, _before, _report, _after = adopted
+def test_the_legacy_root_survives_with_an_empty_data_dir(adopted: Any) -> None:
+    state, _before, _report, _after, _control = adopted
     for member in MEMBERS:
         assert state.service_root(member).is_dir()
-        assert (state.service_root(member) / DATA_DIRNAME).is_dir()
+        data = state.service_root(member) / DATA_DIRNAME
+        block = MEMBER_BLOCKS[member]
+        listing = run_admin(
+            ["find", str(data), "-mindepth", "1", "-maxdepth", "1"], block
+        ).check()
+        assert listing.stdout == b"", "the data dir is put back, and put back empty"
+        stat_out = run_admin(["stat", "-c", "%u %a", str(data)], block).check().stdout
+        uid, mode = stat_out.decode().split()
+        assert (int(uid), mode) == (1000, "750"), "and handed back to the member's own uid"
         assert not state.service_decl_path(member).exists()
     assert not staging_dir(state, "alpha").exists()
 
 
 def test_the_secret_is_copied_under_the_mangled_name(adopted: Any) -> None:
-    state, _before, _report, _after = adopted
+    state, _before, _report, _after, _control = adopted
     secrets = SecretStore(state.root)
     assert secrets.path("alpha", "SVC_SECRET").read_bytes() == SECRET_VALUE
     copied = secrets.path(POOL_ID, "SVC_SECRET__ALPHA")
@@ -300,7 +437,7 @@ def test_the_secret_is_copied_under_the_mangled_name(adopted: Any) -> None:
 
 
 def test_a_second_adoption_is_a_no_op(adopted: Any) -> None:
-    state, _before, _report, after = adopted
+    state, _before, _report, after, _control = adopted
     assert after.is_noop is True
 
     again = adopt(state, POOL, uids=Uids(), run_admin_fn=run_admin)
