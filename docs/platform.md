@@ -283,7 +283,11 @@ in `.claude/state/phase-b-prereqs.md`.
 - **Caddy's log rules have never seen a real Caddy line**, the SDK heartbeat
   patterns are guesses at its wording, and `window_s = 600` /
   `health_grace_s = 300` are derived from the plan rather than measured — all
-  n=0 against a running fleet (D24/T3.3). Expect to raise the grace.
+  n=0 against a running fleet (D24/T3.3). Expect to raise the grace. (The two
+  knobs are different things: `health_grace_s` is the policy's post-sync dedupe
+  grace; the sync loop's separate `failed_health_retry_s = 900` — how long an
+  already-`failed`-at-health service is held before its gate re-probes, keyed
+  off the record's `health_failed_at` — is not measured either.)
 - **`runtime.node` is accepted but not honoured** (pnpm and bun use the host's
   node 22 and the provisioner warns); **`kind = "nix"`** refuses with
   `ProvisionError`. Both are interfaces, not features. Do not remove them.
