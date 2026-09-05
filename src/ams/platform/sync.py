@@ -1225,7 +1225,14 @@ def _build_pool_group(
             if target != head:
                 _translate_pool_members(run, entries, target, services_dir, name)
             sha = target
-        except (TranslateError, DeclError, OSError, UnicodeDecodeError) as e:
+        except (
+            TranslateError,
+            DeclError,
+            OSError,
+            UnicodeDecodeError,
+            RecursionError,
+            ValueError,
+        ) as e:
             if target == head:
                 raise
             # It translated at the head a moment ago, so this is not a manifest
@@ -1257,7 +1264,16 @@ def _build_pool_group(
             for m in (pool_json or {}).get("members", ())
             if isinstance(m, Mapping) and m.get("id") and m.get("port_name")
         }
-    except (PoolError, TranslateError, StaticError, DeclError, OSError, UnicodeDecodeError) as e:
+    except (
+        PoolError,
+        TranslateError,
+        StaticError,
+        DeclError,
+        OSError,
+        UnicodeDecodeError,
+        RecursionError,
+        ValueError,
+    ) as e:
         error = str(e) if isinstance(e, PoolError) else f"{type(e).__name__}: {e}"
 
     manual = any(
@@ -1371,7 +1387,15 @@ def _phase_translate(run: _Run, manifests: Sequence[Path], sha: str, services_di
             translation, decl = _translate_at(
                 run, manifest, overlay, sha, services_dir, pool=overlay.pool
             )
-        except (TranslateError, StaticError, DeclError, OSError, UnicodeDecodeError) as e:
+        except (
+            TranslateError,
+            StaticError,
+            DeclError,
+            OSError,
+            UnicodeDecodeError,
+            RecursionError,
+            ValueError,
+        ) as e:
             if not run.cfg.selects(dirname):
                 log.debug("%s is not selected; ignoring its translate error", manifest)
                 continue
@@ -1432,7 +1456,14 @@ def _phase_translate(run: _Run, manifests: Sequence[Path], sha: str, services_di
                 translation, decl = _translate_at(
                     run, entry.manifest, entry.overlay, target, services_dir
                 )
-            except (TranslateError, DeclError, OSError, UnicodeDecodeError) as e:
+            except (
+                TranslateError,
+                DeclError,
+                OSError,
+                UnicodeDecodeError,
+                RecursionError,
+                ValueError,
+            ) as e:
                 # It translated at the head a moment ago, so this is not a
                 # manifest problem: fall back to the head rather than skip it.
                 log.warning(
@@ -2374,7 +2405,15 @@ def _dry_run(run: _Run, manifests: Sequence[Path], sha: str, services_dir: Path)
             translation, _decl = _translate_at(
                 run, manifest, overlay, sha, services_dir, pool=overlay.pool
             )
-        except (TranslateError, StaticError, DeclError, OSError, UnicodeDecodeError) as e:
+        except (
+            TranslateError,
+            StaticError,
+            DeclError,
+            OSError,
+            UnicodeDecodeError,
+            RecursionError,
+            ValueError,
+        ) as e:
             if not run.cfg.selects(dirname):
                 continue
             error = f"translate: {type(e).__name__}: {e}"

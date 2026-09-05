@@ -26,6 +26,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any
 
+from ams.platform.yamlsubset import YamlSubsetError
 from ams.platform.yamlsubset import parse as parse_yaml
 from ams.schema import (
     PORT_NAME_RE,
@@ -503,8 +504,18 @@ def _acl(data: Any) -> list[dict[str, str]]:
 
 
 def translate(text: str, ctx: TranslateContext) -> Translation:
-    """Translate one ``service.yaml`` document. Raises ``TranslateError``."""
-    data = parse_yaml(text)
+    """Translate one ``service.yaml`` document. Raises ``TranslateError``.
+
+    Parser failures surface as ``TranslateError`` too, never as the parser's
+    own exception types: sync's per-manifest error path catches ``TranslateError``
+    (and its ``ValueError`` base), and a bare ``RecursionError`` from an absurdly
+    nested document would otherwise take the whole sync tick down with it
+    ("one broken manifest fails only itself", issue #2).
+    """
+    try:
+        data = parse_yaml(text)
+    except (YamlSubsetError, RecursionError) as e:
+        raise _err("", str(e)) from None
     doc = _table(data, "", _TOP_KEYS) if isinstance(data, dict) else None
     if doc is None:
         raise _err("", "manifest must be a mapping")
