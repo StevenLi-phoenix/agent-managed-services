@@ -100,7 +100,7 @@ the harness how *this* service marks severity:
 
 | value | what is read |
 |---|---|
-| `level-prefix` | a leading `LEVEL name:` token (`%(levelname)s %(name)s: %(message)s`), case-insensitive |
+| `level-prefix` | a leading `LEVEL name:` token (`%(levelname)s %(name)s: %(message)s`), case-insensitive; an optional `[member]` tag between level and name (`LEVEL [kvservice] kvservice.main: …` — the pool runner's shape, see `docs/platform-pools.md` § Logging) is accepted too |
 | `json` | `level` or `severity` from the line parsed as one JSON object (Caddy's `debug\|info\|warn\|error\|panic\|fatal` included) |
 | `plain` | text heuristics only (`ERROR`, `Traceback`, `WARNING`, …) |
 | `auto` (default) | level prefix, then JSON, then the heuristics |
