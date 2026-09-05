@@ -85,6 +85,16 @@ _SECRET_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _OVERLAY_FILENAME = "service.ams.toml"
 _OVERLAY_TOP_KEYS = frozenset({"secrets", "env", "pool"})
 
+# Names the harness injects into the spawn environment itself. The manifest
+# may *mention* the two URLs (the TranslateContext value wins there), but an
+# overlay merges after translate with no later gate -- there a mention is an
+# override, e.g. REGISTRY_URL pointed off-loopback to exfiltrate the
+# SVC_SECRET the harness injects alongside it (issue #4). SVC_* is the
+# harness's whole identity namespace. Rejected for overlay `env` *and*
+# `secrets` names alike.
+_HARNESS_ENV_NAMES = frozenset({"REGISTRY_URL", "AUTH_URL", "GIT_COMMIT"})
+_HARNESS_ENV_PREFIX = "SVC_"
+
 # PLAN-pool.md §3.2: `registry`/`auth`/`caddy` are the other Layer-0/1
 # services a pool id must never collide with; `pool` is reserved separately
 # as the pooled runner's own admin port name (§3.3's `[ports] pool = 0`).
@@ -111,6 +121,11 @@ def _check_env_name(path: Path, name: str, *, what: str) -> None:
         )
     if name in RESERVED_ENV or name.startswith(RESERVED_ENV_PREFIXES):
         raise StaticError(f"{path}: {what} name {name!r} is reserved by ams")
+    if name in _HARNESS_ENV_NAMES or name.startswith(_HARNESS_ENV_PREFIX):
+        raise StaticError(
+            f"{path}: {what} name {name!r} is injected by ams at spawn; "
+            "an overlay may not set it"
+        )
 
 
 def load_ams_overlay(manifest_dir: Path) -> Overlay:
@@ -223,6 +238,28 @@ def _parse_build_command(service_id: str, raw: str) -> list[str]:
     return argv
 
 
+def _build_mask(state: StateDir) -> list[Path]:
+    """Harness-private paths a static build must not see (issue #1).
+
+    The build runs under the admin map, where inner root's file identity *is*
+    the harness uid -- unmasked, the build scripts (and every postinstall hook
+    ``bun install`` executes) could copy the SecretStore straight into the
+    published tree. Everything private under ``<state>`` is hidden except the
+    static subtree itself, which contains the scratch build dir. Entries are
+    disjoint (:func:`ams.userns._apply_mask` forbids nesting); absent paths
+    are skipped by the mask itself.
+    """
+    mask = [
+        state.root / name
+        for name in ("secrets", "services", "state", "logs", "control.sock")
+    ]
+    site_root = static_root(state)
+    platform = site_root.parent
+    if platform.is_dir():
+        mask.extend(p for p in platform.iterdir() if p != site_root)
+    return mask
+
+
 def _run_build_step(
     argv: Sequence[str],
     block: UidBlock,
@@ -231,6 +268,7 @@ def _run_build_step(
     env: Mapping[str, str],
     what: str,
     timeout_s: float = _BUILD_TIMEOUT_S,
+    mask: Sequence[Path] = (),
 ) -> None:
     """Run one build step as inner root in the admin ns, never as the bare
     harness process (manifest/repo build scripts are untrusted input).
@@ -240,6 +278,9 @@ def _run_build_step(
     coreutils ``env -i -C <workdir> K=V ...`` -- the same trick
     ``ams.runtime._tool`` uses for provisioning, duplicated here (that helper
     is private to ``ams.runtime``).
+
+    ``mask`` carries :func:`_build_mask`'s paths: inner root would otherwise
+    read everything the harness uid can, and the published tree is public.
     """
     wrapped = [
         "env",
@@ -249,7 +290,7 @@ def _run_build_step(
         *(f"{k}={v}" for k, v in sorted(env.items())),
         *argv,
     ]
-    result = run_admin(wrapped, block, timeout_s=timeout_s)
+    result = run_admin(wrapped, block, timeout_s=timeout_s, mask=mask)
     if not result.ok:
         stderr = result.stderr.decode(errors="replace").strip()
         raise StaticError(
@@ -293,6 +334,29 @@ def _harden_tree_mode(root: Path) -> None:
             if p.is_symlink():
                 continue
             os.chmod(p, 0o644)
+
+
+def _reject_symlinks(root: Path) -> None:
+    """A published tree must be plain files and directories only (issue #5).
+
+    ``cp -a`` preserves symlinks committed to the repo and a build step can
+    create more; Caddy's ``file_server`` follows them, so one link pointing
+    outside the docroot would publish files from anywhere the Caddy uid can
+    read. Fail the publish rather than ship the escape hatch.
+    """
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in (*dirnames, *filenames):
+            p = Path(dirpath) / name
+            if p.is_symlink():
+                found.append(f"{p.relative_to(root)} -> {os.readlink(p)}")
+    if found:
+        shown = "\n  ".join(found[:5])
+        more = f"\n  ... and {len(found) - 5} more" if len(found) > 5 else ""
+        raise StaticError(
+            f"{root.name}: refusing to publish {len(found)} symlink(s) "
+            f"(file_server would follow them out of the docroot):\n  {shown}{more}"
+        )
 
 
 # --------------------------------------------------------------------------- publish
@@ -370,11 +434,18 @@ def publish_static(
                     "process (D1); pass any UidBlock, it is never chowned to"
                 )
             env = provisioning_env(store)
+            mask = _build_mask(state)
             for raw in build_cmds:
                 argv = _parse_build_command(service_id, raw)
                 _run_build_step(
-                    argv, block, workdir=build_dir, env=env, what=f"{service_id}: {raw}"
+                    argv,
+                    block,
+                    workdir=build_dir,
+                    env=env,
+                    what=f"{service_id}: {raw}",
+                    mask=mask,
                 )
+        _reject_symlinks(build_dir)
         (build_dir / _SHA_MARKER).write_text(sha + "\n", encoding="utf-8")
         _harden_tree_mode(build_dir)
 

@@ -1422,9 +1422,17 @@ def test_an_overlay_env_name_colliding_with_a_secret_fails_only_that_service(
     env: Any, upstream: Any
 ) -> None:
     src, _sha = upstream
+    # An env name colliding with a *declared* secret (overlay `secrets` feed
+    # the declaration) must stay a DeclError at translate. SVC_* names are
+    # rejected earlier still, by the overlay's own harness-injection gate
+    # (issue #4) -- see test_platform_static.
     _commit(
         src,
-        {"services/alpha/service.ams.toml": '[env]\nSVC_SECRET = "nope"\n'},
+        {
+            "services/alpha/service.ams.toml": (
+                'secrets = ["ALPHA_KEY"]\n[env]\nALPHA_KEY = "nope"\n'
+            )
+        },
         "an overlay that collides with the declared secret",
     )
     report = run_sync(env, make_cfg(src, env.registry))

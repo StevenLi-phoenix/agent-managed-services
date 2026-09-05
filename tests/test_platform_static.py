@@ -106,6 +106,28 @@ def test_overlay_reserved_name_rejected(tmp_path: Path) -> None:
         load_ams_overlay(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "name", ["REGISTRY_URL", "AUTH_URL", "GIT_COMMIT", "SVC_TOKEN", "SVC_NAME"]
+)
+def test_overlay_harness_injected_names_rejected(tmp_path: Path, name: str) -> None:
+    # Issue #4: the overlay merges after translate with no later gate, so an
+    # env entry here is an override -- REGISTRY_URL pointed off-loopback would
+    # carry the injected SVC_SECRET to a third party.
+    (tmp_path / "service.ams.toml").write_text(
+        f'[env]\n{name} = "http://attacker.example/"\n', encoding="utf-8"
+    )
+    with pytest.raises(StaticError, match="injected by ams"):
+        load_ams_overlay(tmp_path)
+
+
+def test_overlay_harness_injected_secret_name_rejected(tmp_path: Path) -> None:
+    # The same namespace rule guards `secrets`: declaring a secret named
+    # SVC_* would collide with the harness's injected identity variables.
+    (tmp_path / "service.ams.toml").write_text('secrets = ["SVC_SESSION"]\n', encoding="utf-8")
+    with pytest.raises(StaticError, match="injected by ams"):
+        load_ams_overlay(tmp_path)
+
+
 def test_overlay_lowercase_name_rejected(tmp_path: Path) -> None:
     (tmp_path / "service.ams.toml").write_text('secrets = ["deepseek_api_key"]\n', encoding="utf-8")
     with pytest.raises(StaticError, match="does not match"):
@@ -250,9 +272,11 @@ class _RecordingAdmin:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
+        self.masks: list[tuple[Path, ...]] = []
 
-    def __call__(self, argv, block, *, timeout_s: float = 60.0) -> AdminResult:
+    def __call__(self, argv, block, *, timeout_s: float = 60.0, mask=()) -> AdminResult:
         self.calls.append(tuple(argv))
+        self.masks.append(tuple(mask))
         # Simulate `bun run build` producing dist/ and the prune/promote steps
         # having already run by the time the *next* real fake step is asked
         # for -- this fake never touches disk, so the on-disk assertions in
@@ -297,7 +321,7 @@ def test_publish_build_step_failure_raises_and_cleans_up(
     mount = dict(_mount_for("files-web"))
     checkout = _make_checkout(tmp_path, SHA, {"files-web": {"package.json": "{}"}})
 
-    def failing(argv, block, *, timeout_s: float = 60.0) -> AdminResult:
+    def failing(argv, block, *, timeout_s: float = 60.0, mask=()) -> AdminResult:
         return AdminResult(tuple(argv), 1, b"", b"bun: command not found")
 
     monkeypatch.setattr(static, "run_admin", failing)
@@ -312,6 +336,57 @@ def test_publish_build_step_failure_raises_and_cleans_up(
 
 
 # --------------------------------------------------------------------------- build-command parsing
+
+
+def test_publish_build_steps_run_with_harness_paths_masked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #1: a build runs as inner root whose file identity is the harness
+    # uid; every build step must carry the mask of harness-private paths, and
+    # the static subtree holding the build dir must stay visible.
+    fake = _RecordingAdmin()
+    monkeypatch.setattr(static, "run_admin", fake)
+    state = _state(tmp_path)
+    checkout = _make_checkout(tmp_path, SHA, {"files-web": {"package.json": "{}"}})
+
+    publish_static(dict(_mount_for("files-web")), checkout, state, _store(tmp_path), _block())
+
+    expected = tuple(static._build_mask(state))
+    assert expected, "the mask must not be empty"
+    assert fake.masks and len(fake.masks) == len(fake.calls)
+    assert all(m == expected for m in fake.masks)
+    static_base = static.static_root(state)
+    assert not any(m == static_base or static_base in m.parents for m in expected)
+    for name in ("secrets", "services", "state", "logs", "control.sock"):
+        assert (state.root / name) in expected
+
+
+def test_publish_rejects_symlinks_committed_to_the_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # cp -a preserves symlinks and file_server follows them; a link committed
+    # to the repo must fail the publish, not ship an escape hatch (#5).
+    checkout = _make_checkout(tmp_path, SHA, {"files-web": {"index.html": "<h1>hi</h1>"}})
+    link = checkout / "apps" / "files-web" / "evil"
+    link.symlink_to("/etc/passwd")
+    monkeypatch.setattr(static, "run_admin", _RecordingAdmin())
+
+    with pytest.raises(StaticError, match="symlink"):
+        publish_static(
+            dict(_mount_for("files-web")), checkout, _state(tmp_path), _store(tmp_path), _block()
+        )
+
+    # nothing was published and the scratch dir is gone (finally block)
+    assert not (_state(tmp_path).root / "platform" / "static" / "files-web").exists()
+
+
+def test_reject_symlinks_names_dirs_and_files(tmp_path: Path) -> None:
+    root = tmp_path / "tree"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "to-dir").symlink_to("/etc", target_is_directory=True)
+    (root / "to-file").symlink_to("/etc/passwd")
+    with pytest.raises(StaticError, match="to-dir -> /etc"):
+        static._reject_symlinks(root)
 
 
 @pytest.mark.parametrize(

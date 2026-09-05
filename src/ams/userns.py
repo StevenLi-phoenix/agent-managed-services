@@ -33,6 +33,7 @@ import os
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import time
 from collections.abc import Callable, Sequence
@@ -46,6 +47,17 @@ from ams.uidmap import UidBlock
 log = logging.getLogger("ams.userns")
 
 CLONE_NEWUSER = 0x10000000
+
+# Mount-namespace masking (issue #1): run_admin can hide harness-private paths
+# from the process it forks, so untrusted code executed under the admin map
+# (static builds, provisioning tools) cannot read what the harness uid can.
+CLONE_NEWNS = 0x00020000
+MS_RDONLY = 1
+MS_NOSUID = 2
+MS_NODEV = 4
+MS_BIND = 4096
+MS_REC = 16384
+MS_PRIVATE = 1 << 20
 
 PR_SET_PDEATHSIG = 1
 PR_GET_PDEATHSIG = 2
@@ -85,6 +97,51 @@ def _check(rc: int, what: str) -> None:
 def unshare_user() -> None:
     """Enter a new (unmapped) user namespace. Caller must get maps written."""
     _check(_libc.unshare(CLONE_NEWUSER), "unshare(CLONE_NEWUSER)")
+
+
+def unshare_mounts() -> None:
+    """Enter a new mount namespace. Requires CAP_SYS_ADMIN in the current user
+    namespace -- true for inner root after the identity drop."""
+    _check(_libc.unshare(CLONE_NEWNS), "unshare(CLONE_NEWNS)")
+
+
+def _mount(
+    source: bytes | None, target: bytes, fstype: bytes | None, flags: int, data: bytes | None
+) -> None:
+    _check(_libc.mount(source, target, fstype, flags, data), f"mount {target!r}")
+
+
+def _apply_mask(paths: Sequence[Path]) -> None:
+    """Overmount every entry in ``paths`` empty, inside a private mount ns.
+
+    Runs in the forked admin child *after* the identity drop: as inner root it
+    holds CAP_SYS_ADMIN over its own namespaces, and every mount dies with the
+    process. ``/`` is made private first -- systemd marks it shared, and a
+    shared peer group would propagate the masks back into the host namespace.
+
+    Directories are covered with an empty read-only tmpfs; anything else
+    (files, sockets) gets ``/dev/null`` bound over it. A path that does not
+    exist is skipped so callers can pass a fixed layout. Entries must not nest:
+    masking a parent after a child would hide the child's mask, not the subtree.
+    """
+    unshare_mounts()
+    _mount(None, b"/", None, MS_PRIVATE | MS_REC, None)
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        target = os.fsencode(p)
+        if stat.S_ISDIR(st.st_mode):
+            _mount(
+                b"tmpfs",
+                target,
+                b"tmpfs",
+                MS_RDONLY | MS_NOSUID | MS_NODEV,
+                b"size=4096,mode=000",
+            )
+        else:
+            _mount(b"/dev/null", target, None, MS_BIND | MS_RDONLY, None)
 
 
 def _prctl(option: int, arg2: int = 0, arg3: int = 0, arg4: int = 0, arg5: int = 0) -> None:
@@ -312,12 +369,20 @@ def run_admin(
     harness_uid: int | None = None,
     harness_gid: int | None = None,
     timeout_s: float = 60.0,
+    mask: Sequence[Path] = (),
 ) -> AdminResult:
     """Run ``argv`` as inner root in an admin-mapped user namespace.
 
     This is how the harness touches files the host reports as owned by
     ``block.uid_start``: as inner root it holds CAP_DAC_OVERRIDE/CAP_CHOWN over
     exactly the uids mapped into this namespace and nothing else.
+
+    ``mask`` hides harness-private paths from the forked process: each entry is
+    overmounted empty in a private mount namespace before exec (issue #1).
+    Harness ops (chown/rm/cp) must not pass it -- they need the real files --
+    but every run of *untrusted* code under the admin map (static builds,
+    provisioning tools) must, or the harness uid's read access becomes the
+    build's read access.
     """
     if not argv:
         raise ValueError("argv must not be empty")
@@ -340,6 +405,8 @@ def run_admin(
         for fd in (devnull, out_w, err_w):
             if fd > 2:
                 os.close(fd)
+        if mask:
+            _apply_mask(mask)
         os.execve(exe, argv, dict(_ADMIN_ENV))
         raise SpawnError("execve returned")  # pragma: no cover
 
