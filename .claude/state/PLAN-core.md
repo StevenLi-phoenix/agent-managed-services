@@ -288,3 +288,17 @@ def ship(state, store, cfg, plugin_ids, *, force=False, isolation=True)     # fo
 4. Docs: `docs/platform-core.md` (new, the end-to-end story), `docs/platform.md` (legacy banner +
    pointer), `README.md`, project `CLAUDE.md`, `CHANGELOG.md` (new, Keep a Changelog, 1.0.0 + 1.1.0),
    `DECISIONS.md` D31, `PROGRESS.md` entry. Version 1.1.0 in `pyproject.toml`, tag `v1.1.0`, push.
+
+## 7. TODO (release + publish, 2026-09-29)
+
+- [ ] 1. Implement A/B/C + integrate (workflow wf_f5809346-271) — A ✅ C ✅ B ⏳ integrate ⏳
+- [ ] 2. Merge `origin/security-audit-fixes` (8 commits, 2026-09-05: issues #1 #2 #4 #5 + docs #6–#12); core-mode admin-ns `pnpm install` gets `provisioning_mask`
+- [ ] 3. Adversarial review of the full diff → fix
+- [ ] 4. Local e2e against the real `../api` (`--no-isolation`, node 24.20.0) → evidence file
+- [ ] 5. Docs: `docs/platform-core.md`, `docs/platform.md` legacy banner, README, CLAUDE.md, CHANGELOG (merge the branch's), D31, PROGRESS; version 1.1.0
+- [ ] 6. Commit on main
+- [ ] 7. `git filter-repo --replace-text` over all refs: 2 throwaway pilot `SVC_SECRET`s (06276ce, `examples/api-pilot/*/service.toml`) + 2 IPs (deleted DO droplet, tailnet)
+- [ ] 8. gitleaks + custom sweep re-scan → clean (only the known fake-key test fixture)
+- [ ] 9. Force-push main, `security-audit-fixes`, tag `v1.0.0` (rewritten) + new tag `v1.1.0`
+- [ ] 10. Repo → public; verify visibility; note open issue #3 (legacy Layer-0 port hijack) is public from then on
+- [ ] Open (user): re-provision racknerd for Linux live verification of core mode
