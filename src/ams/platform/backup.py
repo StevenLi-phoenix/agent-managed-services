@@ -23,7 +23,10 @@ Byte stores (core mode, PLAN-core §4.2)
 ---------------------------------------
 Core's store/oss/pages plugins keep immutable, content-named files in
 directories named ``blobs``, ``oss-bytes`` and ``pages-content`` somewhere under
-``<root>/data``. Re-uploading gigabytes of them into every dated archive would
+``<root>/data``, and core's own ArtifactStore keeps content-addressed artifacts in
+``<core root>/data/artifacts`` (without them a restored core.sqlite boots every
+plugin ``artifact_unreadable``). In-flight ``*.tmp`` staging files are excluded.
+Re-uploading gigabytes of them into every dated archive would
 be the litestream bill again, so -- like phm's ``core-daily-backup`` -- they go
 up with ``rclone copy --immutable``: only files the bucket lacks are sent, an
 existing object is never overwritten, and nothing is ever deleted remotely.
@@ -150,6 +153,17 @@ POOL_MANIFEST_FILENAME = "pool.json"
 #: Directory names under `<root>/data/**` holding immutable, content-named
 #: files (core's store, oss and pages plugins). Copied, never archived.
 BYTE_STORE_NAMES = ("blobs", "oss-bytes", "pages-content")
+#: core's ArtifactStore, ``CORE_STATE_DIR/artifacts`` = ``<core root>/data/artifacts``:
+#: content-addressed ``<artifactId>.json`` files, immutable once renamed into
+#: place. Without it a restored core.sqlite names artifacts nobody has, and core
+#: boots every plugin ``artifact_unreadable`` (upstream core-daily-backup copies
+#: it next to core.sqlite). Only for the core service, only at the top of data/.
+CORE_SERVICE_ID = "core"
+CORE_ARTIFACTS_DIRNAME = "artifacts"
+#: In-flight staging files inside a live byte store: LocalOssBytes writes
+#: ``<uuid>.tmp`` before linking ``<sha>.blob``, ArtifactStore.put writes
+#: ``<id>.json.<pid>.<ts>.tmp`` before its rename. Never part of a backup.
+BYTE_STORE_EXCLUDE = "*.tmp"
 
 DEFAULT_RETENTION_DAYS = 14
 DEFAULT_REMOTE = "r2"
@@ -515,7 +529,8 @@ def discover_byte_stores(
         if block is None:
             log.warning("%s: no uid block allocated; cannot list %s", service_id, data_dir)
             continue
-        result = run_admin_fn(_byte_store_find_argv(data_dir), block, timeout_s=timeout_s)
+        extra = (CORE_ARTIFACTS_DIRNAME,) if service_id == CORE_SERVICE_ID else ()
+        result = run_admin_fn(_byte_store_find_argv(data_dir, extra), block, timeout_s=timeout_s)
         if not result.ok:
             log.warning(
                 "%s: listing byte stores under %s failed (rc=%d): %s",
@@ -526,7 +541,7 @@ def discover_byte_stores(
             )
             continue
         members = _pool_members(service_root)
-        for path in _parse_byte_store_output(result.stdout, data_dir, service_id):
+        for path in _parse_byte_store_output(result.stdout, data_dir, service_id, extra):
             label = _label_for(path, data_dir, members)
             base = data_dir / label if label else data_dir
             rel = path.relative_to(base).as_posix()
@@ -536,8 +551,11 @@ def discover_byte_stores(
     return stores
 
 
-def _byte_store_find_argv(data_dir: Path) -> list[str]:
+def _byte_store_find_argv(data_dir: Path, top_level: Sequence[str] = ()) -> list[str]:
     """`find <data> -mindepth 1 -type d ( -name blobs -o ... ) -print -prune`.
+
+    ``top_level`` adds ``-o -path <data>/<name>`` for stores that only count
+    directly under the data dir (core's ``artifacts``).
 
     ``-prune`` after ``-print`` stops find descending into a store it has just
     reported, so the walk never enumerates the (possibly millions of) files a
@@ -549,6 +567,8 @@ def _byte_store_find_argv(data_dir: Path) -> list[str]:
         if i:
             argv.append("-o")
         argv += ["-name", name]
+    for name in top_level:
+        argv += ["-o", "-path", str(data_dir / name)]
     argv += [")", "-print", "-prune"]
     return argv
 
@@ -558,7 +578,9 @@ def _byte_store_find_argv(data_dir: Path) -> list[str]:
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
 
 
-def _parse_byte_store_output(stdout: bytes, data_dir: Path, service_id: str) -> list[Path]:
+def _parse_byte_store_output(
+    stdout: bytes, data_dir: Path, service_id: str, top_level: Sequence[str] = ()
+) -> list[Path]:
     """`find -print` lines -> byte-store directories; untrusted like `_parse_find_output`.
 
     Kept: inside the data dir, basename one of `BYTE_STORE_NAMES`, every
@@ -572,9 +594,10 @@ def _parse_byte_store_output(stdout: bytes, data_dir: Path, service_id: str) -> 
         if not line:
             continue
         parts = line[len(prefix) :].split("/") if line.startswith(prefix) else []
+        top = len(parts) == 1 and parts[0] in top_level
         if (
             not parts
-            or parts[-1] not in BYTE_STORE_NAMES
+            or (parts[-1] not in BYTE_STORE_NAMES and not top)
             or not all(_SAFE_COMPONENT.fullmatch(p) for p in parts)
         ):
             log.warning("%s: ignoring unexpected byte-store find output %r", service_id, line)
@@ -840,6 +863,8 @@ def byte_store_argv(store: ByteStore, cfg: BackupConfig) -> list[str]:
         "copy",
         "--immutable",
         "--s3-no-check-bucket",
+        "--exclude",
+        BYTE_STORE_EXCLUDE,
         str(store.path),
         cfg.byte_store_remote(store),
     ]

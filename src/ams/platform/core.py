@@ -104,6 +104,10 @@ class CoreConfigError(ValueError):
     """Invalid core config or config bundle. Never carries a secret value."""
 
 
+class CoreLayoutError(RuntimeError):
+    """The service root holds something the layout refuses to work through."""
+
+
 # --------------------------------------------------------------------------- config
 
 
@@ -459,13 +463,30 @@ def _admin(argv: Sequence[str], block: UidBlock) -> None:
     run_admin(list(argv), block).check()
 
 
+#: PATH for the coreutils run as the service (``_as_service``).
+_SERVICE_PATH = "/usr/local/bin:/usr/bin:/bin"
+
+
+def _as_service(argv: Sequence[str], block: UidBlock) -> None:
+    """Run a coreutil as the service itself (runtime map, no harness uid mapped)."""
+    from ams.userns import run_as_service
+
+    run_as_service(list(argv), block, env={"PATH": _SERVICE_PATH, "LANG": "C.UTF-8"}).check()
+
+
 def ensure_layout(layout: CoreLayout, block: UidBlock | None) -> None:
     """Create ``releases/ data/ etc/ run/ build/`` owned by the service.
 
     ``block`` None is plain mode (dev / ``--no-isolation``): the directories belong
     to the current user. Otherwise the service root already exists (it is made by
-    ``ensure_service_root``) and belongs to the block, so the harness goes through
-    the admin namespace, as everywhere else that writes into a service root.
+    ``ensure_service_root``) and belongs to the block, and the missing directories
+    are made **as the service** (``run_as_service``): the root is service-owned, so
+    no harness privilege is needed, and a symlink the service planted can then
+    only lead ``mkdir`` where the service could write anyway. (The previous
+    admin-namespace ``mkdir`` + ``chown`` followed such a link and chowned its
+    target -- e.g. the harness home -- to the service.) A layout entry that is a
+    symlink or not a directory is refused outright: the harness itself later
+    reads through ``releases/`` and nothing legitimate ever puts a link there.
     """
     dirs = (layout.data, layout.run, layout.build)
     if block is None:
@@ -474,29 +495,27 @@ def ensure_layout(layout: CoreLayout, block: UidBlock | None) -> None:
         layout.etc.mkdir(parents=True, exist_ok=True)
         os.chmod(layout.etc, ETC_DIR_MODE)
         return
-    missing = [d for d in (layout.releases, *dirs, layout.etc) if not d.is_dir()]
+    missing = []
+    for d in (layout.releases, *dirs, layout.etc):
+        if d.is_symlink() or (d.exists() and not d.is_dir()):
+            raise CoreLayoutError(
+                f"core: {d} is a symlink or not a directory; refusing to work through it "
+                "(something in the service replaced it -- inspect before removing it)"
+            )
+        if not d.exists():
+            missing.append(d)
     if not missing:
         return
-    from ams.spawn import INNER_GID, INNER_UID
-
     # releases/ is world-traversable like a legacy <root>/repo: the harness reads
     # a staged tree's .ams-sha marker, checks package.json and stats the tree
     # there, and the spawner enters `current` -> releases/<sha> as the harness
     # before it drops to the service (userns cwd walk). Nothing secret lives in
-    # it; data/ run/ build/ stay 0750 and etc/ 0700.
-    _admin(["mkdir", "-m", oct(RELEASES_DIR_MODE)[2:], "-p", str(layout.releases)], block)
-    _admin(["mkdir", "-m", oct(DATA_DIR_MODE)[2:], "-p", *map(str, dirs)], block)
-    _admin(["mkdir", "-m", oct(ETC_DIR_MODE)[2:], "-p", str(layout.etc)], block)
-    _admin(
-        [
-            "chown",
-            f"{INNER_UID}:{INNER_GID}",
-            str(layout.releases),
-            *map(str, dirs),
-            str(layout.etc),
-        ],
-        block,
-    )
+    # it; data/ run/ build/ stay 0750 and etc/ 0700. `mkdir -m` sets the mode
+    # regardless of the umask, and the service's own mkdir makes it the owner.
+    modes = {layout.releases: RELEASES_DIR_MODE, layout.etc: ETC_DIR_MODE}
+    for mode in dict.fromkeys(modes.get(d, DATA_DIR_MODE) for d in missing):
+        paths = [str(d) for d in missing if modes.get(d, DATA_DIR_MODE) == mode]
+        _as_service(["mkdir", "-m", oct(mode)[2:], "-p", *paths], block)
     log.info("core: created %s under %s", ", ".join(d.name for d in missing), layout.root)
 
 
@@ -518,20 +537,146 @@ def flip_current(layout: CoreLayout, sha: str, block: UidBlock | None) -> None:
     """
     target = f"releases/{sha}"
     layout.release_dir(sha)  # validates the sha
-    tmp = layout.root / ".current.new"
     if block is None:
+        tmp = layout.root / ".current.new"
         tmp.unlink(missing_ok=True)
         os.symlink(target, tmp)
         os.replace(tmp, layout.current)
     else:
         from ams.spawn import INNER_GID, INNER_UID
 
+        # Built in the harness-owned <state>/services/core/, not in the root: the
+        # service could plant `<root>/.current.new -> <dir>` and `ln -s` would then
+        # create the link inside <dir>. The relative target resolves once the
+        # link is renamed into the root; rename(2) never follows a destination
+        # symlink (and cannot replace a directory `current` with a link).
+        tmp = layout.root.parent / ".current.new"
         _admin(["rm", "-f", str(tmp)], block)
         _admin(["ln", "-s", target, str(tmp)], block)
         _admin(["chown", "-h", f"{INNER_UID}:{INNER_GID}", str(tmp)], block)
         # GNU mv -T renames onto the old link instead of into the directory it names.
         _admin(["mv", "-T", str(tmp), str(layout.current)], block)
     log.info("core: current -> %s", target)
+
+
+# ---------------------------------------------------------------------- tree pins
+
+_RANGE_TOKEN_RE = re.compile(
+    r"^(>=|<=|>|<|=|\^|~)?v?(\d+|[xX*])(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?$"
+)
+_Version = tuple[int, int, int]
+
+
+def _pad(parts: Sequence[int]) -> _Version:
+    a, b, c = (*parts, 0, 0, 0)[:3]
+    return (a, b, c)
+
+
+def _bump(parts: Sequence[int]) -> _Version:
+    """The first version above a partial ``X`` / ``X.Y``: ``24`` -> 25.0.0."""
+    return _pad([*parts[:-1], parts[-1] + 1])
+
+
+def _token_bounds(token: str) -> list[tuple[str, _Version]] | None:
+    """One semver comparator -> ``[(op, version)]`` over >=, >, <, <=, =."""
+    m = _RANGE_TOKEN_RE.match(token)
+    if m is None:
+        return None
+    op = m.group(1) or "="
+    raw = [g for g in m.groups()[1:] if g is not None]
+    nums: list[int] = []
+    for g in raw:
+        if g in ("x", "X", "*"):
+            break
+        nums.append(int(g))
+    full = len(nums) == 3
+    low = _pad(nums)
+    if not nums:
+        return [] if op in ("=", ">=", "^", "~") else None
+    if op == "=":
+        return [("=", low)] if full else [(">=", low), ("<", _bump(nums))]
+    if op == "^":
+        if not full:
+            return [(">=", low), ("<", _bump(nums[:1]))]
+        first = next((i for i, n in enumerate(nums) if n), 2)
+        return [(">=", low), ("<", _bump(nums[: first + 1]))]
+    if op == "~":
+        return [(">=", low), ("<", _bump(nums[:2] if len(nums) >= 2 else nums))]
+    if op == ">" and not full:
+        return [(">=", _bump(nums))]
+    if op == "<=" and not full:
+        return [("<", _bump(nums))]
+    return [(op, low)]
+
+
+def node_satisfies(version: str, node_range: str) -> bool | None:
+    """Does exact ``version`` satisfy an ``engines.node`` range? ``None`` = cannot tell.
+
+    The subset package.json ranges use: ``||`` alternatives of space-separated
+    comparators (``>=``, ``>``, ``<``, ``<=``, ``=``, ``^``, ``~``, x-ranges and
+    partial versions). Anything else (hyphen ranges, tags) is not guessed at.
+    """
+    v = tuple(int(x) for x in version.split("."))
+    checks = {
+        ">=": lambda a: v >= a,
+        ">": lambda a: v > a,
+        "<": lambda a: v < a,
+        "<=": lambda a: v <= a,
+        "=": lambda a: v == a,
+    }
+    for alternative in node_range.split("||"):
+        bounds: list[tuple[str, _Version]] = []
+        for token in alternative.split():
+            b = _token_bounds(token)
+            if b is None:
+                return None
+            bounds.extend(b)
+        if all(checks[op](ver) for op, ver in bounds):
+            return True
+    return False
+
+
+def check_tree_pins(tree: Path, node: str, pnpm: str) -> list[str]:
+    """Problems between ``core.node``/``core.pnpm`` and the tree's ``package.json``.
+
+    ``engines.node`` must be satisfied by ``node`` (pnpm itself only warns, so the
+    release would build and run on an unsupported runtime), and a
+    ``packageManager`` pin must be ``pnpm@<core.pnpm>`` (else pnpm switches to --
+    and downloads -- that version inside the provisioning step). An empty list
+    is fine; so is a tree without ``package.json`` (provisioning reports that).
+    """
+    pkg = Path(tree) / "package.json"
+    try:
+        data = json.loads(pkg.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return [f"{pkg.name}: cannot read it ({type(e).__name__})"]
+    if not isinstance(data, dict):
+        return [f"{pkg.name}: not a JSON object"]
+    problems: list[str] = []
+    engines = data.get("engines")
+    node_range = engines.get("node") if isinstance(engines, dict) else None
+    if isinstance(node_range, str):
+        ok = node_satisfies(node, node_range)
+        if ok is False:
+            problems.append(
+                f"core.node {node} does not satisfy the tree's engines.node {node_range!r}"
+            )
+        elif ok is None:
+            log.warning("cannot evaluate engines.node %r; not checked", node_range)
+    manager = data.get("packageManager")
+    if isinstance(manager, str):
+        name, _, version = manager.partition("@")
+        version = version.split("+", 1)[0]
+        if name != "pnpm":
+            problems.append(f"the tree's packageManager is {name!r}, not pnpm")
+        elif version != pnpm:
+            problems.append(
+                f"core.pnpm {pnpm} differs from the tree's packageManager pnpm@{version}; "
+                "pnpm would switch to (and download) that version -- update core.pnpm"
+            )
+    return problems
 
 
 # ---------------------------------------------------------------------- declaration
@@ -871,13 +1016,21 @@ def place_bundle(state: StateDir, layout: CoreLayout, block: UidBlock | None) ->
     else:
         from ams.spawn import INNER_GID, INNER_UID
 
-        _admin(["rm", "-rf", str(new), str(old)], block)
-        _admin(["cp", "-R", str(master), str(new)], block)
-        _admin(["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(new)], block)
-        _admin(["chmod", "-R", "u=rwX,go=", str(new)], block)
+        # The copy, its modes and its owner are all made in the harness-owned
+        # <state>/services/core/ -- never on a name inside the service root, which
+        # core (running meanwhile) could swap for a symlink between two of these
+        # forks: `chmod -R` follows a command-line symlink, and `cp -R` would copy
+        # the bundle wherever it pointed. chmod before chown, so the service never
+        # owns the staging copy while it is still being prepared. Only renames
+        # (and an `rm -rf`, which never follows links) touch the root.
+        stage = layout.root.parent / ".etc.stage"
+        _admin(["rm", "-rf", str(stage), str(old)], block)
+        _admin(["cp", "-R", str(master), str(stage)], block)
+        _admin(["chmod", "-R", "u=rwX,go=", str(stage)], block)
+        _admin(["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(stage)], block)
         if layout.etc.exists():
             _admin(["mv", "-T", str(layout.etc), str(old)], block)
-        _admin(["mv", "-T", str(new), str(layout.etc)], block)
+        _admin(["mv", "-T", str(stage), str(layout.etc)], block)
         _admin(["rm", "-rf", str(old)], block)
     marker.parent.mkdir(parents=True, exist_ok=True)
     _write_private(marker, (digest + "\n").encode("ascii"))

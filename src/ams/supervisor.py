@@ -602,7 +602,7 @@ class Supervisor:
         *,
         on_iteration: Callable[[list[Event]], None] | None = None,
         on_reload: Callable[[], Any] | None = None,
-        shutdown_timeout_s: float | None = None,
+        shutdown_timeout_s: float | Callable[[], float] | None = None,
     ) -> None:
         """Loop until SIGTERM/SIGINT or ``stop_event``, then stop everything.
 
@@ -614,7 +614,8 @@ class Supervisor:
         the reload runs on the ordinary loop stack where it may touch the service
         table. ``shutdown_timeout_s`` bounds the final graceful stop, which
         matters under systemd where ``TimeoutStopSec`` will SIGKILL us if we
-        overrun.
+        overrun. A callable is evaluated at shutdown, so services a reload added
+        after start (core, with its 40 s drain) count too.
         """
         self._stop_requested = False
         self._reload_requested = False
@@ -635,7 +636,17 @@ class Supervisor:
             # default handlers, so a second SIGTERM during the graceful-stop
             # window would kill the harness and orphan every service.
             log.info("shutting down")
-            self.shutdown(shutdown_timeout_s)
+            grace: float | None
+            if callable(shutdown_timeout_s):
+                try:
+                    grace = shutdown_timeout_s()
+                except Exception as e:  # a broken budget must not skip the shutdown
+                    log.exception("shutdown budget hook raised (%s); using stop timeouts", e)
+                    grace = None
+            else:
+                grace = shutdown_timeout_s
+            log.info("graceful stop budget: %s", f"{grace:.1f}s" if grace is not None else "auto")
+            self.shutdown(grace)
 
     def _run_reload(self, on_reload: Callable[[], Any] | None) -> None:
         if on_reload is None:

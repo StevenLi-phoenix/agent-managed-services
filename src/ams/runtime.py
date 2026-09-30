@@ -64,7 +64,7 @@ from ams.schema import EXACT_VERSION_RE, RuntimeSpec, ServiceDecl
 from ams.spawn import INNER_GID, INNER_UID
 from ams.state import StateDir
 from ams.uidmap import UidBlock
-from ams.userns import AdminResult, ensure_service_root, run_admin
+from ams.userns import AdminResult, SpawnError, ensure_service_root, run_admin, run_as_service
 
 log = logging.getLogger("ams.runtime")
 
@@ -77,6 +77,13 @@ STDERR_TAIL_LINES = 40
 
 # provision_tree runs a whole repository install plus a TypeScript build.
 TREE_TIMEOUT_S = 1800.0
+
+#: ``<root>/.cache``: the pnpm store, npm cache and HOME of provisioning steps
+#: that run *as the service* (security-3). Service-owned, 0700, on the same
+#: filesystem as the tree, so ``clone`` imports still reflink.
+SERVICE_CACHE_DIRNAME = ".cache"
+#: The system PATH tail a step run as the service gets after the toolchain.
+_SERVICE_BASE_PATH = ("/usr/local/bin", "/usr/bin", "/bin")
 
 # Where managed node releases come from. The archive and its checksum file are
 # fetched from the same versioned directory.
@@ -539,6 +546,39 @@ def provisioning_env(store: RuntimeStore, spec: RuntimeSpec | None = None) -> di
     }
 
 
+def service_provisioning_env(
+    store: RuntimeStore, spec: RuntimeSpec | None, service_root: Path
+) -> dict[str, str]:
+    """Pure: the environment of a provisioning step run **as the service**.
+
+    Nothing of the harness's own: HOME, the pnpm store, the npm cache and pnpm's
+    home all live in the service's ``<root>/.cache`` -- the shared caches are
+    harness-owned and the service cannot write them, which is the point. The
+    toolchain (``<store>/node``, ``<store>/pnpm``, world-readable) comes first on
+    PATH; the host pnpm shims are read-only there.
+    """
+    cache = Path(service_root) / SERVICE_CACHE_DIRNAME
+    tc = managed_toolchain(spec, store) if spec is not None else None
+    path = ":".join(
+        (
+            *(tc.bin_dirs if tc is not None else ()),
+            str(store.pnpm_home / "bin"),
+            *_SERVICE_BASE_PATH,
+        )
+    )
+    return {
+        "PATH": path,
+        "HOME": str(cache / "home"),
+        "LANG": "C.UTF-8",
+        "CI": "1",
+        "XDG_CACHE_HOME": str(cache / "xdg"),
+        "PNPM_HOME": str(cache / "pnpm-home"),
+        "npm_config_store_dir": str(cache / "pnpm-store"),
+        "npm_config_cache": str(cache / "npm"),
+        "npm_config_package_import_method": "clone",
+    }
+
+
 # --------------------------------------------------------------------------- running tools
 
 
@@ -666,6 +706,38 @@ def _run_plain(
     return _finish(result, what=what, shown=shown, started=started, log_path=log_path, note=note)
 
 
+def _service_tool(
+    argv: Sequence[str],
+    block: UidBlock,
+    *,
+    workdir: Path | None,
+    env: Mapping[str, str],
+    what: str,
+    log_path: Path | None = None,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> AdminResult:
+    """Run one provisioning step as the service (``run_as_service``), logged.
+
+    For untrusted code -- package lifecycle scripts, a repository's build: the
+    runtime map has no harness uid in it, so the step can neither read the
+    harness's 0600/0700 files nor write anything the harness owns, and there is
+    no namespace-local mount mask to lift (security-3/-4).
+    """
+    shown = " ".join(argv)
+    started = time.monotonic()
+    try:
+        result = run_as_service(
+            list(argv),
+            block,
+            env=env,
+            cwd=str(workdir) if workdir is not None else None,
+            timeout_s=timeout_s,
+        )
+    except SpawnError as e:
+        raise ProvisionError(f"{what}: could not run {shown} as the service: {e}") from e
+    return _finish(result, what=what, shown=shown, started=started, log_path=log_path)
+
+
 def _tool(
     argv: Sequence[str],
     block: UidBlock,
@@ -715,7 +787,53 @@ def _require_linux() -> None:
         )
 
 
-def provisioning_mask(service_root: Path) -> list[Path]:
+#: Store entries that are harness-private: the platform-wide RS256 signing key
+#: (``<store>/platform``, D16) and the private api mirror (bare repos, upstream).
+STORE_PRIVATE_NAMES = ("platform", "upstream", "repos", "src")
+#: Entries of the harness HOME that hold credentials or keys.
+HOME_PRIVATE_NAMES = (
+    ".ssh",
+    ".gnupg",
+    ".config",
+    ".aws",
+    ".docker",
+    ".kube",
+    ".npmrc",
+    ".netrc",
+    ".pypirc",
+    ".git-credentials",
+    ".env",
+    ".bash_history",
+)
+
+
+def harness_private_paths(
+    store: RuntimeStore, *, keep: Sequence[Path] = (), home: Path | None = None
+) -> list[Path]:
+    """Harness-private paths *outside* ``<state>`` for an admin-namespace mask.
+
+    ``<store>/{platform,upstream,repos,src}`` and the credential dotfiles of the
+    harness HOME (security-5): on the target host the signing key's
+    ``<store>/platform`` is a sibling of the state dir, which the ``<state>``-only
+    masks never covered. An entry that contains (or is) any ``keep`` path -- the
+    tree being built, the state dir, the store itself -- is left out, so a mask
+    never hides what the tool works in and entries never nest with the
+    ``<state>`` ones. Absent paths are fine: the mask skips them.
+    """
+    home = Path(home) if home is not None else Path.home()
+    kept = [Path(k) for k in (*keep, store.root)]
+    out: list[Path] = []
+    for p in (
+        *(store.root / n for n in STORE_PRIVATE_NAMES),
+        *(home / n for n in HOME_PRIVATE_NAMES),
+    ):
+        if any(p == k or p in k.parents for k in kept):
+            continue
+        out.append(p)
+    return out
+
+
+def provisioning_mask(service_root: Path, store: RuntimeStore | None = None) -> list[Path]:
     """Harness-private paths provisioning tools must not see (issue #1).
 
     Provisioning runs untrusted code -- uv/pnpm/bun execute package build
@@ -729,6 +847,10 @@ def provisioning_mask(service_root: Path) -> list[Path]:
     Entries are disjoint by construction (never nest -- see
     :func:`ams.userns._apply_mask`). Paths that do not exist are skipped by
     the mask itself, so a fixed layout is safe to pass.
+
+    With ``store``, :func:`harness_private_paths` is added: the platform key and
+    private mirrors under the store and the credential dotfiles of the harness
+    HOME (security-5).
     """
     root = Path(service_root)
     state = root.parent.parent.parent  # <state>/services/<id>/root -> <state>
@@ -743,6 +865,8 @@ def provisioning_mask(service_root: Path) -> list[Path]:
     services = state / "services"
     if services.is_dir():
         mask.extend(p for p in services.iterdir() if p != own)
+    if store is not None:
+        mask.extend(harness_private_paths(store, keep=(state, root)))
     return mask
 
 
@@ -940,6 +1064,9 @@ def _provision_node(
     log_path: Path | None,
     timeout_s: float,
     mask: Sequence[Path] = (),
+    *,
+    store: RuntimeStore | None = None,
+    service_root: Path | None = None,
 ) -> None:
     """``kind = pnpm | bun``: install into ``<workdir>/node_modules``.
 
@@ -991,15 +1118,25 @@ def _provision_node(
             mask=mask,
         )
     if rt.build:
-        _tool(
+        # Repository code: run it as the service, not as inner root (security-3).
+        # The install above ran as inner root, so the tree is handed over first.
+        if store is None or service_root is None:
+            raise ProvisionError(f"{decl.id}: a build step needs the store and service root")
+        _admin(
+            ["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(service_root)],
+            block,
+            what=f"{decl.id}: chown to service before build",
+            log_path=log_path,
+            timeout_s=timeout_s,
+        )
+        _service_tool(
             list(rt.build),
             block,
             workdir=workdir,
-            env=env,
+            env=service_provisioning_env(store, rt, service_root),
             what=f"{decl.id}: build",
             log_path=log_path,
             timeout_s=timeout_s,
-            mask=mask,
         )
 
 
@@ -1051,12 +1188,22 @@ def provision(
     workdir = service_workdir(decl, service_root)
     _ensure_root(decl, service_root, workdir, block)
     env = provisioning_env(store, decl.runtime)
-    mask = provisioning_mask(service_root)
+    mask = provisioning_mask(service_root, store=store)
 
     if decl.runtime.is_python:
         _provision_python(decl, service_root, workdir, block, env, log_path, timeout_s, mask)
     else:
-        _provision_node(decl, workdir, block, env, log_path, timeout_s, mask)
+        _provision_node(
+            decl,
+            workdir,
+            block,
+            env,
+            log_path,
+            timeout_s,
+            mask,
+            store=store,
+            service_root=service_root,
+        )
 
     _admin(
         ["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(service_root)],
@@ -1081,8 +1228,7 @@ def _containing_service_root(tree: Path) -> Path:
         if p.name == "root" and p.parent.parent.name == "services":
             return p
     raise ProvisionError(
-        f"provision_tree: {tree} is not inside a service root "
-        "(<state>/services/<id>/root); pass mask= explicitly"
+        f"provision_tree: {tree} is not inside a service root (<state>/services/<id>/root)"
     )
 
 
@@ -1096,7 +1242,6 @@ def provision_tree(
     log_path: Path | None = None,
     env: Mapping[str, str] | None = None,
     timeout_s: float = TREE_TIMEOUT_S,
-    mask: Sequence[Path] | None = None,
 ) -> None:
     """Install (and build) a staged pnpm repository tree in place.
 
@@ -1105,23 +1250,22 @@ def provision_tree(
     ``run_build``. A managed spec gets its toolchain ensured first and put
     first on PATH.
 
-    ``block`` given: the tools run as inner root in the admin namespace (the
-    shared caches are harness-owned) and the tree is handed back to the service
-    with ``chown -R`` -- the ``provision`` pattern. ``block`` None: a plain
-    subprocess as the current user, for development, ``--no-isolation`` and
-    macOS; there the pnpm import method is ``clone-or-copy``, because a dev
-    tree and store need not share a filesystem and a hard ``clone`` would fail.
+    ``block`` given: every step runs **as the service** (``run_as_service``),
+    never as inner root. The install runs package lifecycle scripts and the
+    build runs repository code -- untrusted code that, as inner root, held the
+    harness uid's write access (the ams source, its venv, ``~/.ssh``, the shared
+    toolchain) and could unmount the issue-#1 mask in its own namespace
+    (review 2026-09-29, security-3/-4/-5). As the service the harness uid is
+    not mapped at all. The tree must already belong to the service (``stage``
+    chowns it); the pnpm store, caches and HOME are the service's own under
+    ``<root>/.cache`` (:func:`service_provisioning_env`), so no chown follows.
+    ``block`` None: a plain subprocess as the current user, for development,
+    ``--no-isolation`` and macOS; there the pnpm import method is
+    ``clone-or-copy``, because a dev tree and store need not share a filesystem
+    and a hard ``clone`` would fail.
 
     ``env`` is merged over the provisioning environment, the caller winning
-    (e.g. ``CORE_SOURCE_COMMIT``). On the admin path its values travel in the
-    ``env -i`` argv, so it must never carry a secret.
-
-    ``mask`` (admin path only): the install runs package lifecycle scripts and
-    the build runs repository code -- untrusted code with the harness uid's read
-    access -- so both run with :func:`provisioning_mask` applied (issue #1).
-    ``None`` derives it from the service root that contains ``tree``
-    (``<state>/services/<id>/root/...``); a tree outside any service root is
-    refused rather than provisioned unmasked.
+    (e.g. ``CORE_SOURCE_COMMIT``); it must never carry a secret.
     """
     tree = Path(tree)
     if spec.kind != "pnpm":
@@ -1130,17 +1274,25 @@ def provision_tree(
         raise ProvisionError(f"provision_tree: tree {tree} does not exist")
     if not (tree / _PACKAGE_JSON).is_file():
         raise ProvisionError(f"provision_tree: no {_PACKAGE_JSON} in {tree}")
-    tool_mask: Sequence[Path] = ()
+    service_root: Path | None = None
     if block is not None:
         _require_linux()
-        tool_mask = mask if mask is not None else provisioning_mask(_containing_service_root(tree))
+        service_root = _containing_service_root(tree)
+        owner = os.stat(tree).st_uid
+        if owner != block.uid_start:
+            raise ProvisionError(
+                f"tree {tree} is owned by host uid {owner}, expected {block.uid_start} "
+                "(stage hands the tree to the service before it is provisioned)"
+            )
 
     store.ensure()
     if spec.managed_node and spec.node is not None:
         ensure_node_toolchain(store, spec.node, spec.pnpm)
-    tool_env = provisioning_env(store, spec)
-    if block is None:
+    if service_root is None:
+        tool_env = provisioning_env(store, spec)
         tool_env["npm_config_package_import_method"] = "clone-or-copy"
+    else:
+        tool_env = service_provisioning_env(store, spec, service_root)
     tool_env.update(env or {})
 
     install = ["pnpm", "install", "--frozen-lockfile"]
@@ -1155,9 +1307,20 @@ def provision_tree(
     steps: list[tuple[list[str], str]] = [(install, "pnpm install")]
     if run_build and spec.build:
         steps.append((list(spec.build), "build"))
-    mode = "plain" if block is None else f"admin ns (block {block.uid_start})"
+    mode = "plain" if block is None else f"as the service (block {block.uid_start})"
     log.info("provision_tree %s: %d step(s), %s", tree, len(steps), mode)
 
+    if block is not None and service_root is not None:
+        cache = service_root / SERVICE_CACHE_DIRNAME
+        _service_tool(
+            ["mkdir", "-m", "700", "-p", str(cache), str(cache / "home")],
+            block,
+            workdir=None,
+            env={"PATH": ":".join(_SERVICE_BASE_PATH), "LANG": "C.UTF-8"},
+            what=f"{tree.name}: service cache dir",
+            log_path=log_path,
+            timeout_s=60.0,
+        )
     for argv, what in steps:
         label = f"{tree.name}: {what}"
         if block is None:
@@ -1165,7 +1328,7 @@ def provision_tree(
                 argv, cwd=tree, env=tool_env, what=label, log_path=log_path, timeout_s=timeout_s
             )
         else:
-            _tool(
+            _service_tool(
                 argv,
                 block,
                 workdir=tree,
@@ -1173,21 +1336,6 @@ def provision_tree(
                 what=label,
                 log_path=log_path,
                 timeout_s=timeout_s,
-                mask=tool_mask,
-            )
-
-    if block is not None:
-        _admin(
-            ["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(tree)],
-            block,
-            what=f"{tree.name}: chown to service",
-            log_path=log_path,
-            timeout_s=timeout_s,
-        )
-        owner = os.stat(tree).st_uid
-        if owner != block.uid_start:
-            raise ProvisionError(
-                f"tree {tree} is owned by host uid {owner}, expected {block.uid_start}"
             )
     log.info("provision_tree %s: done (%s)", tree, mode)
 

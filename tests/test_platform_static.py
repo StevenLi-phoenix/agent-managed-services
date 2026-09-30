@@ -349,10 +349,12 @@ def test_publish_build_steps_run_with_harness_paths_masked(
     state = _state(tmp_path)
     checkout = _make_checkout(tmp_path, SHA, {"files-web": {"package.json": "{}"}})
 
-    publish_static(dict(_mount_for("files-web")), checkout, state, _store(tmp_path), _block())
+    store = _store(tmp_path)
+    publish_static(dict(_mount_for("files-web")), checkout, state, store, _block())
 
-    expected = tuple(static._build_mask(state))
+    expected = tuple(static._build_mask(state, store, keep=(checkout,)))
     assert expected, "the mask must not be empty"
+    assert store.root / "platform" in expected  # the signing key's dir (security-5)
     assert fake.masks and len(fake.masks) == len(fake.calls)
     assert all(m == expected for m in fake.masks)
     static_base = static.static_root(state)

@@ -1,5 +1,7 @@
 # Platform sidecars
 
+> **Legacy manifest mode (api v2.0.0), deprecated in ams 1.1.0.** For the Cordis-based api core, see [platform-core.md](platform-core.md).
+
 An api `service.yaml` manifest carries three kinds of information. Only one of
 them belongs in an ams declaration:
 

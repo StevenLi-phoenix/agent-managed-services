@@ -24,6 +24,10 @@ admin = 8081                  # fixed request; conflict is a load-time error in 
 kind = "venv"                 # none | venv | uv | pnpm | bun | nix
 python = "3.12"               # venv/uv only
 # node = "22"                 # pnpm/bun only (pnpm: system or pnpm-managed node; bun: ignored)
+#                             # pnpm + an EXACT "24.20.0": managed toolchain in <store>/node/v<ver>,
+#                             # downloaded and sha256-checked against nodejs.org SHASUMS256.txt (1.1.0)
+# pnpm = "11.19.0"            # pnpm only, exact; needs an exact node; installed into <store>/pnpm/<ver>
+# build = ["node", "scripts/build.mjs"]   # pnpm only: argv run in the workdir after install
 requirements = "requirements.txt"   # venv/uv only, relative to workdir
 # sync = true                # uv only: workdir is a uv project; `uv sync --frozen`, venv at <workdir>/.venv;
 #                             # `packages` must be empty in sync mode (deps come from pyproject/uv.lock)

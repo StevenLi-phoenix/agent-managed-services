@@ -31,7 +31,7 @@ Plugin entry is `plugins/<id>/core.ts` if present else `index.ts`.
 
 Core env: `CORE_STATE_DIR` (core.sqlite + artifacts/), `CORE_SOCKET`, `CORE_PLUGIN_CONFIG`
 (plugins.json, read by the `secrets` plugin: `{plugins:{<id>:{config,grants}}, redactionReaders:[...]}`),
-`CORE_LOG_LEVEL`. Core logs JSON lines to stdout. Requires Node `>=24.19.0 <25`, pnpm 11.19.0.
+`CORE_LOG_LEVEL`. Core logs JSON lines (observed on **stderr** in the 2026-09-30 e2e; the declaration's `format = "json"` classifies either stream). Requires Node `>=24.19.0 <25`, pnpm 11.19.0.
 
 The racknerd replica of ams 1.0.0 has been torn down (no store, no venv, unit inactive); the DO
 mock droplet is deleted. Production stays on phm under systemd and is **out of scope — never touch phm.**
@@ -291,11 +291,13 @@ def ship(state, store, cfg, plugin_ids, *, force=False, isolation=True)     # fo
 
 ## 7. TODO (release + publish, 2026-09-29)
 
-- [ ] 1. Implement A/B/C + integrate (workflow wf_f5809346-271) — A ✅ C ✅ B ⏳ integrate ⏳
-- [ ] 2. Merge `origin/security-audit-fixes` (8 commits, 2026-09-05: issues #1 #2 #4 #5 + docs #6–#12); core-mode admin-ns `pnpm install` gets `provisioning_mask`
-- [ ] 3. Adversarial review of the full diff → fix
-- [ ] 4. Local e2e against the real `../api` (`--no-isolation`, node 24.20.0) → evidence file
-- [ ] 5. Docs: `docs/platform-core.md`, `docs/platform.md` legacy banner, README, CLAUDE.md, CHANGELOG (merge the branch's), D31, PROGRESS; version 1.1.0
+- [x] 1. Implement A/B/C + integrate (workflow wf_f5809346-271) — A ✅ C ✅ B ✅ integrate ✅ (a9fca88)
+- [x] 2. Merge `origin/security-audit-fixes` (8 commits, 2026-09-05: issues #1 #2 #4 #5 + docs #6–#12); core-mode admin-ns `pnpm install` gets `provisioning_mask` (1c0460e; superseded in step 3: core-mode installs and builds now run as the service, D32)
+- [x] 3. Adversarial review of the full diff → fix (25 findings, 24 applied test-first; D32, CHANGELOG [1.1.0])
+- [x] 4. Local e2e against the real `../api` (`--no-isolation`, node 24.20.0) → evidence file
+  `.claude/state/evidence/core-e2e-local-2026-09-29.txt` (2026-09-30: all six scenarios pass;
+  two fixes — gate fails fast on a harness-`failed` core; Node trace-warnings hint is INFO)
+- [x] 5. Docs: `docs/platform-core.md`, `docs/platform.md` legacy banner, README, CLAUDE.md, CHANGELOG (merge the branch's), D31, PROGRESS; version 1.1.0 (2026-09-30; suite 1608 passed / 167 skipped)
 - [ ] 6. Commit on main
 - [ ] 7. `git filter-repo --replace-text` over all refs: 2 throwaway pilot `SVC_SECRET`s (06276ce, `examples/api-pilot/*/service.toml`) + 2 IPs (deleted DO droplet, tailnet)
 - [ ] 8. gitleaks + custom sweep re-scan → clean (only the known fake-key test fixture)

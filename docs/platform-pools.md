@@ -1,5 +1,7 @@
 # Pools: N manifests, one process, distinguished by tag
 
+> **Legacy manifest mode (api v2.0.0), deprecated in ams 1.1.0.** For the Cordis-based api core, see [platform-core.md](platform-core.md).
+
 The fleet's memory is dominated by a fixed per-process cost, not by the
 services themselves: on racknerd, 16 Python uvicorn processes hold 44–74 MiB
 each while `import fastapi` alone is 44 MiB, and 14 member packages imported

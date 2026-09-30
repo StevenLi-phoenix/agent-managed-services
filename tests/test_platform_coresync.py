@@ -133,6 +133,18 @@ class FakeCore:
         self.calls: list[tuple[str, ...]] = []
         #: pid -> privilege it cannot pass probation without (health / ops.read)
         self.needs: dict[str, str] = {}
+        #: pid -> reason: deploy is rejected with this reason (manager.ts incompatibility)
+        self.reject_reason: dict[str, str] = {}
+        #: pid -> error corectl raises for its upload (core-side refusal or transport)
+        self.upload_error: dict[str, CoreControlError] = {}
+        #: pids whose `corectl restart` transition fails
+        self.restart_fail: set[str] = set()
+        #: release sha -> pids whose live generation fails to boot on that core
+        self.broken: dict[str, set[str]] = {}
+        #: pid -> observed failure reason core reports at boot (e.g. artifact_unreadable)
+        self.boot_failed: dict[str, str] = {}
+        self.layout: core.CoreLayout | None = None
+        self._gen = 0
 
     # --- helpers
     def install(self, pid: str, aid: str, privileges: Sequence[str] = ()) -> None:
@@ -188,23 +200,40 @@ class FakeCore:
             raise CoreControlError("corectl status failed (rc=1): connect ENOENT")
         if self.behaviour.get("*") != "slow":
             self._tick_probation()
-        return {
-            "autoDeploy": False,
-            "plugins": json.loads(
-                json.dumps(sorted(self.plugins.values(), key=lambda p: p["pluginId"]))
-            ),
-        }
+        plugins = json.loads(json.dumps(sorted(self.plugins.values(), key=lambda p: p["pluginId"])))
+        running = core.current_sha(self.layout) if self.layout else None
+        broken = self.broken.get(running or "", set())
+        for p in plugins:
+            if p["pluginId"] in broken:
+                p["live"] = None
+                p["observed"].update(phase="failed", reason="start failed: boom")
+            if p["pluginId"] in self.boot_failed:
+                p["live"] = None
+                p["observed"].update(phase="failed", reason=self.boot_failed[p["pluginId"]])
+        return {"autoDeploy": False, "plugins": plugins}
 
     def upload(self, path: Path) -> str:
         self.calls.append(("upload", str(path)))
         if not self.up:
             raise CoreControlError("down")
-        return self.registry.by_path[str(path)][1]
+        pid, aid = self.registry.by_path[str(path)]
+        if pid in self.upload_error:
+            raise self.upload_error[pid]
+        return aid
 
     def deploy(self, aid: str) -> dict[str, Any]:
         self.calls.append(("deploy", aid))
         pid = next(p for p, a in self.registry.by_path.values() if a == aid)
         beh = self.behaviour.get(pid, "ok")
+        if pid in self.reject_reason:
+            return {
+                "pluginId": pid,
+                "kind": "deploy",
+                "outcome": "rejected",
+                "reason": self.reject_reason[pid],
+                "toArtifact": aid,
+            }
+        self.boot_failed.pop(pid, None)
         if beh == "rejected":
             return {
                 "pluginId": pid,
@@ -251,10 +280,21 @@ class FakeCore:
     def restart(self, pid: str) -> dict[str, Any]:
         self.calls.append(("restart", pid))
         p = self.plugins[pid]
+        if pid in self.restart_fail:
+            return {"pluginId": pid, "kind": "restart", "outcome": "failed", "reason": "boom"}
+        self._gen += 1
+        gen = f"gr{self._gen}"
+        p["observed"]["generationId"] = gen
+        if p.get("live"):
+            p["live"]["generationId"] = gen
         if p["observed"]["lastKnownGood"] != p["observed"]["artifactId"]:
             p["observed"].update(phase="probation", reason=None)
             self._countdown[pid] = self.settle_after
         return {"pluginId": pid, "outcome": "ok"}
+
+    def gc(self) -> dict[str, Any]:
+        self.calls.append(("gc",))
+        return {"removed": [], "kept": len(self.plugins)}
 
     def transitions(self, pid: str, limit: int = 20) -> list[dict[str, Any]]:
         return [{"kind": "auto_revert", "outcome": "ok", "reason": "probation failed: 5/5 failed"}]
@@ -282,6 +322,8 @@ class FakeSupervisor:
     def __init__(self, layout: core.CoreLayout) -> None:
         self.layout = layout
         self.services: dict[str, dict[str, Any]] = {}
+        self.desired: dict[str, str] = {}
+        self.decls: dict[str, str] = {}
         self.ops: list[tuple[str, str | None, str | None]] = []
         self.fail_reload = False
 
@@ -289,29 +331,47 @@ class FakeSupervisor:
         self.ops.append((op, sid, core.current_sha(self.layout)))
 
     def reload(self) -> dict[str, Any]:
+        """Like ``ams.reload``: a new declaration is started, a changed one is
+        restarted -- unless the operator's ``desired`` is down (``ctl stop``) and it
+        did not fail, which the real reload leaves down."""
         self._log("reload", None)
         if self.fail_reload:
             raise coresync.SupervisorError("reload refused")
         for sid in ("core", "caddy"):
             decl = self.layout.root.parent.parent / sid / "service.toml"
-            if decl.is_file():
-                self.services[sid] = {"status": "running"}
+            if not decl.is_file():
+                continue
+            text = decl.read_text(encoding="utf-8")
+            if sid in self.services and self.decls.get(sid) == text:
+                continue  # unchanged: reload does nothing
+            self.decls[sid] = text
+            if sid in self.desired and self.desired[sid] == "down":
+                if self.services.get(sid, {}).get("status") != "failed":
+                    continue  # "changed but is down; leaving it down"
+            self.desired[sid] = "up"
+            self.services[sid] = {"status": "running"}
         return {"ok": True}
 
     def start(self, sid: str) -> dict[str, Any]:
         self._log("start", sid)
         if sid not in self.services:
             raise coresync.SupervisorError(f"unknown service {sid!r}")
+        if self.services[sid]["status"] == "running":
+            # Supervisor.start raises RuntimeError on a live process.
+            raise coresync.SupervisorError(f"service {sid!r} is still running")
+        self.desired[sid] = "up"
         self.services[sid] = {"status": "running"}
         return {"ok": True}
 
     def stop(self, sid: str) -> dict[str, Any]:
         self._log("stop", sid)
+        self.desired[sid] = "down"
         self.services[sid] = {"status": "stopped"}
         return {"ok": True}
 
     def restart(self, sid: str) -> dict[str, Any]:
         self._log("restart", sid)
+        self.desired[sid] = "up"
         self.services[sid] = {"status": "running"}
         return {"ok": True}
 
@@ -361,6 +421,7 @@ class World:
         self.keys = {pid: f"ck-{pid}-1" for pid in ROSTER}
         self.planner = FakePlanner(self.registry, self.keys)
         self.core = FakeCore(self.registry)
+        self.core.layout = self.layout
         self.sup = FakeSupervisor(self.layout)
         self.mirror = FakeMirror()
         self.provisioned: list[tuple[str, bool]] = []
@@ -376,6 +437,8 @@ class World:
         svc = self.sup.services.get("core")
         if not svc or svc["status"] != "running":
             return None
+        if "gateway" in self.core.boot_failed:
+            return None  # the gateway plugin binds the port; it did not boot
         return 200 if core.current_sha(self.layout) in self.healthy else 503
 
     def provision(
@@ -772,6 +835,46 @@ def test_release_gate_and_flip_back_both_failing_is_core_down(world: World) -> N
     assert rep.exit_code == 1
     assert sorted(w.kinds()) == ["core_down", "core_release_failed"]
     assert core.current_sha(w.layout) == SHA_A
+
+
+def _crash_looping_on(w: World, sha: str) -> None:
+    """Core on ``sha`` dies at startup: its socket never answers, and the harness
+    gives up on it (``failed``: restart policy exhausted, it will not restart)."""
+    real_status, real_start = w.core.status, w.sup.start
+
+    def status() -> dict[str, Any]:
+        if core.current_sha(w.layout) == sha:
+            raise CoreControlError("corectl status failed (rc=1): connect ENOENT")
+        return real_status()
+
+    def start(sid: str) -> dict[str, Any]:
+        out = real_start(sid)
+        if sid == "core" and core.current_sha(w.layout) == sha:
+            w.sup.services[sid] = {"status": "failed"}
+        return out
+
+    w.core.status = status  # type: ignore[method-assign]
+    w.sup.start = start  # type: ignore[method-assign]
+
+
+def test_release_gate_gives_up_as_soon_as_the_harness_gave_up_on_core(world: World) -> None:
+    # Seen in the local end-to-end run (2026-09-30): a release whose core died at
+    # startup was abandoned by the harness after ~15 s (5 failures >= max_retries),
+    # yet the gate kept waiting out the whole health_timeout_s -- ~90 s of outage --
+    # before flipping back. A service the harness marked `failed` is never restarted,
+    # so waiting on it cannot pass the gate.
+    w = world
+    first_release(w)
+    _core_change(w, SHA_B)
+    _crash_looping_on(w, SHA_B)
+    started = w.clock.now()
+    rep = w.tick()
+    assert rep.release_ok is False and rep.rolled_back
+    assert core.current_sha(w.layout) == SHA_A
+    assert w.kinds() == ["core_release_failed"]
+    assert "gave up" in w.escalations()[0]["event"]["cause"]
+    assert w.clock.now() - started < w.cfg.health_timeout_s
+    assert w.record()["release_failed_sha"] == SHA_B
 
 
 def test_release_build_failure_does_not_touch_the_running_core(world: World) -> None:

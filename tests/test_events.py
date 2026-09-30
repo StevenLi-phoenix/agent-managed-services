@@ -24,6 +24,19 @@ def test_classify_markers():
     assert classify("Serving HTTP on 0.0.0.0 port 8000", "stderr") == Severity.INFO
 
 
+def test_classify_node_trace_hint_is_info():
+    # Node prints this hint after the first process warning; it carries nothing
+    # but the word "warning". Seen escalated on every core start in the local
+    # core-mode e2e (2026-09-30). The warning line it follows is classified on
+    # its own.
+    for flag in ("warnings", "deprecation"):
+        hint = f"(Use `node --trace-{flag} ...` to show where the warning was created)"
+        assert classify(hint, "stderr") == Severity.INFO
+        assert classify(hint, "stderr", "json") == Severity.INFO
+    # A real warning still is one.
+    assert classify("(node:1) Warning: something odd", "stderr") == Severity.WARNING
+
+
 def test_classify_most_severe_wins():
     assert classify("WARNING: ERROR-like text", "stdout") == Severity.ERROR
     assert classify("error then fatal", "stdout") == Severity.CRITICAL

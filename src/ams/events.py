@@ -75,7 +75,18 @@ _JSON_START_RE = re.compile(r"^\s*\{")
 _JSON_LEVEL_KEYS = ("level", "severity")
 
 
+# Lines that trip a marker word but carry no signal of their own. Node prints the
+# first as a follow-up to its first process warning ("... to show where the warning
+# was created"); the warning line it follows is classified on its own. Anchored
+# and exact, so nothing else can ride on it.
+_NOISE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\(Use `node --trace-[a-z-]+ \.\.\.` to show where the \w+ was created\)$"),
+)
+
+
 def _heuristic(text: str) -> Severity:
+    if any(p.match(text) for p in _NOISE_PATTERNS):
+        return Severity.INFO
     for pattern, sev in _SEVERITY_PATTERNS:
         if pattern.search(text):
             return sev

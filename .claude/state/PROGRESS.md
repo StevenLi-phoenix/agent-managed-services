@@ -1124,3 +1124,59 @@ ams: `v1.0.0` (248d7f3) pushed to the new private repo
 c8b1fff3 — **not merged to main**; the production deployer ignores tag pushes
 and non-main branches, so nothing deployed. Both earlier open items ("git
 remote for ams", "api branch unpushed") are closed.
+
+## 2026-09-29/30 — ams 1.1.0: core mode (host the Cordis-based api core)
+
+api `main` (v3.1.0) replaced the Python service fleet with one Node 24
+process, `core`, that hot-installs its own plugins. ams 1.1.0 hosts it as
+**core mode** (`PLAN-core.md`, DECISIONS D31/D32, `docs/platform-core.md`).
+The legacy manifest mode stays, deprecated and untouched.
+
+Landed:
+- a9fca88: `platform/{core,corectl,coresync}.py`, `assets/core_plan.mjs`,
+  `ams platform core {config import,bootstrap,sync,status,release --rollback,ship}`,
+  the managed Node/pnpm toolchain and `provision_tree` (`runtime.py`),
+  `run_as_service` + `run_admin(env, cwd)` (`userns.py`), `sources.stage(dest=)`
+  / `stage_plain`, `gateway.render_core`, backup byte stores under `bytes/`,
+  `deploy/ams-core-sync.{service,timer}`.
+- 1c0460e: merge of `security-audit-fixes` (issues #1 #2 #4 #5, docs #6–#12:
+  `run_admin` mask / `provisioning_mask`, static symlink refusal, overlay
+  env-name gate, yamlsubset hardening).
+- Adversarial review of the full diff: 25 findings (correctness, security,
+  upstream fit). 24 applied, each test-first; see D32 and CHANGELOG
+  [1.1.0]. Main outcomes: verdicts keyed by content key + core release +
+  bundle digest (+ fingerprint for `blocked`), transport failures in
+  `ship_retry`, held stage/release shas, untrusted steps run as the
+  service with a per-service pnpm store, harness-side staging for
+  bundle/`current`, `data/artifacts` backed up, a pin check against
+  `engines`/`packageManager`, a shutdown budget computed at shutdown.
+- Local e2e (macOS, `--no-isolation`, scratch clone of api at f99fb863, node
+  24.20.0 / pnpm 11.19.0 managed): all six PLAN-core §6.2 scenarios pass.
+  Bootstrap 74 s; no-change tick 0.17 s with nothing written; a one-plugin
+  content change ships only that plugin (65 s); a broken plugin is rejected
+  and escalated once, not retried, while the old artifact keeps serving;
+  a core release costs ≈2 s of `/health`; rollback 3 s and the sha is then
+  held. Extras: a crashing release flips back (outage ≈92 s → ≈17 s after the
+  fix), and a harness restart reboots all plugins from `core.sqlite`. Two
+  fixes came out of it (gate fails fast on a harness-`failed` core; Node's
+  trace-warnings hint is INFO). Evidence:
+  `evidence/core-e2e-local-2026-09-29.txt`.
+- Docs: `docs/platform-core.md` (new), legacy banners on `platform.md`,
+  `platform-pools.md`, `manifest-translation.md`, `platform-sidecars.md`;
+  `service-declaration.md` runtime pins; README (zh), CLAUDE.md, AGENTS.md,
+  CHANGELOG `[1.1.0]` + `[1.0.0]`, DECISIONS D31. `pyproject.toml` 1.1.0.
+
+Tests: **1608 passed / 167 skipped** (`.venv/bin/python -m pytest -q`,
+2026-09-30), up from 1231/125 at 1.0.0. No new skips besides Linux-only ones.
+
+Next:
+- Commit on main, then the publish steps in PLAN-core §7 (history
+  scrub of the pilot secrets and IPs, gitleaks re-scan, force-push, tags
+  `v1.0.0` (rewritten) and `v1.1.0`, repo public).
+- **Linux live verification of core mode**: no host exists. It needs racknerd
+  (or another box) re-provisioned (user decision), then
+  `scripts/remote-test.sh` + a live core e2e. None of the isolation code
+  (`run_as_service` provisioning, as-service layout, staged renames) has run
+  on Linux yet.
+- Open follow-ups (D31/D32 Open): the two escalation streams, `SourceMirror.stage`
+  and gc as inner root inside the root, legacy provisioning's mask bypass.

@@ -570,6 +570,17 @@ def shutdown_timeout_for(declarations: dict[str, ServiceDecl]) -> float:
     return longest
 
 
+def shutdown_grace(asm: Assembly) -> Callable[[], float]:
+    """The graceful-stop budget as of *shutdown*, not of harness start.
+
+    ``reload`` keeps ``asm.declarations`` current, so a service added after start
+    -- core, declared by ``ams platform core bootstrap`` on a running harness,
+    with a 40 s drain -- gets its stop timeout honoured on the next
+    ``systemctl stop``, still clamped to ``SHUTDOWN_BUDGET_S``.
+    """
+    return lambda: shutdown_timeout_for(asm.declarations)
+
+
 # -------------------------------------------------------------------------- run
 
 
@@ -652,7 +663,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         asm.supervisor.run_forever(
             on_iteration=on_iteration,
             on_reload=on_reload,
-            shutdown_timeout_s=shutdown_timeout_for(asm.declarations),
+            shutdown_timeout_s=shutdown_grace(asm),
         )
     finally:
         server.close()

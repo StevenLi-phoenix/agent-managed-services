@@ -172,8 +172,9 @@ BLOCK = UidBlock(100000, 1024)
 def test_isolated_layout_keeps_releases_traversable(
     state: StateDir, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Made as the service (security-2): the service's own mkdir makes it the owner.
     admin = FakeAdmin()
-    monkeypatch.setattr(core, "_admin", lambda argv, block: admin(argv, block).check())
+    monkeypatch.setattr(core, "_as_service", lambda argv, block: admin(argv, block).check())
     lay = CoreLayout.from_state(state)
     lay.root.mkdir(parents=True)
     core.ensure_layout(lay, BLOCK)
@@ -184,8 +185,7 @@ def test_isolated_layout_keeps_releases_traversable(
         "build": "750",
         "etc": "700",
     }
-    chown = next(c for c in admin.calls if c[0] == "chown")
-    assert {Path(p).name for p in chown[2:]} == {"releases", "data", "run", "build", "etc"}
+    assert not any(c[0] == "chown" for c in admin.calls)
     admin.calls.clear()
     core.ensure_layout(lay, BLOCK)  # everything exists: no fork at all
     assert admin.calls == []
@@ -232,6 +232,7 @@ def test_an_isolated_tick_stages_into_releases_and_passes_the_block(
 
         admin = FakeAdmin()
         monkeypatch.setattr(core, "_admin", lambda argv, block: admin(argv, block).check())
+        monkeypatch.setattr(core, "_as_service", lambda argv, block: admin(argv, block).check())
         monkeypatch.setattr(coresync, "_admin", lambda argv, block: admin(argv, block).check())
         monkeypatch.setattr(ams.userns, "run_admin", admin)
         roots: list[tuple[Path, UidBlock]] = []
@@ -294,7 +295,8 @@ def test_an_isolated_tick_stages_into_releases_and_passes_the_block(
         assert planner_blocks == [BLOCK] and runner_blocks == [BLOCK]
         # current flipped through the admin namespace, onto the staged release.
         assert core.current_sha(w.layout) == SHA_A
-        assert ["mv", "-T", str(w.layout.root / ".current.new"), str(w.layout.current)] in (
+        # (the temporary link is built outside the service-owned root: security-6)
+        assert ["mv", "-T", str(w.layout.root.parent / ".current.new"), str(w.layout.current)] in (
             admin.calls
         )
         # The bundle went into etc/ via the namespace, never a harness-side copy.

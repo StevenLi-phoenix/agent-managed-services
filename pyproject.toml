@@ -1,6 +1,6 @@
 [project]
 name = "ams"
-version = "1.0.0"
+version = "1.1.0"
 description = "Agent managed services: rootless supervisor core (userns + cgroup v2)"
 requires-python = ">=3.12"
 dependencies = []

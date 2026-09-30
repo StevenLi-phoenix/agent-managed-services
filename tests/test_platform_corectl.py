@@ -231,3 +231,35 @@ def test_isolated_runner_turns_a_spawn_error_into_rc_127(monkeypatch: pytest.Mon
     with pytest.raises(CoreControlError, match="not found"):
         ctl.status()
     assert ctl.ping() is False
+
+
+# --------------------------------------------- review 2026-09-29: error codes, gc
+
+
+def test_core_refusal_carries_cores_error_code(tmp_path: Path) -> None:
+    # Manager.upload -> parse -> validateManifest throws; corectl prints the code.
+    art = tmp_path / "t.artifact.json"
+    art.write_text("{}", encoding="utf-8")
+    err = "corectl: invalid_manifest: health: method ping is not provided\n"
+    with pytest.raises(CoreControlError) as info:
+        _ctl(FakeRunner([(1, "", err)])).upload(art)
+    assert info.value.code == "invalid_manifest"
+
+
+def test_transport_failure_has_no_error_code() -> None:
+    runner = FakeRunner([(1, "", "corectl: connect ENOENT /srv/core/run/control.sock\n")])
+    with pytest.raises(CoreControlError) as info:
+        _ctl(runner).status()
+    assert info.value.code is None
+
+
+def test_runner_rc_127_has_no_error_code() -> None:
+    with pytest.raises(CoreControlError) as info:
+        _ctl(FakeRunner([(127, "", "'node' not found on PATH")])).status()
+    assert info.value.code is None
+
+
+def test_gc_argv_and_result() -> None:
+    runner = FakeRunner([(0, {"removed": ["a" * 64], "kept": 3}, "")])
+    assert _ctl(runner).gc() == {"removed": ["a" * 64], "kept": 3}
+    assert runner.calls[0]["argv"][-1] == "gc"

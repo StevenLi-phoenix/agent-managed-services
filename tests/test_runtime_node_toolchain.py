@@ -421,6 +421,22 @@ class AdminRecorder:
         return AdminResult(tuple(argv), 0, b"", b"")
 
 
+class ServiceRecorder:
+    """Stands in for ``runtime.run_as_service``: the untrusted steps (security-3)."""
+
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.fail_on = fail_on
+
+    def __call__(
+        self, argv: Any, block: UidBlock, *, env: Any, cwd: Any = None, timeout_s: float = 0
+    ) -> AdminResult:
+        argv = list(argv)
+        self.calls.append({"argv": argv, "env": dict(env), "cwd": cwd})
+        rc = 1 if self.fail_on and self.fail_on in " ".join(argv) else 0
+        return AdminResult(tuple(argv), rc, b"", b"boom" if rc else b"")
+
+
 @pytest.fixture
 def own_block() -> UidBlock:
     """A block whose host uid is ours, so provision's final owner check passes."""
@@ -439,6 +455,8 @@ def test_provision_managed_spec_ensures_toolchain_then_installs_then_builds(
     )
     admin = AdminRecorder()
     monkeypatch.setattr(rt_mod, "_admin", admin)
+    svc = ServiceRecorder()
+    monkeypatch.setattr(rt_mod, "run_as_service", svc)
     root = tmp_path / "root"
     (root / "current").mkdir(parents=True)
     (root / "current" / "package.json").write_text("{}")
@@ -449,13 +467,20 @@ def test_provision_managed_spec_ensures_toolchain_then_installs_then_builds(
     assert ensured == [(store, NODE, PNPM)]
     shown = [c["shown"] for c in admin.calls]
     assert shown[0][:2] == ["pnpm", "install"]
-    assert shown[1] == ["node", "scripts/build.mjs"]
-    assert shown[2][:2] == ["chown", "-R"]
-    for call in admin.calls[:2]:
-        assert call["argv"][2:4] == ["-C", str(root / "current")]
-        assert call["env"]["PATH"].split(":")[:2] == list(
-            node_toolchain(store, NODE, PNPM).bin_dirs
-        )
+    assert admin.calls[0]["argv"][2:4] == ["-C", str(root / "current")]
+    assert admin.calls[0]["env"]["PATH"].split(":")[:2] == list(
+        node_toolchain(store, NODE, PNPM).bin_dirs
+    )
+    # The build is repository code: it runs as the service (security-3), after
+    # the tree was handed to it, never as inner root (the harness uid).
+    assert ["node", "scripts/build.mjs"] not in shown
+    assert shown[1][:2] == ["chown", "-R"]
+    build = svc.calls[-1]
+    assert build["argv"] == ["node", "scripts/build.mjs"]
+    assert build["cwd"] == str(root / "current")
+    assert build["env"]["PATH"].split(":")[:2] == list(node_toolchain(store, NODE, PNPM).bin_dirs)
+    assert build["env"]["HOME"].startswith(str(root))
+    assert shown[-1][:2] == ["chown", "-R"]
 
 
 def test_provision_legacy_node_keeps_the_warning_and_never_downloads(
@@ -652,64 +677,83 @@ def test_provision_tree_isolated_refuses_off_linux(
         )
 
 
-def test_provision_tree_isolated_runs_as_inner_root_then_chowns(
+def test_provision_tree_isolated_runs_every_step_as_the_service(
     monkeypatch: pytest.MonkeyPatch, store: RuntimeStore, tree: Path, own_block: UidBlock
 ) -> None:
+    """pnpm lifecycle scripts and scripts/build.mjs are untrusted code: as inner
+    root they would hold the harness uid's write access (ams source, venv, ~/.ssh,
+    the shared toolchain) and could lift the mount mask (security-3/-4/-5). As the
+    service the harness uid is not even mapped, and the pnpm store and caches are
+    the service's own, under its root."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(
         rt_mod, "ensure_node_toolchain", lambda s, n, p=None, **kw: node_toolchain(s, n, p)
     )
     admin = AdminRecorder()
     monkeypatch.setattr(rt_mod, "_admin", admin)
+    svc = ServiceRecorder()
+    monkeypatch.setattr(rt_mod, "run_as_service", svc)
     spec = schema.RuntimeSpec(kind="pnpm", node=NODE, pnpm=PNPM, build=("node", "b.mjs"))
 
     provision_tree(tree, spec, block=own_block, store=store, env={"CORE_SOURCE_COMMIT": "f" * 40})
 
-    assert [c["shown"] for c in admin.calls] == [
+    assert admin.calls == []  # nothing as inner root, no closing chown
+    root = tree.parents[1]  # <state>/services/core/root
+    cache = root / rt_mod.SERVICE_CACHE_DIRNAME
+    assert [c["argv"] for c in svc.calls] == [
+        ["mkdir", "-m", "700", "-p", str(cache), str(cache / "home")],
         ["pnpm", "install", "--frozen-lockfile"],
         ["node", "b.mjs"],
-        ["chown", "-R", "1000:1000", str(tree)],
     ]
-    install = admin.calls[0]
-    assert install["argv"][:4] == ["env", "-i", "-C", str(tree)]
-    assert install["env"]["CORE_SOURCE_COMMIT"] == "f" * 40
-    assert install["env"]["PATH"].split(":")[:2] == list(node_toolchain(store, NODE, PNPM).bin_dirs)
-    # the admin path keeps the reflink-only import method (one XFS store, D8).
-    assert install["env"]["npm_config_package_import_method"] == "clone"
-    # install scripts and the build are untrusted code: both run masked (issue #1),
-    # the closing chown is a harness op and sees the real files.
-    state = tree.parents[4]
-    expected = rt_mod.provisioning_mask(state / "services" / "core" / "root")
-    assert state / "secrets" in expected
-    assert [c["mask"] for c in admin.calls] == [expected, expected, []]
+    install = svc.calls[1]
+    assert install["cwd"] == str(tree)
+    env = install["env"]
+    assert env["CORE_SOURCE_COMMIT"] == "f" * 40
+    assert env["PATH"].split(":")[:2] == list(node_toolchain(store, NODE, PNPM).bin_dirs)
+    assert env["npm_config_package_import_method"] == "clone"  # same XFS store (D8)
+    assert env["HOME"] == str(cache / "home")
+    for key in ("npm_config_store_dir", "npm_config_cache", "PNPM_HOME", "XDG_CACHE_HOME"):
+        assert env[key].startswith(str(cache) + "/"), key
+    # nothing of the harness's own: not its home, not the shared caches
+    home = str(Path.home())
+    assert not any(v.startswith(home + "/") or v == home for v in env.values()), env
+    assert str(store.pnpm_store) not in env.values()
 
 
 def test_provision_tree_isolated_refuses_a_tree_outside_any_service_root(
     monkeypatch: pytest.MonkeyPatch, store: RuntimeStore, tmp_path: Path, own_block: UidBlock
 ) -> None:
     monkeypatch.setattr(sys, "platform", "linux")
-    admin = AdminRecorder()
-    monkeypatch.setattr(rt_mod, "_admin", admin)
+    svc = ServiceRecorder()
+    monkeypatch.setattr(rt_mod, "run_as_service", svc)
     loose = tmp_path / "loose"
     loose.mkdir()
     (loose / "package.json").write_text("{}")
     with pytest.raises(ProvisionError, match="not inside a service root"):
         provision_tree(loose, schema.RuntimeSpec(kind="pnpm"), block=own_block, store=store)
-    assert admin.calls == []
-    # an explicit mask is honoured as given
-    provision_tree(
-        loose, schema.RuntimeSpec(kind="pnpm"), block=own_block, store=store, mask=[tmp_path / "s"]
-    )
-    assert admin.calls[0]["mask"] == [tmp_path / "s"]
+    assert svc.calls == []
+
+
+def test_provision_tree_isolated_refuses_a_tree_the_service_does_not_own(
+    monkeypatch: pytest.MonkeyPatch, store: RuntimeStore, tree: Path
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    svc = ServiceRecorder()
+    monkeypatch.setattr(rt_mod, "run_as_service", svc)
+    with pytest.raises(ProvisionError, match="owned by host uid"):
+        provision_tree(
+            tree, schema.RuntimeSpec(kind="pnpm"), block=UidBlock(100_000, 100_000), store=store
+        )
+    assert svc.calls == []
 
 
 def test_provision_tree_isolated_failure_stops_before_build(
     monkeypatch: pytest.MonkeyPatch, store: RuntimeStore, tree: Path, own_block: UidBlock
 ) -> None:
     monkeypatch.setattr(sys, "platform", "linux")
-    admin = AdminRecorder(fail_on="pnpm install")
-    monkeypatch.setattr(rt_mod, "_admin", admin)
+    svc = ServiceRecorder(fail_on="pnpm install")
+    monkeypatch.setattr(rt_mod, "run_as_service", svc)
     spec = schema.RuntimeSpec(kind="pnpm", build=("node", "b.mjs"))
     with pytest.raises(ProvisionError, match="boom"):
         provision_tree(tree, spec, block=own_block, store=store)
-    assert [c["shown"][0] for c in admin.calls] == ["pnpm"]
+    assert [c["argv"][0] for c in svc.calls] == ["mkdir", "pnpm"]

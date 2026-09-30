@@ -1,5 +1,7 @@
 # The platform layer
 
+> **Legacy manifest mode (api v2.0.0), deprecated in ams 1.1.0.** api `main` now runs as one Cordis-based core process with plugins and no `service.yaml` manifests; ams hosts it in **core mode**, see [platform-core.md](platform-core.md). This page is kept unchanged for hosts that still run api v2.0.0. Removing legacy mode is a 2.0.0 decision.
+
 How a `git push` to the `api` monorepo becomes a running, routed, registered
 service under the ams harness — and where every piece of that lives.
 

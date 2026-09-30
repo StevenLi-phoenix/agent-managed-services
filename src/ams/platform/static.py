@@ -33,7 +33,7 @@ from types import MappingProxyType
 from typing import Any
 
 from ams.platform.gateway import static_root
-from ams.runtime import RuntimeStore, provisioning_env
+from ams.runtime import RuntimeStore, harness_private_paths, provisioning_env
 from ams.schema import RESERVED_ENV, RESERVED_ENV_PREFIXES, SERVICE_ID_RE
 from ams.state import StateDir
 from ams.uidmap import UidBlock
@@ -238,7 +238,9 @@ def _parse_build_command(service_id: str, raw: str) -> list[str]:
     return argv
 
 
-def _build_mask(state: StateDir) -> list[Path]:
+def _build_mask(
+    state: StateDir, store: RuntimeStore | None = None, keep: Sequence[Path] = ()
+) -> list[Path]:
     """Harness-private paths a static build must not see (issue #1).
 
     The build runs under the admin map, where inner root's file identity *is*
@@ -248,6 +250,11 @@ def _build_mask(state: StateDir) -> list[Path]:
     static subtree itself, which contains the scratch build dir. Entries are
     disjoint (:func:`ams.userns._apply_mask` forbids nesting); absent paths
     are skipped by the mask itself.
+
+    With ``store`` the harness-private paths outside ``<state>`` are hidden too
+    (:func:`ams.runtime.harness_private_paths`: the platform signing key, the
+    private mirrors, the harness HOME's credentials -- security-5); ``keep``
+    names what the build reads and must stay visible (its checkout).
     """
     mask = [
         state.root / name
@@ -257,6 +264,8 @@ def _build_mask(state: StateDir) -> list[Path]:
     platform = site_root.parent
     if platform.is_dir():
         mask.extend(p for p in platform.iterdir() if p != site_root)
+    if store is not None:
+        mask.extend(harness_private_paths(store, keep=(state.root, site_root, *keep)))
     return mask
 
 
@@ -434,7 +443,7 @@ def publish_static(
                     "process (D1); pass any UidBlock, it is never chowned to"
                 )
             env = provisioning_env(store)
-            mask = _build_mask(state)
+            mask = _build_mask(state, store, keep=(checkout,))
             for raw in build_cmds:
                 argv = _parse_build_command(service_id, raw)
                 _run_build_step(

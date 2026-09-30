@@ -426,3 +426,38 @@ def test_the_cli_and_the_control_module_agree_on_the_op_list():
     from ams.control import OPS
 
     assert set(CTL_OPS) == set(OPS)
+
+
+def test_shutdown_grace_follows_declarations_added_after_start(tmp_path):
+    """upstream-fit-6: the documented fresh-host flow starts the harness first and
+    lets `ams platform core bootstrap` add core (stop timeout 40 s) by reload; the
+    grace must be computed when the harness stops, not when it started."""
+    from ams.cli import build_supervisor, shutdown_grace
+    from ams.schema import from_dict
+    from ams.state import StateDir
+
+    _state_with(tmp_path, "one", 'id = "one"\n[start]\nargv = ["/bin/echo"]\n')
+    asm = build_supervisor(StateDir(tmp_path), isolation=False)
+    grace = shutdown_grace(asm)
+    assert grace() == asm.declarations["one"].stop.timeout_s < 40.0
+    asm.declarations["core"] = from_dict(
+        {"id": "core", "start": {"argv": ["/bin/true"]}, "stop": {"timeout_s": 40.0}}
+    )
+    assert grace() == 40.0
+
+
+def test_run_forever_evaluates_a_callable_grace_at_shutdown(tmp_path, monkeypatch):
+    import threading
+
+    from ams.cli import build_supervisor
+    from ams.state import StateDir
+
+    asm = build_supervisor(StateDir(tmp_path), isolation=False)
+    seen: list[float | None] = []
+    monkeypatch.setattr(asm.supervisor, "shutdown", lambda t=None: seen.append(t))
+    value = [1.0]
+    stop = threading.Event()
+    stop.set()
+    value[0] = 42.0  # changed after run_forever was called, before shutdown
+    asm.supervisor.run_forever(stop, shutdown_timeout_s=lambda: value[0])
+    assert seen == [42.0]

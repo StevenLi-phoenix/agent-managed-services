@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -111,6 +112,40 @@ K_ERROR = "core_sync_error"
 LIVE = "live"
 FAILED = "failed"
 PROBATION = "probation"
+#: Rejected for a reason about core's *state*, not the artifact's bytes: retried
+#: once that state changes (``blocked_on``), never every tick.
+BLOCKED = "blocked"
+
+#: corectl error codes that refuse the artifact bytes themselves (upload/parse,
+#: upstream ``artifact.ts``/``ops.ts``). A verdict on the content key, recorded like
+#: a rejected deploy; any other ``CoreControlError`` is transport and retried.
+ARTIFACT_REFUSALS = frozenset(
+    {
+        "invalid_manifest",
+        "invalid_artifact",
+        "artifact_too_large",
+        "manifest_mismatch",
+        "plugin_mismatch",
+    }
+)
+#: Transition reasons (upstream ``manager.ts``) that describe what core currently
+#: has installed -- a missing or failed provider, a CAS race, a dependent still
+#: holding a service -- rather than anything wrong with the artifact.
+STATE_REJECTIONS = frozenset(
+    {
+        "dependency_unavailable",
+        "dependency_failed",
+        "dependency_major_mismatch",
+        "generation_conflict",
+        "service_in_use",
+        "major_in_use",
+        "unknown_plugin",
+    }
+)
+#: ``observed.reason`` of a plugin whose desired *and* lastKnownGood artifacts core
+#: cannot read at boot (upstream ``boot.ts``) -- e.g. core.sqlite restored without
+#: ``artifacts/``. Only a fresh upload brings it back.
+UNREADABLE = "artifact_unreadable"
 
 
 class CoreSyncError(RuntimeError):
@@ -215,7 +250,23 @@ def make_planner(state: StateDir, layout: CoreLayout, block: UidBlock | None) ->
     The asset is copied into the service root because in isolated mode the planner
     runs as the service uid, which cannot read the harness's ams checkout (the
     same reason the pool runner is placed, PLAN-pool §4.1).
+
+    In isolated mode the placement runs **as the service** (the ``runner``), never
+    as inner root: ``build/`` is service-owned and core keeps running while a tick
+    plans, so a compromised core can plant ``build/core_plan.mjs`` or
+    ``build/artifacts`` as a symlink to a harness file. A following ``cp``/``chown``
+    as inner root (the harness uid, with CAP_CHOWN) would overwrite that file and
+    hand it to the service. As the service, a planted link only reaches what the
+    service could write anyway. The bytes travel through a 0644 staging file in the
+    harness-owned ``<state>/services/core/`` (traversable by the service, not
+    writable by it).
     """
+
+    def place(runner: Runner, argv: Sequence[str], env: Mapping[str, str], what: str) -> None:
+        result = runner(list(argv), env=env, cwd=None, timeout_s=60.0)
+        if not result.ok:
+            tail = result.stderr.decode(errors="replace").strip()[-500:]
+            raise CorePlanError(f"{what} failed (rc={result.returncode}): {tail or '(no stderr)'}")
 
     def plan(
         tree: Path,
@@ -232,35 +283,33 @@ def make_planner(state: StateDir, layout: CoreLayout, block: UidBlock | None) ->
             if not asset.is_file() or asset.read_bytes() != content:
                 asset.write_bytes(content)
         else:
-            from ams.spawn import INNER_GID, INNER_UID
-
             tmp = state.service_dir(CORE_ID) / f".{CORE_PLAN_ASSET}.tmp{os.getpid()}"
             tmp.write_bytes(content)
             try:
                 os.chmod(tmp, 0o644)
-                _admin(["mkdir", "-p", str(out_dir)], block)
-                _admin(["cp", str(tmp), str(asset)], block)
-                _admin(
-                    [
-                        "chown",
-                        f"{INNER_UID}:{INNER_GID}",
-                        str(asset),
-                        str(out_dir),
-                        str(out_dir.parent),
-                    ],
-                    block,
-                )
+                place(runner, ["mkdir", "-p", str(out_dir)], env, "mkdir of the artifacts dir")
+                place(runner, ["cp", str(tmp), str(asset)], env, f"placing {CORE_PLAN_ASSET}")
             finally:
                 tmp.unlink(missing_ok=True)
         argv = ["node", str(asset), str(tree), str(out_dir), *ids]
         started = time.monotonic()
         result = runner(argv, env=env, cwd=str(tree), timeout_s=PLAN_TIMEOUT_S)
+        # Complete lines count even when node died afterwards: a crash in one
+        # plugin's build must not throw away the others' plans (the ids with no
+        # line become build errors in _Tick.plan). No line at all is a failed run.
+        plans = parse_plan_output(result.stdout.decode(errors="replace"))
         if not result.ok:
             tail = "\n".join(result.stderr.decode(errors="replace").strip().splitlines()[-15:])
-            raise CorePlanError(
-                f"core_plan.mjs exited {result.returncode}: {tail or '(no stderr)'}"
+            if not plans:
+                raise CorePlanError(
+                    f"core_plan.mjs exited {result.returncode}: {tail or '(no stderr)'}"
+                )
+            log.warning(
+                "core_plan.mjs exited %d after %d plan line(s); keeping them: %s",
+                result.returncode,
+                len(plans),
+                tail or "(no stderr)",
             )
-        plans = parse_plan_output(result.stdout.decode(errors="replace"))
         log.info(
             "planned %d plugin(s) in %.1fs (%d error(s))",
             len(plans),
@@ -419,8 +468,13 @@ def _empty_record() -> dict[str, Any]:
         "release_sha": None,
         "previous_release_sha": None,
         "release_failed_sha": None,
+        "stage_failed_sha": None,
         "planned_sha": None,
         "planned_roster": [],
+        #: plugins whose last ship failed in transport: re-planned alone next tick
+        "ship_retry": [],
+        #: pid -> live generationId that a failed post-grant restart left running
+        "privilege_restart": {},
         "plugins": {},
         "build_failures": {},
         "escalated": {},
@@ -577,6 +631,39 @@ def _installed(p: Mapping[str, Any] | None) -> bool:
     return bool(p and isinstance(p.get("desired"), dict))
 
 
+def _active(p: Mapping[str, Any] | None) -> bool:
+    """The plugin has a live generation that is serving."""
+    live = (p or {}).get("live")
+    return isinstance(live, dict) and live.get("phase") == "active"
+
+
+def _unreadable(p: Mapping[str, Any] | None) -> bool:
+    observed = (p or {}).get("observed") or {}
+    return observed.get("phase") == "failed" and str(observed.get("reason") or "").startswith(
+        UNREADABLE
+    )
+
+
+def _reason_code(reason: Any) -> str:
+    """``dependency_unavailable: clock`` -> ``dependency_unavailable``."""
+    return str(reason or "").split(":", 1)[0].strip()
+
+
+def core_fingerprint(status: Mapping[str, Any] | None) -> str:
+    """A short digest of what core runs: every plugin's live artifact and phase.
+
+    A ``blocked`` verdict holds while this stays the same, and is retried once
+    when it changes (a provider went live, a dependent was removed ...).
+    """
+    items = sorted(
+        f"{p.get('pluginId')}={(p.get('live') or {}).get('artifactId')}"
+        f"/{(p.get('observed') or {}).get('phase')}"
+        for p in (status or {}).get("plugins") or []
+        if isinstance(p, dict)
+    )
+    return hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()[:16]
+
+
 def _touches(paths: Sequence[str], prefixes: Sequence[str]) -> list[str]:
     """Paths matching ``core_paths``: an entry ending in ``/`` is a prefix, else exact."""
     hits = []
@@ -619,6 +706,7 @@ class _Tick:
         self._path_env: str | None = None
         self._sup: Supervisor | None = None
         self.head: str | None = None
+        self._bundle: str | None = None
         #: Set when the whole tick ran. Only then is "not seen this tick" evidence
         #: that a cause cleared -- a tick that stopped at the fetch never looked.
         self.completed = False
@@ -657,6 +745,12 @@ class _Tick:
 
     def provision_log(self) -> Path:
         return self.state.logs_dir / PROVISION_LOG
+
+    def bundle_digest(self) -> str:
+        """The config bundle every verdict of this tick is judged under ("" = none)."""
+        if self._bundle is None:
+            self._bundle = core_mod.bundle_digest(self.state) or ""
+        return self._bundle
 
     # ----------------------------------------------------------- escalation
 
@@ -730,8 +824,18 @@ class _Tick:
     # --------------------------------------------------------------- stage
 
     def stage(self, head: str) -> bool:
+        """``True`` when ``head`` is staged and installed.
+
+        A sha whose stage failed is held like a failed release: re-running a
+        ``pnpm install`` that fails the same way every 60 s fixes nothing, and a
+        new commit tries again. The caller keeps running the rest of the tick
+        against the running release either way.
+        """
         if head == self.record["staged_sha"]:
             return True
+        if head == self.record["stage_failed_sha"]:
+            log.info("staging %s failed before; not retried at this sha", head[:12])
+            return False
         mirror = self.mirror
         tree = self.layout.release_dir(head)
         try:
@@ -739,6 +843,9 @@ class _Tick:
                 mirror.stage_plain(head, tree)
             else:
                 mirror.stage(head, self.layout.root, self.block, dest=f"releases/{head}")
+            problems = core_mod.check_tree_pins(tree, self.cfg.node, self.cfg.pnpm)
+            if problems:
+                raise core_mod.CoreConfigError("; ".join(problems))
             self.hooks.provision(
                 tree,
                 self.spec(),
@@ -751,11 +858,16 @@ class _Tick:
         except Exception as e:  # noqa: BLE001 - SourceError/ProvisionError/SpawnError alike
             self.escalate(K_STAGE, f"{type(e).__name__}: {e}")
             self.out.error = f"stage {head[:12]} failed"
+            self.record["stage_failed_sha"] = head
             return False
         self.record["staged_sha"] = head
+        self.record["stage_failed_sha"] = None
         log.info("staged + installed %s", head[:12])
         with contextlib.suppress(Exception):
             mirror.gc(keep=MIRROR_KEEP)
+        # Every staged tree carries a full node_modules; the one staged before
+        # this is garbage now unless it is the release or its rollback target.
+        self.gc_releases()
         return True
 
     # ------------------------------------------------------------- release
@@ -814,9 +926,19 @@ class _Tick:
         return changed
 
     def start_core(self) -> None:
-        """Declaration changed -> reload (which adds or restarts it); else start."""
+        """Declaration changed -> reload (which adds or restarts it); else start.
+
+        A reload leaves a service that ``ctl stop`` stopped *down* -- the
+        operator's intent wins (``ams.reload``) -- and a release stops core
+        before it flips ``current``. So after a reload core is started explicitly
+        when it is still stopped; not unconditionally, because ``start`` refuses
+        a live process (a first declaration is already started by the reload).
+        """
         if self.declare():
             self.sup.reload()
+            if self.core_state() in ("stopped", "failed"):
+                log.info("core declaration changed while core was stopped; starting it")
+                self.sup.start(CORE_ID)
             return
         try:
             self.sup.start(CORE_ID)
@@ -825,50 +947,106 @@ class _Tick:
                 raise
             self.sup.reload()
 
-    def gate(self, sha: str, was_healthy: bool) -> tuple[bool, str]:
+    def active_plugins(self, sha: str | None) -> frozenset[str]:
+        """Plugins serving (``live.phase`` active) on the core built from ``sha``."""
+        if sha is None:
+            return frozenset()
+        try:
+            status = self.control(sha).status()
+        except CoreControlError as e:
+            log.warning("cannot list live plugins before the switch: %s", e)
+            return frozenset()
+        return frozenset(
+            str(p["pluginId"])
+            for p in status.get("plugins") or []
+            if isinstance(p, dict) and isinstance(p.get("pluginId"), str) and _active(p)
+        )
+
+    def gate(
+        self, sha: str, was_healthy: bool, active_before: frozenset[str] = frozenset()
+    ) -> tuple[bool, str]:
         """Core answers on its socket, then HTTP: never worse than before the stop.
 
         ``/health`` is the ``health`` plugin behind the ``gateway`` plugin, not core
         itself, so a fresh core (no plugins) cannot pass an HTTP gate. The rule is
         therefore "no regression": ``/health`` must be 200 again if it was 200
-        before the stop; otherwise the gateway port must answer HTTP at all if the
-        gateway plugin is installed; otherwise the control socket answering is it.
+        before the stop; otherwise every plugin that was serving before the stop
+        (``active_before``) must be serving again -- one plugin already red must
+        not turn the gate into "the port answers"; with nothing serving before,
+        the gateway port must answer HTTP at all if the gateway plugin is
+        installed (and readable); otherwise the control socket answering is it.
         """
         ctl = self.control(sha)
         deadline = self.now() + self.cfg.health_timeout_s
-        status: Mapping[str, Any] | None = None
+        answered = False
         last = "control socket not answering"
         port = self.cfg.gateway_port
         while True:
-            if status is None:
-                try:
-                    status = ctl.status()
-                except CoreControlError as e:
+            status: Mapping[str, Any] | None = None
+            try:
+                status = ctl.status()
+                answered = True
+            except CoreControlError as e:
+                if not answered:
                     last = f"control socket not answering: {e}"
             if status is not None:
+                missing = sorted(
+                    pid for pid in active_before if not _active(_plugin_status(status, pid))
+                )
                 if was_healthy:
                     code = self.hooks.http_probe(port, core_mod.HEALTH_PATH)
                     if code == 200:
                         return True, "/health 200"
                     last = f"/health answered {code}" if code else "gateway not answering"
+                elif missing:
+                    last = f"serving before the switch, not serving now: {', '.join(missing)}"
+                elif active_before:
+                    return True, f"all {len(active_before)} plugin(s) serving before serve again"
                 else:
                     gw = _plugin_status(status, "gateway")
                     if not (_installed(gw) and gw["desired"].get("enabled", True)):
                         return True, "control socket answers (no gateway installed)"
+                    if _unreadable(gw):
+                        # Restored core.sqlite without artifacts/: nothing can bind
+                        # the port until ship reinstalls the gateway -- which only
+                        # runs once this gate has passed.
+                        return True, "control socket answers (gateway artifact unreadable)"
                     code = self.hooks.http_probe(port, core_mod.HEALTH_PATH)
                     if code is not None:
                         return True, f"gateway answers ({code})"
                     last = "gateway plugin installed but port not answering"
+            if self.harness_gave_up():
+                # `failed` is terminal: restart policy exhausted, the harness will not
+                # start core again. Waiting out health_timeout_s would only extend the
+                # outage before the flip back (seen in the local e2e: ~90 s vs ~15 s).
+                return False, f"{last}; the harness gave up on core (status failed)"
             if self.now() >= deadline:
                 return False, last
             self.sleep(GATE_INTERVAL_S)
 
-    def _switch(self, sha: str, was_healthy: bool) -> tuple[bool, str]:
+    def harness_gave_up(self) -> bool:
+        """``True`` when the harness reports core ``failed`` (it will not restart it).
+
+        A harness that cannot be asked is not evidence either way: ``False``.
+        """
+        try:
+            state = self.core_state()
+        except Exception as e:  # noqa: BLE001 - ControlError/SupervisorError alike
+            log.debug("gate: cannot ask the harness about core: %s", e)
+            return False
+        if state == "failed":
+            log.warning("gate: the harness reports core failed; not waiting any longer")
+            return True
+        return False
+
+    def _switch(
+        self, sha: str, was_healthy: bool, active_before: frozenset[str] = frozenset()
+    ) -> tuple[bool, str]:
         if not self.stop_core():
             return False, "core did not stop"
         core_mod.flip_current(self.layout, sha, self.block)
         self.start_core()
-        return self.gate(sha, was_healthy)
+        return self.gate(sha, was_healthy, active_before)
 
     def release(self, head: str) -> bool:
         try:
@@ -898,21 +1076,31 @@ class _Tick:
             prev is not None
             and self.hooks.http_probe(self.cfg.gateway_port, core_mod.HEALTH_PATH) == 200
         )
+        active_before = self.active_plugins(prev)
         log.info(
-            "releasing %s (previous %s, /health before: %s)",
+            "releasing %s (previous %s, /health before: %s, %d plugin(s) serving)",
             head[:12],
             str(prev)[:12],
             "200" if was_healthy else "not 200",
+            len(active_before),
         )
         try:
-            ok, detail = self._switch(head, was_healthy)
+            ok, detail = self._switch(head, was_healthy, active_before)
         except Exception as e:  # noqa: BLE001 - supervisor/transport errors
             return self._release_failed(
-                head, f"{type(e).__name__}: {e}", flipped=True, was_healthy=was_healthy
+                head,
+                f"{type(e).__name__}: {e}",
+                flipped=True,
+                was_healthy=was_healthy,
+                active_before=active_before,
             )
         if not ok:
             return self._release_failed(
-                head, f"health gate: {detail}", flipped=True, was_healthy=was_healthy
+                head,
+                f"health gate: {detail}",
+                flipped=True,
+                was_healthy=was_healthy,
+                active_before=active_before,
             )
         self.record["previous_release_sha"] = prev
         self.record["release_sha"] = head
@@ -923,7 +1111,13 @@ class _Tick:
         return True
 
     def _release_failed(
-        self, head: str, detail: str, *, flipped: bool, was_healthy: bool = False
+        self,
+        head: str,
+        detail: str,
+        *,
+        flipped: bool,
+        was_healthy: bool = False,
+        active_before: frozenset[str] = frozenset(),
     ) -> bool:
         self.out.release_ok = False
         prev = self.record["release_sha"]
@@ -939,7 +1133,7 @@ class _Tick:
             self.escalate(K_DOWN, "the first release failed; there is no release to flip back to")
             return False
         try:
-            ok, back = self._switch(prev, was_healthy)
+            ok, back = self._switch(prev, was_healthy, active_before)
         except Exception as e:  # noqa: BLE001
             ok, back = False, f"{type(e).__name__}: {e}"
         self.out.rolled_back = True
@@ -1031,22 +1225,57 @@ class _Tick:
 
     # -------------------------------------------------------------- plan
 
-    def plan_needed(self, head: str, status: Mapping[str, Any]) -> bool:
+    def retry_reason(self, rec: Mapping[str, Any], status: Mapping[str, Any] | None) -> str | None:
+        """Why a content key that did not go live may be tried once more, or ``None``.
+
+        A verdict holds for the bytes *under the conditions it was reached in*:
+        the core release, the config bundle, and -- for a ``blocked`` rejection
+        about core's state -- what core was running. A change to any of them is a
+        new experiment, tried once; an unchanged one is never retried (no storm).
+        Records written before these fields existed are never retried.
+        """
+        outcome = rec.get("outcome")
+        if outcome not in (FAILED, BLOCKED):
+            return None
+        release = self.record["release_sha"]
+        if "release" in rec and rec["release"] != release:
+            return f"core release changed ({_short(rec['release'])} -> {_short(release)})"
+        if "bundle" in rec and rec["bundle"] != self.bundle_digest():
+            return "config bundle changed"
+        if outcome == BLOCKED and rec.get("blocked_on") != core_fingerprint(status):
+            return "core's installed plugins changed"
+        return None
+
+    def plan_ids(self, head: str, status: Mapping[str, Any]) -> list[str]:
+        """Which roster plugins to build this tick; ``[]`` = none.
+
+        The whole roster on a new head or roster; otherwise only the plugins that
+        need another look: a transport failure last tick, a plugin recorded live
+        that core no longer has or cannot read, and a failed or blocked verdict
+        whose conditions changed (:meth:`retry_reason`).
+        """
         if head != self.record["planned_sha"]:
-            return True
+            return list(self.cfg.plugins)
         if list(self.cfg.plugins) != list(self.record["planned_roster"]):
             log.info("roster changed; re-planning")
-            return True
-        missing = [
-            pid
-            for pid in self.cfg.plugins
-            if (self.record.plugins.get(pid) or {}).get("outcome") == LIVE
-            and not _installed(_plugin_status(status, pid))
-        ]
-        if missing:
-            log.warning("recorded live but not installed in core: %s", ", ".join(missing))
-            return True
-        return False
+            return list(self.cfg.plugins)
+        retry = set(self.record["ship_retry"])
+        ids: list[str] = []
+        for pid in self.cfg.plugins:
+            rec = self.record.plugins.get(pid) or {}
+            p = _plugin_status(status, pid)
+            if pid in retry:
+                why: str | None = "its last ship failed in transport"
+            elif rec.get("outcome") == LIVE and not _installed(p):
+                why = "recorded live but not installed in core"
+            elif _installed(p) and _unreadable(p):
+                why = "core cannot read its artifact"
+            else:
+                why = self.retry_reason(rec, status)
+            if why:
+                log.info("%s: re-planning at %s: %s", pid, head[:12], why)
+                ids.append(pid)
+        return ids
 
     def plan(self, head: str, ids: Sequence[str]) -> list[PluginPlan] | None:
         factory = self.hooks.planner_factory
@@ -1104,22 +1333,71 @@ class _Tick:
             if force or not rec or rec.get("content_key") != plan.content_key:
                 out.append(plan)
                 continue
-            if rec.get("outcome") == FAILED:
-                log.info("%s: content %s already failed; not retried", pid, plan.content_key[:12])
+            p = _plugin_status(status, pid)
+            if _installed(p) and _unreadable(p):
+                log.warning("%s: core cannot read its artifact; reinstalling", pid)
+                out.append(plan)
                 continue
-            if rec.get("outcome") == LIVE and not _installed(_plugin_status(status, pid)):
+            if rec.get("outcome") in (FAILED, BLOCKED):
+                why = self.retry_reason(rec, status)
+                if why:
+                    log.info(
+                        "%s: content %s was %s, but %s; trying once more",
+                        pid,
+                        plan.content_key[:12],
+                        rec.get("outcome"),
+                        why,
+                    )
+                    out.append(plan)
+                    continue
+                log.info(
+                    "%s: content %s already %s; not retried",
+                    pid,
+                    plan.content_key[:12],
+                    rec.get("outcome"),
+                )
+                continue
+            if rec.get("outcome") == LIVE and not _installed(p):
                 log.warning("%s: live in the record but not installed in core; reinstalling", pid)
                 out.append(plan)
                 continue
             log.debug("%s: content unchanged (%s)", pid, plan.content_key[:12])
         return out
 
-    def ship(self, ctl: Any, head: str, plans: Sequence[PluginPlan]) -> bool:
-        """Upload + deploy each, then wait out probation. ``True`` = every one settled."""
-        settled = True
+    def _entry(self, plan: PluginPlan, artifact_id: str, head: str) -> dict[str, Any]:
+        """The record entry of one attempt, with the conditions it was judged under."""
+        return {
+            "content_key": plan.content_key,
+            "artifact_id": artifact_id,
+            "sha": head,
+            "release": self.record["release_sha"],
+            "bundle": self.bundle_digest(),
+            "at": _stamp(self.now()),
+        }
+
+    def ship(
+        self,
+        ctl: Any,
+        head: str,
+        plans: Sequence[PluginPlan],
+        status: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Upload + deploy each, then wait out probation. ``True`` = no transport failure.
+
+        Every outcome that is about the plugin is recorded under its content key:
+        a deploy that went ok (probation), a rejected or failed one, and core
+        refusing the artifact bytes at upload (``ARTIFACT_REFUSALS``). A rejection
+        about core's state (``STATE_REJECTIONS``) is recorded ``blocked`` with the
+        :func:`core_fingerprint` of ``status``. Only a transport failure is left
+        unrecorded -- listed in ``ship_retry`` so the next tick re-plans just it.
+        """
+        fingerprint = core_fingerprint(status)
+        retry = set(self.record["ship_retry"])
+        transport: list[str] = []
         deployed: dict[str, str] = {}
         for plan in plans:
             pid = plan.plugin_id
+            retry.discard(pid)
             try:
                 artifact_id = ctl.upload(Path(plan.path))
                 if artifact_id != plan.artifact_id:
@@ -1130,31 +1408,66 @@ class _Tick:
                         plan.artifact_id[:12],
                     )
                 transition = ctl.deploy(artifact_id)
-            except (CoreControlError, OSError, ValueError) as e:
-                self.escalate(K_SHIP, f"ship: {type(e).__name__}: {e}", plugin=pid)
-                self.out.failed.append(pid)
-                settled = False
+            except CoreControlError as e:
+                if e.code in ARTIFACT_REFUSALS:
+                    reason = f"core refused the artifact: {e}"[:1000]
+                    self.record.plugins[pid] = {
+                        **self._entry(plan, plan.artifact_id, head),
+                        "outcome": FAILED,
+                        "reason": reason,
+                    }
+                    self.out.failed.append(pid)
+                    self.escalate(K_REJECTED, reason, plugin=pid)
+                    continue
+                self._transport_failed(pid, e, transport)
+                continue
+            except (OSError, ValueError) as e:
+                self._transport_failed(pid, e, transport)
                 continue
             self.out.shipped.append(pid)
             outcome = transition.get("outcome")
-            entry = {
-                "content_key": plan.content_key,
-                "artifact_id": str(transition.get("toArtifact") or artifact_id),
-                "sha": head,
-                "at": _stamp(self.now()),
-            }
+            entry = self._entry(plan, str(transition.get("toArtifact") or artifact_id), head)
             if outcome == "ok":
                 self.record.plugins[pid] = {**entry, "outcome": PROBATION, "reason": None}
                 deployed[pid] = entry["artifact_id"]
                 log.info("%s: deployed %s; in probation", pid, entry["artifact_id"][:12])
                 self.grant_now(ctl, pid)
+                continue
+            reason = f"deploy {outcome}: {transition.get('reason')}"
+            if _reason_code(transition.get("reason")) in STATE_REJECTIONS:
+                self.record.plugins[pid] = {
+                    **entry,
+                    "outcome": BLOCKED,
+                    "reason": reason,
+                    "blocked_on": fingerprint,
+                }
+                log.warning("%s: %s; retried once core's installed plugins change", pid, reason)
             else:
-                reason = f"deploy {outcome}: {transition.get('reason')}"
                 self.record.plugins[pid] = {**entry, "outcome": FAILED, "reason": reason}
-                self.out.failed.append(pid)
-                self.escalate(K_REJECTED, reason, plugin=pid)
+            self.out.failed.append(pid)
+            self.escalate(K_REJECTED, reason, plugin=pid)
+        self.record["ship_retry"] = sorted(retry | set(transport))
+        shipped_any = bool(deployed)
         self.wait_probation(ctl, deployed)
-        return settled
+        if shipped_any:
+            self.collect_garbage(ctl)
+        return not transport
+
+    def _transport_failed(self, pid: str, e: Exception, transport: list[str]) -> None:
+        self.escalate(K_SHIP, f"ship: {type(e).__name__}: {e}", plugin=pid)
+        self.out.failed.append(pid)
+        transport.append(pid)
+
+    def collect_garbage(self, ctl: Any) -> None:
+        """``corectl gc`` after a ship: artifacts nothing references any more.
+
+        Best effort. Without it every content change adds an artifact for good,
+        and upstream ``corectl deploy`` reads and hashes the whole store first.
+        """
+        try:
+            ctl.gc()
+        except (CoreControlError, ValueError) as e:
+            log.warning("corectl gc failed (ignored): %s", e)
 
     def wait_probation(self, ctl: Any, deployed: dict[str, str]) -> None:
         started = self.now()
@@ -1228,6 +1541,31 @@ class _Tick:
 
     # -------------------------------------------------------- privileges
 
+    def _restart_for_privileges(self, ctl: Any, pid: str, p: Mapping[str, Any] | None) -> bool:
+        """Restart ``pid`` so a new generation holds its privileges. ``True`` = ok.
+
+        corectl returns a failed or rejected restart as a *result*: the old
+        generation -- started without the privileges, so without an ``ops`` port
+        (upstream ``Manager.host``) -- keeps running. That is escalated, and the
+        generation it left running is remembered so a later tick restarts again
+        while it is still the live one.
+        """
+        before = ((p or {}).get("live") or {}).get("generationId")
+        transition = ctl.restart(pid)
+        outcome = transition.get("outcome") if isinstance(transition, dict) else None
+        pending: dict[str, Any] = self.record["privilege_restart"]
+        if outcome != "ok":
+            pending[pid] = before
+            self.escalate(
+                K_PRIVILEGES,
+                f"restart after granting privileges: {outcome}: "
+                f"{(transition or {}).get('reason')}; the running generation lacks them",
+                plugin=pid,
+            )
+            return False
+        pending.pop(pid, None)
+        return True
+
     def grant_now(self, ctl: Any, pid: str) -> None:
         """Right after a deploy: give a privileged plugin its privileges *before*
         probation judges it.
@@ -1247,7 +1585,8 @@ class _Tick:
             if not _installed(p) or sorted(p["desired"].get("privileges") or []) == sorted(wanted):
                 return
             ctl.privileges(pid, list(wanted))
-            ctl.restart(pid)
+            if not self._restart_for_privileges(ctl, pid, p):
+                return
         except (CoreControlError, ValueError) as e:
             self.escalate(K_PRIVILEGES, f"{type(e).__name__}: {e}", plugin=pid)
             return
@@ -1262,6 +1601,9 @@ class _Tick:
         except CoreControlError as e:
             log.warning("privileges skipped: %s", e)
             return
+        pending: dict[str, Any] = self.record["privilege_restart"]
+        for pid in [k for k in pending if k not in self.cfg.privileges]:
+            del pending[pid]
         for pid, wanted in self.cfg.privileges.items():
             p = _plugin_status(status, pid)
             if not _installed(p):
@@ -1269,12 +1611,26 @@ class _Tick:
                 continue
             current = sorted(p["desired"].get("privileges") or [])
             if current == sorted(wanted):
+                if pid not in pending:
+                    continue
+                live_gen = (p.get("live") or {}).get("generationId")
+                if not p.get("live") or live_gen != pending[pid]:
+                    # A newer generation started since (with the privileges).
+                    log.info("%s: a new generation holds its privileges", pid)
+                    del pending[pid]
+                    continue
+                log.info("%s: generation %s predates its privileges; restarting", pid, live_gen)
+                try:
+                    if self._restart_for_privileges(ctl, pid, p):
+                        self.out.privileges.append(pid)
+                except (CoreControlError, ValueError) as e:
+                    self.escalate(K_PRIVILEGES, f"{type(e).__name__}: {e}", plugin=pid)
                 continue
             try:
                 ctl.privileges(pid, list(wanted))
                 # Privileges bind at generation start: a running plugin needs a new one.
-                if p.get("live"):
-                    ctl.restart(pid)
+                if p.get("live") and not self._restart_for_privileges(ctl, pid, p):
+                    continue
             except (CoreControlError, ValueError) as e:
                 self.escalate(K_PRIVILEGES, f"{type(e).__name__}: {e}", plugin=pid)
                 continue
@@ -1385,15 +1741,26 @@ def _tick_body(t: _Tick) -> None:
         return
     t.head = head
     log.info("%s -> %s", t.cfg.ref, head[:12])
-    if not t.stage(head):
-        return
 
-    if t.release_needed(head):
+    # Plugins are built from the head tree and judged by the running core, so
+    # they only ship while that core is head's core (or head leaves core alone).
+    ship_ok = True
+    if not t.stage(head):
+        log.warning("%s is not staged; running the tick against the current release", head[:12])
+        ship_ok = False
+    elif t.release_needed(head):
         if not t.release(head):
             log.warning("release failed; plugins are not shipped this tick")
             t.gateway()
             return
-    elif t.record["release_sha"] is not None:
+    elif head == t.record["release_failed_sha"] and head != t.record["release_sha"]:
+        log.info(
+            "core at %s is held; plugins built from it are not shipped onto core %s",
+            head[:12],
+            str(t.record["release_sha"])[:12],
+        )
+        ship_ok = False
+    if not t.out.released and t.record["release_sha"] is not None:
         if t.declare():
             # A config change (memory_max, log level, ports) with no new core code.
             log.info("core declaration changed without a release; reloading")
@@ -1413,13 +1780,18 @@ def _tick_body(t: _Tick) -> None:
     t.check_drift(status)
 
     ctl = t.control(t.record["release_sha"])
-    if t.plan_needed(head, status):
-        plans = t.plan(head, t.cfg.plugins)
+    ids = t.plan_ids(head, status) if ship_ok else []
+    if ids:
+        plans = t.plan(head, ids)
         if plans is not None:
-            settled = t.ship(ctl, head, t.ship_set(head, plans, status))
-            if settled:
-                t.record["planned_sha"] = head
-                t.record["planned_roster"] = list(t.cfg.plugins)
+            # Planned ids leave ship_retry; ship() puts transport failures back.
+            t.record["ship_retry"] = sorted(set(t.record["ship_retry"]) - set(ids))
+            t.ship(ctl, head, t.ship_set(head, plans, status), status)
+            # Every outcome that is about a plugin is recorded by now, so head
+            # is planned even when some failed: a failure is not re-planned
+            # every tick, only a transport failure (ship_retry) is re-shipped.
+            t.record["planned_sha"] = head
+            t.record["planned_roster"] = list(t.cfg.plugins)
     t.apply_privileges(ctl)
     t.gateway()
     t.gc_dir(t.layout.build / "artifacts", {head, t.record["planned_sha"]})
@@ -1479,10 +1851,11 @@ def rollback_release(
             raise CoreSyncError("no previous release to roll back to")
         t.out.released = True
         was_healthy = t.hooks.http_probe(cfg.gateway_port, core_mod.HEALTH_PATH) == 200
-        ok, detail = t._switch(prev, was_healthy)
+        active_before = t.active_plugins(cur)
+        ok, detail = t._switch(prev, was_healthy, active_before)
         if not ok:
             t.escalate(K_RELEASE, f"rollback to {prev[:12]}: {detail}")
-            back_ok, back = t._switch(cur, was_healthy)
+            back_ok, back = t._switch(cur, was_healthy, active_before)
             if not back_ok:
                 t.escalate(K_DOWN, f"flip forward to {cur[:12]} failed too: {back}")
             t.out.release_ok = False
@@ -1539,7 +1912,7 @@ def ship(
         plans = t.plan(head, ordered)
         if plans is None:
             return
-        t.ship(t.control(release), head, t.ship_set(head, plans, status, force=force))
+        t.ship(t.control(release), head, t.ship_set(head, plans, status, force=force), status)
 
     return _run(
         state,

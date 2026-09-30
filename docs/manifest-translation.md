@@ -1,5 +1,7 @@
 # Manifest translation
 
+> **Legacy manifest mode (api v2.0.0), deprecated in ams 1.1.0.** For the Cordis-based api core, see [platform-core.md](platform-core.md).
+
 `ams.platform.translate.translate(text, ctx)` turns one api `service.yaml`
 **manifest** into an ams `service.toml` **declaration** plus the two sidecars in
 [platform-sidecars.md](platform-sidecars.md). It parses the manifest with

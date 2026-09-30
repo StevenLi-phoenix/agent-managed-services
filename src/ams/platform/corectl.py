@@ -60,8 +60,30 @@ _PLUGIN_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 _ARTIFACT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+#: corectl reports a core-side refusal as ``corectl: <code>: <message>`` on stderr
+#: (``Control.call`` in upstream ``scripts/corectl.mjs``); a transport failure
+#: (``connect ENOENT``) or a client-side error has no such code.
+_ERROR_CODE_RE = re.compile(r"^corectl: ([a-z][a-z0-9_]*): ", re.MULTILINE)
+
+
 class CoreControlError(RuntimeError):
-    """corectl could not produce a result (core down, bad request, protocol drift)."""
+    """corectl could not produce a result (core down, bad request, protocol drift).
+
+    ``code`` is core's own error code when core refused the request
+    (``invalid_manifest``, ``artifact_too_large``, ``unknown_plugin`` ...), and
+    ``None`` when no answer came from core at all -- the distinction a caller
+    needs to tell "these bytes are refused" from "try again".
+    """
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def error_code(stderr: str) -> str | None:
+    """The last ``corectl: <code>: ...`` code in corectl's stderr, if any."""
+    codes = _ERROR_CODE_RE.findall(stderr)
+    return codes[-1] if codes else None
 
 
 class Runner(Protocol):
@@ -198,8 +220,11 @@ class CoreControl:
             )
             return parsed
         stderr = _tail(result.stderr) or "(no stderr)"
-        log.warning("%s -> rc=%d in %.1fs: %s", what, result.returncode, elapsed, stderr)
-        raise CoreControlError(f"{what} failed (rc={result.returncode}): {stderr}")
+        code = error_code(stderr)
+        log.warning(
+            "%s -> rc=%d code=%s in %.1fs: %s", what, result.returncode, code, elapsed, stderr
+        )
+        raise CoreControlError(f"{what} failed (rc={result.returncode}): {stderr}", code=code)
 
     # ------------------------------------------------------------------ reads
 
@@ -249,6 +274,21 @@ class CoreControl:
         out = self._call(["restart", _plugin(plugin_id)], timeout_s=DEPLOY_TIMEOUT_S)
         if not isinstance(out, dict):
             raise CoreControlError("corectl restart: expected a transition")
+        return out
+
+    def gc(self) -> dict[str, Any]:
+        """Delete stored artifacts nothing references (desired, lastKnownGood,
+        previous, active). Without it the store only grows, and upstream's
+        ``corectl deploy`` reads and hashes *every* stored artifact first."""
+        out = self._call(["gc"])
+        if not isinstance(out, dict):
+            raise CoreControlError("corectl gc: expected {removed, kept}")
+        removed = out.get("removed")
+        log.info(
+            "corectl gc: removed %d artifact(s), kept %s",
+            len(removed) if isinstance(removed, list) else 0,
+            out.get("kept"),
+        )
         return out
 
     def privileges(self, plugin_id: str, privileges: Sequence[str]) -> dict[str, Any]:

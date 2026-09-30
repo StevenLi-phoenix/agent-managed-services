@@ -1923,3 +1923,242 @@ identity never depends on the service being up (true: it is a registry
 write with a stored secret). `--no-layer1` assumes the sync unit's `--only`
 list names at least one member of every pool wanted (it does: "8 of 15
 members named; a pool is one process, so all of it is selected").
+
+### D31. Core mode: host the Cordis-based api core as one ams service (2026-09-29)
+
+**Context.** api `main` (v3.1.0, 2026-09-26) no longer has `service.yaml`
+manifests. It is one Node 24 process, `core` (`cordis@4`), that hot-installs
+~28 TypeScript plugins through a unix control socket and owns per-plugin
+safety itself: isolated apply, health check, atomic facade swap, drain,
+60 s probation, auto-revert. Registry, auth, gateway, store, secrets and
+health are plugins inside it. Production runs on phm under systemd
+(`core.service`, `core-ship`, `core-release`, `core-daily-backup`),
+which is out of scope. Plan and interfaces: `.claude/state/PLAN-core.md`.
+End-to-end story: `docs/platform-core.md`.
+
+**Decision.** A second platform mode, **core mode** (ams 1.1.0):
+`core` is one ordinary ams service, and a one-shot tick on a 60 s timer
+(`ams platform core sync`) does what phm's units do. It stages and releases
+core when `core_paths` change, ships plugins whose *content* changed through
+core's own client, fronts core with Caddy, backs it up, and escalates. ams
+does **not** re-implement anything core owns: probation, plugin rollback,
+dependency order, artifact validation. The legacy manifest mode stays,
+deprecated and untouched.
+
+1. **The control plane goes through upstream `scripts/corectl.mjs`, run as
+   the service.** The socket is 0660 and owned by the service uid, so the
+   harness cannot connect in isolated mode. `run_as_service` gives a one-shot
+   process the service's own identity. corectl already does the CAS dance
+   (`expectedGeneration` from a fresh `status`) and the base64 upload.
+   A transition with `outcome != ok` is a result; only a failure to get one
+   raises.
+2. **Change detection is a content key**: upstream `computeArtifactId` minus
+   buildInfo, computed by `assets/core_plan.mjs` with the tree's own
+   `build-artifact.mjs`. `buildInfo.commit` changes on every commit, so the
+   artifactId cannot tell ams whether a plugin changed. A `git archive` tree
+   has no `.git`, so `CORE_SOURCE_COMMIT` carries the sha. The planner is
+   package data, copied into `R/build/` because the service cannot read the
+   ams checkout (same reason as the pool runner).
+3. **A failed content key is never retried** under unchanged conditions (no
+   retry storm), and a new commit with new content retries. D32 refines
+   "conditions". Likewise, a sha whose release failed is held
+   (`release_failed_sha`); a failed *first* release is not held, because
+   nothing runs yet and a fresh host with an environment problem should heal.
+4. **Release = stop → flip `current` → start → gate → flip back on failure.**
+   Core imports from the tree `current` resolves to, so it is stopped first.
+   The gate is **"no regression"**, not "HTTP 200": `/health` belongs to the
+   `health` plugin behind the `gateway` plugin, so a fresh core cannot pass an
+   HTTP gate. `/health` must be 200 again if it was before; otherwise every
+   plugin serving before must serve again (D32); otherwise the gateway port
+   must answer; otherwise the control socket answering is enough. The gate
+   fails at once when the harness reports core `failed` (added after the
+   local e2e: a crashing release was down ≈92 s, now ≈17 s). No plugins
+   ship in the tick of a failed release.
+5. **Privileges are granted right after a new plugin's deploy, then the
+   plugin is restarted** (`CoreControl.restart`), so the generation judged
+   by probation holds them. Seen in the first local run: `health` without
+   `ops.read` answers every probe 503, fails probation, and has no revert
+   target. A steady-state pass (`apply_privileges`) keeps them in line with
+   `core.toml` afterwards.
+6. **Fixed ports, like Layer 0 (D22)**: gateway 18080 (+ extras). The number
+   is written inside `plugins.json` and every Caddy site names it; `import`
+   checks that `plugins.gateway.config.port == core.gateway_port`. The
+   Caddy front's listen port is the new config key `caddy_port` (default
+   20180). The gate's patience is the new `health_timeout_s` (default 90).
+   Neither key is in the plan's example.
+7. **The config bundle is a write-only secret** (D16): a harness master copy
+   under `<state>/secrets/core/bundle/` (0700/0600), names only on output,
+   placed into `R/etc` on every tick whose digest differs from
+   `bundle.placed` (the harness cannot read the 0700 service-owned `etc/`
+   back). A changed bundle outside a release logs a warning to restart
+   the affected plugins instead of restarting them: a restart is a
+   probation, and which plugin reads which section is core's business.
+8. **Plumbing choices.** `core.lock` is taken by the process (non-blocking
+   flock) instead of `flock(1)` in the unit, which would deadlock against
+   it and would not cover a hand-run `ship`/`release --rollback`.
+   `Conflicts=` keeps legacy sync off the same state dir. `releases/` is
+   0755 (the harness reads `.ams-sha` and `package.json` there, and the
+   spawner walks `current` before dropping to the service). The harness
+   shutdown budget is 45 s with `TimeoutStopSec=50` (core drains 40 s,
+   upstream `TimeoutStopSec=40`). `--no-isolation` loads the runtime layer so
+   a managed-Node service finds `node`. Site hosts are validated by
+   `gateway.CoreSite` (strict lowercase RFC 1123; the host is also a file
+   name and an `import` argument). The managed pnpm is installed with
+   `ignore-scripts`. Node archives are `.tar.gz` on every platform (zlib is
+   always there; `lzma` is optional in a source-built CPython).
+   `provision_tree` refuses a tree outside a service root.
+9. **Backup** adds immutable byte stores (`blobs`, `oss-bytes`,
+   `pages-content`), copied with `rclone copy --immutable` to a separate,
+   never-pruned `bytes/<id>/<path under data>` prefix after the sqlite
+   snapshots, with new `ByteStoreSynced`/`ByteStoreFailed` records. The first
+   cut left `R/data/artifacts` out as "rebuildable". The review showed that
+   a restored `core.sqlite` without it boots every plugin
+   `artifact_unreadable`, so it is now backed up too (core only, top level;
+   part of the D32 review fixes), and the tick reinstalls unreadable plugins.
+10. **Untrusted build code.** The first cut ran `pnpm install` and the build
+    as inner root under `provisioning_mask` (the merge of issue #1). D32
+    replaced that with `run_as_service`.
+
+**Rejected alternatives.**
+
+- *Re-implement core's control protocol (JSON lines over the socket) in
+  Python.* It would avoid a Node process per call and let the harness talk
+  to the socket directly. Rejected: a second implementation of the CAS
+  dance and the upload framing drifts from the one production uses, and
+  upstream changes it freely. The cost is a Node process per call (not
+  measured separately; a whole no-change tick, one `corectl status`
+  included, took 0.17 s locally) and `corectl deploy` hashing the whole
+  artifact store (mitigated with `gc`).
+- *Use artifactId for change detection.* It changes on every commit
+  (buildInfo), so every tick would ship every plugin, each into a 60 s
+  probation.
+- *Treat each plugin as an ams service, or translate plugins into
+  declarations.* That fights core's model: plugins are generations inside
+  one process, and core already gates, swaps and reverts them.
+- *Delete legacy mode in 1.1.0.* api v2.0.0 still needs it, racknerd may
+  be rebuilt from it, and deleting it is irreversible for anyone still on
+  v2.0.0. Deprecate now, decide in 2.0.0.
+- *Run installs and builds as the harness, or as inner root without a
+  mask.* The build runs repository code and dependency lifecycle scripts:
+  untrusted code with the harness uid's access to the SecretStore, the
+  platform RS256 key and the ams checkout. See D32 for why even the masked
+  form was replaced.
+- *Back up by stopping the writer, like phm's `core-daily-backup`.* That is
+  a daily outage of every plugin at once. sqlite's online backup API gives a
+  consistent snapshot while core runs, and the byte stores are immutable,
+  content-named files.
+- *A webhook instead of the 60 s timer.* Same reasoning as the legacy sync
+  (PLAN-allin Q1): an inbound port, a route and an HMAC secret for the same
+  latency.
+- *Caddy doing routing and auth per plugin*, as in the legacy per-mount
+  sites. Core's `gateway` plugin already routes, authenticates and sets
+  headers. Caddy shrinks to a host → port map.
+
+**Assumptions / would break if.** Upstream keeps `scripts/corectl.mjs`'s
+CLI and its `corectl: <code>:` stderr shape, `build-artifact.mjs`'s
+`buildArtifact`/`canonical` exports and the `computeArtifactId` part order
+(a drift makes every content key change once, which is safe but noisy).
+Core's status shape (`desired/observed/live`, `phase`, `reason`) is as
+described in `corectl.py`'s docstring. The socket path stays under the
+`sun_path` limit.
+
+### Open / weak signals (core mode, 2026-09-30)
+
+- **The Linux isolation path has never run live** (n=0): `run_as_service`
+  provisioning with a per-service pnpm store, as-service `mkdir` in
+  `ensure_layout`, planner placement as the service, and the staged
+  `.etc.stage` / `.current.new` renames. The evidence is portable tests of
+  the argv/paths and the plain-mode e2e (n=1, macOS). Next test:
+  re-provision racknerd, run `scripts/remote-test.sh` (including
+  `tests/linux/test_run_as_service_live.py` and
+  `test_run_admin_mask_live.py`), then a live core e2e. This is a user
+  decision.
+- **Two escalation streams for one failure.** Core-sync's `CoreSync` line,
+  plus the harness escalating core's own `level:"warn"` lines
+  (`plugin.failure`, `core.transition … failed`) and "giving up on core".
+  Candidate: a platform-policy rule that suppresses core's transition and
+  failure lines in core mode. Not done: it hides core's own view if
+  core-sync is down.
+- **Core probation can pass a plugin whose health always fails** under
+  enough successful traffic (12 of 71 = 17% < 20%, n=1). Upstream
+  behaviour (`manager.ts` `startProbation`); ams records core's verdict.
+- **Re-shipping reverted content** deploys a new artifactId with a fresh
+  probation even when core already serves identical bytes. Harmless; it
+  matches "new commit with new content retries".
+- **`SourceMirror.stage` and the release gc** still run as inner root
+  inside the service root. `ensure_layout`'s symlink refusal covers the
+  non-racing case; a service that wins a race could redirect them.
+  Candidate: stage outside the root and rename in, or run them as the
+  service.
+- **First isolated install downloads everything**: the per-service pnpm
+  store (D32) costs one full network fetch per host. Not measured.
+- **Upstream docs say core logs to stdout; it logs JSON lines to stderr**
+  (observed in the e2e). Harmless: `[logging] format = "json"` classifies
+  either stream.
+- **Legacy mode: the issue #1 mask is bypassable** (review finding
+  security-4, 2026-09-29). Legacy provisioning and static builds still run
+  untrusted code as inner root under the *admin* map; the overmounts are not
+  `MNT_LOCKED`, so the code can `umount` them (it holds CAP_SYS_ADMIN over
+  its own mount ns), and with no pid ns `/proc/<harness pid>/root` reaches
+  the real tree. Core mode is not affected (D32.3: untrusted steps run as
+  the service). Fix = the same redesign for legacy (run as the service), or
+  remove legacy mode in 2.0.0. Unverified on Linux either way.
+- **Legacy Layer 0: registry/auth port hijack** (was GitHub issue #3,
+  medium; the issue was deleted 2026-09-29 before the repo went public, so
+  this is the only record). While registry (20100) or auth (20101) is down
+  -- restart, crash, deploy -- any compromised ordinary service can bind
+  127.0.0.1:20100/20101 and harvest the `X-Admin-Token` /
+  `X-Service-Secret` headers other services send, escalating to platform
+  admin. Core mode is not affected (registry/auth are plugins inside core;
+  no fixed loopback ports between processes). Not fixed; candidates were
+  per-service network namespaces, `SO_PEERCRED`-checked unix sockets, or
+  holding the ports in the harness and passing fds. Retires with legacy mode.
+- **No state migration from phm.** Bootstrap starts from a fresh
+  `core.sqlite` and ships the roster; moving an existing core's state is an
+  un-rehearsed manual step.
+
+### D32. Core-mode review fixes: a verdict holds under its conditions; untrusted steps run as the service (2026-09-29)
+
+(D31 above is the core-mode decision itself.)
+
+1. **A content key that did not go live is a verdict *under the conditions it
+   was reached in*.** Each plugin record carries the core `release` and the
+   config-`bundle` digest; a rejection whose reason is about core's *state*
+   (`dependency_unavailable`, `dependency_failed`, `dependency_major_mismatch`,
+   `generation_conflict`, `service_in_use`, `major_in_use`, `unknown_plugin`)
+   is recorded `blocked` with a fingerprint of what core runs (every plugin's
+   live artifact + observed phase). A changed release, bundle or (for
+   `blocked`) fingerprint makes the same bytes a new experiment, tried once;
+   nothing else retries. Core refusing the bytes at upload
+   (`invalid_manifest`, `invalid_artifact`, `artifact_too_large`,
+   `manifest_mismatch`, `plugin_mismatch`, read from corectl's
+   `corectl: <code>:` stderr) is a recorded `failed`. Only transport failures
+   stay unrecorded, in `ship_retry`, and the next tick re-plans *only* those
+   plugins; `planned_sha` advances whenever the plan itself ran.
+   Rejected: never retry any failure (the original rule) -- it pinned good
+   plugins forever behind a missing provider or an old core; retry every tick
+   -- the storm the rule exists to prevent; key blocked retries on the
+   provider's artifact only -- ams does not parse manifests' dependencies, and
+   the whole-core fingerprint is bounded (one retry per core change).
+2. **Held shas.** A stage that failed (`stage_failed_sha`) or a core release
+   that failed (`release_failed_sha == head`) holds the sha: no re-install,
+   and no plugin built from that tree ships onto the older core. The rest of
+   the tick (probation verdicts, drift, privileges, gateway) still runs.
+3. **Untrusted code never runs under the admin map in core mode.**
+   `provision_tree` runs `pnpm install` and the build with `run_as_service`
+   (no harness uid mapped, so neither harness DAC access nor a mount mask to
+   `umount`), with a service-owned pnpm store/cache/HOME in `<root>/.cache`.
+   Every other write into the service root is either done as the service
+   (`ensure_layout`, the planner asset) or prepared in the harness-owned
+   `<state>/services/core/` and renamed in (`place_bundle`, `flip_current`).
+   Rejected: lock the mask (nested userns + CLONE_NEWPID + fresh /proc + cap
+   drop) -- still leaves harness-uid write access, and cannot be verified
+   without a Linux host; keep the shared harness pnpm store -- the service
+   cannot write it, and write access to it is exactly the escalation.
+   Cost: the first core install fills a per-service store (network once).
+
+**Open.** Legacy provisioning (uv/pnpm/bun installs) and static builds still
+run as inner root under the admin map with the (now wider, security-5) mask;
+issue-#1-style bypasses via `umount` or `/proc/<harness>/root` remain there.
+Fixing them needs per-service caches for uv/python/bun -- a legacy-mode
+redesign, deferred with the rest of legacy mode to 2.0.0.

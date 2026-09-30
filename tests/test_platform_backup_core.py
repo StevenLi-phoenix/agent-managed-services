@@ -4,7 +4,7 @@ The core service root is ``R = <state>/services/core/root`` and everything
 worth keeping is under ``R/data`` (``CORE_STATE_DIR``):
 
     R/data/core.sqlite                 core's own state (transitions, artifacts index)
-    R/data/artifacts/...               built plugin artifacts (reproducible from source)
+    R/data/artifacts/...               core's ArtifactStore (immutable, content-addressed)
     R/data/data/state.sqlite           the store plugin's state
     R/data/data/{blobs,oss-bytes,pages-content}/...   immutable, content-named bytes
 
@@ -13,7 +13,8 @@ What this file pins:
 * both databases are found by the *existing* `discover` (its ``-maxdepth 2``
   already reaches ``data/data/state.sqlite``) and get ordinary R2 keys under
   ``daily/core/`` -- nothing about any existing key changes;
-* the three byte stores are copied with ``rclone copy --immutable`` (never
+* the three byte stores (and core's ``artifacts/``) are copied with
+  ``rclone copy --immutable`` (never
   ``sync``, never deleted remotely) to a stable prefix OUTSIDE the pruned
   ``daily/`` one -- otherwise the 14-day retention sweep would delete every
   blob older than 14 days;
@@ -191,6 +192,7 @@ def test_discover_byte_stores_finds_the_three_stores_under_data(state: StateDir)
     )
 
     assert stores == [
+        ByteStore("core", data / "artifacts", CORE_BLOCK, "artifacts"),
         ByteStore("core", data / "data" / "blobs", CORE_BLOCK, "data/blobs"),
         ByteStore("core", data / "data" / "oss-bytes", CORE_BLOCK, "data/oss-bytes"),
         ByteStore("core", data / "data" / "pages-content", CORE_BLOCK, "data/pages-content"),
@@ -353,7 +355,7 @@ def test_run_copies_byte_stores_after_every_sqlite_snapshot(
     assert report.ok
     byte_events = [i for i, e in enumerate(events) if e.startswith("bytes:")]
     db_events = [i for i, e in enumerate(events) if e.startswith(("snapshot:", "copyto:"))]
-    assert len(byte_events) == 3 and len(db_events) == 6
+    assert len(byte_events) == 4 and len(db_events) == 6  # 3 stores + artifacts/
     assert max(db_events) < min(byte_events)
     assert events[-1] == "delete:"  # the retention sweep still runs last
 
@@ -382,10 +384,12 @@ def test_run_byte_store_argv_is_an_immutable_copy_in_the_admin_ns(
             "copy",
             "--immutable",
             "--s3-no-check-bucket",
-            str(data / "data" / name),
-            f"r2:{BUCKET}/bytes/core/data/{name}",
+            "--exclude",
+            "*.tmp",
+            str(data / rel),
+            f"r2:{BUCKET}/bytes/core/{rel}",
         )
-        for name in backup.BYTE_STORE_NAMES
+        for rel in ["artifacts", *(f"data/{name}" for name in backup.BYTE_STORE_NAMES)]
     ]
     for argv, block, env in admin.calls:
         assert block == CORE_BLOCK  # only inner root in the service's map can read them
@@ -422,13 +426,15 @@ def test_run_records_byte_stores_and_keeps_the_prune_on_daily_only(
         "ByteStoreSynced",
         "ByteStoreSynced",
         "ByteStoreSynced",
+        "ByteStoreSynced",
         "BackupRunFinished",
     ]
     assert records[2]["service_id"] == "core"
-    assert records[2]["event"]["remote"] == f"r2:{BUCKET}/bytes/core/data/blobs"
-    assert records[-1]["event"]["byte_stores"] == 3
+    assert records[2]["event"]["remote"] == f"r2:{BUCKET}/bytes/core/artifacts"
+    assert records[3]["event"]["remote"] == f"r2:{BUCKET}/bytes/core/data/blobs"
+    assert records[-1]["event"]["byte_stores"] == 4
     assert records[-1]["event"]["byte_stores_failed"] == 0
-    assert [len(r.remote or "") > 0 for r in report.byte_stores] == [True] * 3
+    assert [len(r.remote or "") > 0 for r in report.byte_stores] == [True] * 4
     assert runner.calls[-1][0] == tuple(prune_argv(cfg))
     assert prune_argv(cfg)[-1] == f"r2:{BUCKET}/daily/"
 
@@ -453,8 +459,8 @@ def test_a_failing_byte_store_escalates_redacted_and_the_others_still_run(
         )
 
     assert report.exit_code == 1
-    assert [r.status for r in report.byte_stores] == ["ok", "failed", "ok"]
-    assert len(admin.calls) == 3
+    assert [r.status for r in report.byte_stores] == ["ok", "ok", "failed", "ok"]
+    assert len(admin.calls) == 4
     failed = [json.loads(line) for line in out.getvalue().splitlines()]
     failed = [r for r in failed if r["kind"] == "ByteStoreFailed"]
     assert len(failed) == 1 and failed[0]["action"] == "escalate"
@@ -485,7 +491,7 @@ def test_dry_run_plans_byte_store_copies_without_running_rclone(state: StateDir)
     assert admin.calls == []
     planned = [json.loads(line) for line in out.getvalue().splitlines()]
     planned = [r for r in planned if r["kind"] == "ByteStoreSynced"]
-    assert len(planned) == 3
+    assert len(planned) == 4
     assert planned[0]["event"]["argv"][:4] == [
         str(RCLONE),
         "copy",
@@ -536,3 +542,55 @@ def test_a_service_without_byte_stores_makes_no_rclone_admin_call(
 
     assert report.ok and report.byte_stores == ()
     assert admin.calls == []
+
+
+# ------------------------------------- review 2026-09-29: artifacts/, *.tmp staging
+
+
+def test_core_artifact_store_is_a_byte_store(state: StateDir) -> None:
+    """upstream-fit-2: core.sqlite without R/data/artifacts restores every plugin
+    as ``artifact_unreadable``; upstream core-daily-backup copies artifacts/ too.
+    The files are content-addressed (``<artifactId>.json``) and immutable."""
+    data = make_core(state)
+
+    stores = discover_byte_stores(
+        state, FakeAllocator({"core": CORE_BLOCK}), run_admin_fn=local_admin
+    )
+
+    artifacts = [s for s in stores if s.rel == "artifacts"]
+    assert artifacts == [ByteStore("core", data / "artifacts", CORE_BLOCK, "artifacts")]
+    assert _cfg().byte_store_remote(artifacts[0]) == f"r2:{BUCKET}/bytes/core/artifacts"
+
+
+def test_an_artifacts_dir_of_another_service_is_not_a_byte_store(state: StateDir) -> None:
+    data = make_service(state, "svc")
+    (data / "artifacts").mkdir()
+    (data / "artifacts" / "x.json").write_text("{}")
+
+    assert (
+        discover_byte_stores(state, FakeAllocator({"svc": BLOCK}), run_admin_fn=local_admin) == []
+    )
+
+
+def test_nested_artifacts_dir_under_core_data_is_not_the_artifact_store(state: StateDir) -> None:
+    data = make_core(state)
+    (data / "data" / "artifacts").mkdir()
+
+    stores = discover_byte_stores(
+        state, FakeAllocator({"core": CORE_BLOCK}), run_admin_fn=local_admin
+    )
+
+    assert [s.rel for s in stores if "artifacts" in s.rel] == ["artifacts"]
+
+
+def test_byte_store_copy_skips_in_flight_tmp_files(state: StateDir) -> None:
+    """upstream-fit-9: LocalOssBytes stages uploads as ``<uuid>.tmp`` and
+    ArtifactStore.put as ``<id>.json.<pid>.<ts>.tmp`` inside the live store; a
+    copy must neither upload them for good nor fail when one vanishes."""
+    data = make_core(state)
+    argv = backup.byte_store_argv(
+        ByteStore("core", data / "data" / "blobs", CORE_BLOCK, "data/blobs"), _cfg()
+    )
+    i = argv.index("--exclude")
+    assert argv[i + 1] == "*.tmp"
+    assert i < len(argv) - 2  # an option, before source and destination

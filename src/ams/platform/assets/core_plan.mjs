@@ -18,6 +18,14 @@
 //
 // stdout is a protocol: anything a plugin bundle prints while its manifest is probed is moved to
 // stderr, so a stray console.log can never corrupt a result line.
+//
+// buildArtifact evaluates each bundle's module scope in THIS process. core installs handlers for
+// unhandled rejections and uncaught exceptions (packages/core/main.ts), so a bundle that rejects a
+// promise or throws from a timer runs fine there; here, without handlers, Node would exit and every
+// plugin's plan would be lost. So the handlers below pin such an error on the plugin being built
+// (or, if it fires between builds, on the one just built -- a later line for the same pluginId
+// overrides its success line), and the run ends with process.exit so a module-scope setInterval
+// cannot keep it alive.
 import { createHash } from 'node:crypto';
 import { stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -26,6 +34,21 @@ import { pathToFileURL } from 'node:url';
 const PLUGIN_ID = /^[a-z][a-z0-9-]{0,62}$/;
 
 const out = line => process.stdout.write(JSON.stringify(line) + '\n');
+
+let current = null;
+let previous = null;
+const strayFailed = new Set();
+function stray(kind, error) {
+  const pluginId = current ?? previous;
+  const message = `${kind} while building: ${String(error?.stack ?? error?.message ?? error)}`.slice(0, 2000);
+  process.stderr.write(`core_plan: ${pluginId ?? '(no plugin)'}: ${message}\n`);
+  if (pluginId && !strayFailed.has(pluginId)) {
+    strayFailed.add(pluginId);
+    out({ pluginId, error: message });
+  }
+}
+process.on('unhandledRejection', error => stray('unhandled rejection', error));
+process.on('uncaughtException', error => stray('uncaught exception', error));
 for (const name of ['log', 'info', 'debug', 'warn']) {
   console[name] = (...parts) => process.stderr.write(parts.map(String).join(' ') + '\n');
 }
@@ -64,9 +87,11 @@ function contentKey(file) {
 for (const pluginId of ids) {
   if (!PLUGIN_ID.test(pluginId)) { out({ pluginId, error: 'invalid plugin id' }); continue; }
   const dir = join(tree, 'plugins', pluginId);
+  current = pluginId;
   try {
     if (!(await stat(dir)).isDirectory()) throw new Error(`${dir} is not a directory`);
     const built = await buildArtifact(dir, { outDir });
+    if (strayFailed.has(pluginId)) continue;  // its error line is already out
     if (built.pluginId !== pluginId) {
       out({ pluginId, error: `manifest pluginId ${JSON.stringify(built.pluginId)} does not match directory ${pluginId}` });
       continue;
@@ -74,6 +99,13 @@ for (const pluginId of ids) {
     out({ pluginId, dir, artifactId: built.artifactId, contentKey: contentKey(built.file), path: built.path,
       commit: built.commit, dirty: built.dirty });
   } catch (error) {
-    out({ pluginId, error: String(error?.message ?? error).slice(0, 2000) });
+    if (!strayFailed.has(pluginId)) out({ pluginId, error: String(error?.message ?? error).slice(0, 2000) });
+  } finally {
+    previous = pluginId;
+    current = null;
   }
 }
+// Give a late rejection from the last bundle one turn to land, flush stdout, then exit: a
+// module-scope timer or open handle in some bundle must not hold the planner open.
+await new Promise(resolveTurn => setTimeout(resolveTurn, 50));
+process.stdout.write('', () => process.exit(0));
