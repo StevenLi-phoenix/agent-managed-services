@@ -1,0 +1,17 @@
+[Unit]
+Description=Run one ams core-mode tick every 60 seconds
+
+[Timer]
+# Same 60 s poll as ams-platform-sync.timer (PLAN-allin Q1): a webhook would need
+# an inbound port, a route and an HMAC secret for the same latency.
+OnBootSec=2min
+OnUnitActiveSec=60s
+# Measured from the start of the last tick: a tick that runs long (a release, a
+# probation wait) pushes the next one out rather than stacking.
+AccuracySec=1s
+# A missed tick is not worth catching up on; the next one re-derives everything.
+Persistent=false
+Unit=ams-core-sync.service
+
+[Install]
+WantedBy=timers.target

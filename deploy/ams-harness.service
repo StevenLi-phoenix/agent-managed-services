@@ -34,11 +34,12 @@ Delegate=yes
 DelegateSubgroup=harness
 # Services are direct children; a harness restart takes them all down (accepted trade-off).
 KillMode=control-group
-# Must stay above ams.cli.SHUTDOWN_BUDGET_S (25s) + ~1.5s of supervisor drain.
+# Must stay above ams.cli.SHUTDOWN_BUDGET_S (45s) + ~1.5s of supervisor drain.
 # The harness clamps the graceful phase to that budget, so a declaration with a
 # large stop.timeout_s is capped rather than letting systemd SIGKILL us mid-stop.
-# Raise both together if services ever need longer than 25s to stop.
-TimeoutStopSec=30
+# 45s is core mode's stop.timeout_s (40s, upstream core.service) plus margin.
+# Raise both together if services ever need longer than 45s to stop.
+TimeoutStopSec=50
 # Do NOT set NoNewPrivileges=yes or an empty CapabilityBoundingSet= here: the
 # harness relies on the setuid newuidmap/newgidmap helpers, which need to regain
 # CAP_SETUID/CAP_SETGID on exec to write the per-service uid/gid maps.

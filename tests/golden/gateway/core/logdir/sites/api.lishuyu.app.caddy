@@ -1,0 +1,12 @@
+# api.lishuyu.app — core on 127.0.0.1:18080
+http://api.lishuyu.app:8080 {
+	log {
+		output file /srv/ams/logs/api.lishuyu.app-access.log {
+			roll_size 50MiB
+			roll_keep 10
+			roll_keep_for 90d
+		}
+		format json
+	}
+	reverse_proxy 127.0.0.1:18080
+}

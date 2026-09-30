@@ -22,6 +22,11 @@ Two map layouts exist (DECISIONS D4):
   deliberately absent, so harness-private files are unreadable from inside.
 - admin: inner 0 <- harness uid, plus the block at inner 1000. Only the harness
   uses this, to chown/rm files that the host sees as owned by block uids.
+
+Two one-shot runners sit on top of the handshake: ``run_admin`` (admin map,
+inner root) and ``run_as_service`` (runtime map, inner 1000 -- the service's own
+identity, for work that must happen *as* the service, such as talking to a
+0660 socket it owns). Both are a bare ``fork``: no threads, ever (CLAUDE.md).
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ import shutil
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -312,39 +317,176 @@ def run_admin(
     harness_uid: int | None = None,
     harness_gid: int | None = None,
     timeout_s: float = 60.0,
+    env: Mapping[str, str] | None = None,
+    cwd: str | None = None,
 ) -> AdminResult:
     """Run ``argv`` as inner root in an admin-mapped user namespace.
 
     This is how the harness touches files the host reports as owned by
     ``block.uid_start``: as inner root it holds CAP_DAC_OVERRIDE/CAP_CHOWN over
     exactly the uids mapped into this namespace and nothing else.
+
+    ``env`` is merged over the fixed admin environment (the caller wins, also
+    for ``PATH``, which is what ``argv[0]`` is resolved against). ``cwd`` is
+    entered inside the namespace, as inner root, so a service-owned 0700
+    directory is still reachable.
     """
     if not argv:
         raise ValueError("argv must not be empty")
-    exe = shutil.which(argv[0], path=_ADMIN_ENV["PATH"])
+    full_env = {**_ADMIN_ENV, **(env or {})}
+    path = full_env.get("PATH", "")
+    exe = shutil.which(argv[0], path=path)
     if exe is None:
-        raise SpawnError(f"admin helper {argv[0]!r} not found on {_ADMIN_ENV['PATH']}")
+        raise SpawnError(f"admin helper {argv[0]!r} not found on {path}")
     uid = os.getuid() if harness_uid is None else harness_uid
     gid = os.getgid() if harness_gid is None else harness_gid
     uid_args, gid_args = admin_map_args(block, uid, gid)
+    result = _run_in_userns(
+        list(argv),
+        exe,
+        full_env,
+        uid_args,
+        gid_args,
+        0,
+        0,
+        cwd=cwd,
+        cwd_before_unshare=False,
+        new_session=False,
+        timeout_s=timeout_s,
+    )
+    log.debug("admin %s -> rc=%d", " ".join(result.argv), result.returncode)
+    return result
 
+
+def run_as_service(
+    argv: Sequence[str],
+    block: UidBlock,
+    *,
+    env: Mapping[str, str],
+    cwd: str | None = None,
+    timeout_s: float = 60.0,
+) -> AdminResult:
+    """Run ``argv`` once as the service itself: runtime map, inner uid/gid 1000.
+
+    The same identity ``IsolatedSpawner`` gives the long-running process (the
+    harness uid is not mapped, ``no_new_privs`` is set), without a cgroup: this
+    is for short jobs that must act *as* the service -- building artifacts in a
+    service-owned tree, or connecting to a socket the service created 0660
+    (which the harness itself cannot open).
+
+    ``env`` is the complete environment (nothing is inherited or merged) and
+    must carry ``PATH``; ``argv[0]`` is resolved against it here, in the
+    harness, so a missing tool is a clean error rather than an exec failure
+    inside the namespace. The child leads its own session so a timeout kills
+    everything it started, not just the first process.
+    """
+    if not argv:
+        raise ValueError("argv must not be empty")
+    if "PATH" not in env:
+        raise ValueError("env must include PATH (argv[0] is resolved against it)")
+    exe = shutil.which(argv[0], path=env["PATH"])
+    if exe is None:
+        raise SpawnError(f"{argv[0]!r} not found on PATH={env['PATH']}")
+    started = time.monotonic()
+    result = _run_in_userns(
+        list(argv),
+        exe,
+        dict(env),
+        block.newuidmap_args(),
+        block.newgidmap_args(),
+        INNER_UID,
+        INNER_GID,
+        cwd=cwd,
+        cwd_before_unshare=True,
+        new_session=True,
+        timeout_s=timeout_s,
+    )
+    log.info(
+        "as-service %s (block %d) -> rc=%d in %.1fs",
+        " ".join(result.argv),
+        block.uid_start,
+        result.returncode,
+        time.monotonic() - started,
+    )
+    return result
+
+
+def _run_in_userns(
+    argv: list[str],
+    exe: str,
+    env: dict[str, str],
+    uid_args: Sequence[str],
+    gid_args: Sequence[str],
+    inner_uid: int,
+    inner_gid: int,
+    *,
+    cwd: str | None,
+    cwd_before_unshare: bool,
+    new_session: bool,
+    timeout_s: float,
+) -> AdminResult:
+    """Fork into a mapped namespace, exec, collect stdout/stderr and the exit code.
+
+    ``cwd_before_unshare`` chooses where the directory is entered. As the
+    service (inner 1000) the harness-owned ancestors of a service root are
+    unmapped and may not be traversable, and a service-owned 0700/0750 directory
+    is closed to the harness. So the child, while still the harness (the
+    ``IsolatedSpawner`` pattern), enters the deepest ancestor of ``cwd`` it can,
+    and after the identity drop finishes the remaining components *relative*
+    to it -- no traversal of harness-owned directories as the service. As
+    inner root the post-drop absolute ``chdir`` always has the better rights.
+    """
     out_r, out_w = os.pipe()
     err_r, err_w = os.pipe()
-    argv = list(argv)
+    # The child's own copy: set in pre_unshare, read by child() in the same
+    # forked process, never seen by the parent. None = chdir(cwd) absolutely.
+    remainder: list[str | None] = [None]
+
+    def pre_unshare(_pid: int) -> None:
+        # Runs in the forked child: plain os calls only, no logging, no locks.
+        assert cwd is not None
+        head, rest = os.path.abspath(cwd), ""
+        while True:
+            try:
+                os.chdir(head)
+            except OSError:
+                parent, name = os.path.split(head)
+                if parent == head:
+                    return  # nothing enterable; child() tries the absolute path
+                head, rest = parent, os.path.join(name, rest) if rest else name
+                continue
+            remainder[0] = rest
+            return
 
     def child() -> NoReturn:
         devnull = os.open(os.devnull, os.O_RDONLY)
         os.dup2(devnull, 0)
         os.dup2(out_w, 1)
         os.dup2(err_w, 2)
-        for fd in (devnull, out_w, err_w):
+        for fd in (devnull, out_w, err_w, out_r, err_r):
             if fd > 2:
-                os.close(fd)
-        os.execve(exe, argv, dict(_ADMIN_ENV))
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        if cwd is not None:  # a failure raises -> reported to the parent as SpawnError
+            if remainder[0] is None:
+                os.chdir(cwd)
+            elif remainder[0]:
+                os.chdir(remainder[0])
+        if new_session:
+            os.setsid()
+        os.execve(exe, argv, env)
         raise SpawnError("execve returned")  # pragma: no cover
 
+    deadline = time.monotonic() + timeout_s
     try:
-        pid = fork_in_userns(uid_args, gid_args, 0, 0, child)
+        pid = fork_in_userns(
+            uid_args,
+            gid_args,
+            inner_uid,
+            inner_gid,
+            child,
+            pre_unshare=pre_unshare if cwd_before_unshare and cwd is not None else None,
+        )
     except BaseException:
         for fd in (out_r, err_r):
             os.close(fd)
@@ -355,15 +497,20 @@ def run_admin(
 
     buffers = {out_r: bytearray(), err_r: bytearray()}
     try:
-        _drain(buffers, time.monotonic() + timeout_s)
+        _drain(buffers, deadline)
     finally:
         os.close(out_r)
         os.close(err_r)
-    status = _wait_with_timeout(pid, timeout_s)
+    if new_session and time.monotonic() >= deadline:
+        # The pipes were still held at the deadline: by the leader or by
+        # something it left running. The leader is not reaped yet, so its pid --
+        # which is also the group id -- cannot have been recycled.
+        log.warning("namespaced child %d exceeded %.1fs; killing its group", pid, timeout_s)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pid, signal.SIGKILL)
+    status = _wait_with_timeout(pid, max(0.0, deadline - time.monotonic()))
     rc = os.waitstatus_to_exitcode(status) if status is not None else -signal.SIGKILL
-    result = AdminResult(tuple(argv), rc, bytes(buffers[out_r]), bytes(buffers[err_r]))
-    log.debug("admin %s -> rc=%d", " ".join(argv), rc)
-    return result
+    return AdminResult(tuple(argv), rc, bytes(buffers[out_r]), bytes(buffers[err_r]))
 
 
 def _wait_with_timeout(pid: int, timeout_s: float) -> int | None:
@@ -376,7 +523,7 @@ def _wait_with_timeout(pid: int, timeout_s: float) -> int | None:
         if done == pid:
             return status
         if time.monotonic() >= deadline:
-            log.warning("admin child %d exceeded %.1fs; killing", pid, timeout_s)
+            log.warning("namespaced child %d exceeded %.1fs; killing", pid, timeout_s)
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
             return _reap(pid)

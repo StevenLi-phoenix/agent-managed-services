@@ -1,0 +1,12 @@
+# pages.shuyuli.com — core on 127.0.0.1:18081
+http://pages.shuyuli.com:8080 {
+	log {
+		output file /srv/ams/logs/pages.shuyuli.com-access.log {
+			roll_size 50MiB
+			roll_keep 10
+			roll_keep_for 90d
+		}
+		format json
+	}
+	reverse_proxy 127.0.0.1:18081
+}

@@ -36,6 +36,10 @@ ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # per-service runtime bin dir, the port the health probe uses, etc.).
 RESERVED_ENV = frozenset({"PATH", "HOME", "LANG", "PYTHONUNBUFFERED", "VIRTUAL_ENV"})
 RESERVED_ENV_PREFIXES = ("AMS_", "PORT_", "UV_", "PNPM_", "BUN_", "npm_config_")
+# An exact ``MAJOR.MINOR.PATCH`` pin: ``runtime.node`` in this form on a pnpm
+# service selects the managed toolchain (downloaded, checksum-verified, into the
+# store); ``runtime.pnpm`` must always have it.
+EXACT_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _SIZE_RE = re.compile(r"^(\d+)([KMGT]?)$", re.IGNORECASE)
 _PCT_RE = re.compile(r"^(\d+(?:\.\d+)?)%$")
 
@@ -71,7 +75,11 @@ class RuntimeSpec:
 
     kind: RuntimeKind = "none"
     python: str | None = None  # venv/uv: "3.12"; interpreter resolved by the provisioner
-    node: str | None = None  # pnpm/bun: "22"; pnpm uses system/pnpm-managed node, bun ignores
+    # pnpm/bun. An exact "24.20.0" on kind=pnpm selects the managed toolchain
+    # (<store>/node/v<ver>, checksum-verified download); anything else ("22",
+    # "22.12") keeps the legacy meaning: the host node, with a provisioner
+    # warning. bun ignores it either way.
+    node: str | None = None
     requirements: str | None = None  # venv/uv: path relative to workdir
     # uv only: workdir is a uv project (pyproject.toml + uv.lock); provision runs
     # `uv sync --frozen` there and the venv lives at <workdir>/.venv. Path
@@ -81,10 +89,25 @@ class RuntimeSpec:
         str, ...
     ] = ()  # pip/uv specs, or npm specs for pnpm/bun (added to package.json)
     nix_packages: tuple[str, ...] = ()  # nix profile packages (kind == "nix")
+    # pnpm only: exact "11.19.0" -> pnpm installed into <store>/pnpm/<ver> with
+    # the managed node's npm. Requires an exact ``node``.
+    pnpm: str | None = None
+    # pnpm only: argv run in the workdir after the install (e.g. ("node",
+    # "scripts/build.mjs")). An argv, never a shell string.
+    build: tuple[str, ...] = ()
 
     @property
     def is_python(self) -> bool:
         return self.kind in ("venv", "uv")
+
+    @property
+    def managed_node(self) -> bool:
+        """True when provisioning must install exactly ``node`` (and ``pnpm``) itself."""
+        return (
+            self.kind == "pnpm"
+            and isinstance(self.node, str)
+            and EXACT_VERSION_RE.match(self.node) is not None
+        )
 
     @property
     def is_node(self) -> bool:
@@ -258,7 +281,7 @@ def _build(cls: type, data: Any, path: str) -> Any:
             continue
         value = data[name]
         sub = f"{path}.{name}" if path else name
-        if name in ("argv", "packages", "nix_packages"):
+        if name in ("argv", "packages", "nix_packages", "build"):
             if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
                 raise _err(sub, "expected a list of strings")
             kwargs[name] = tuple(value)
@@ -396,6 +419,24 @@ def validate(d: ServiceDecl) -> None:  # noqa: C901 - one flat checklist is clea
             raise _err("runtime.node", "only valid with kind=pnpm or kind=bun")
         if not re.match(r"^\d+(\.\d+){0,2}$", rt.node):
             raise _err("runtime.node", "expected a version like '22' or '22.12.0'")
+    if rt.pnpm is not None:
+        if rt.kind != "pnpm":
+            raise _err("runtime.pnpm", "only valid with kind=pnpm")
+        if not isinstance(rt.pnpm, str) or not EXACT_VERSION_RE.match(rt.pnpm):
+            raise _err(
+                "runtime.pnpm", "expected an exact version 'MAJOR.MINOR.PATCH', e.g. '11.19.0'"
+            )
+        if not rt.managed_node:
+            raise _err(
+                "runtime.pnpm",
+                "a pinned pnpm needs an exact runtime.node 'MAJOR.MINOR.PATCH' "
+                "(it is installed with the managed node's npm)",
+            )
+    if rt.build:
+        if rt.kind != "pnpm":
+            raise _err("runtime.build", "only valid with kind=pnpm")
+        if any(not isinstance(a, str) or not a or "\0" in a for a in rt.build):
+            raise _err("runtime.build", "entries must be non-empty strings without NUL")
     if rt.requirements is not None and not rt.is_python:
         raise _err("runtime.requirements", "only valid with kind=venv or kind=uv")
     if rt.sync:

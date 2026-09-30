@@ -1,0 +1,48 @@
+[Unit]
+Description=ams core mode: one tick (fetch, stage, release core, ship changed plugins, gate)
+Documentation=file:///home/harness/ams/src/ams/platform/coresync.py
+# Not Requires=ams-harness.service: a tick that cannot reach the control socket
+# escalates one JSON line and leaves the record alone (a release is retried on
+# the next tick), so a harness that is down delays core rather than failing the
+# unit chain. After= only, so a boot brings the harness up first.
+After=network-online.target ams-harness.service
+Wants=network-online.target
+# Core mode replaces the manifest mode; the two must never run against one state
+# dir (both render <state>/gateway/ and both would declare services).
+Conflicts=ams-platform-sync.timer ams-platform-sync.service
+
+[Service]
+Type=oneshot
+User=harness
+Group=harness
+WorkingDirectory=/home/harness/ams
+# Same environment block as ams-harness.service. A drift between the two would
+# have the tick declare core into a different state dir than the one the harness
+# supervises, which is silent and total.
+Environment=HOME=/home/harness
+Environment=AMS_STATE_DIR=/home/harness/store/state
+Environment=AMS_STORE_DIR=/home/harness/store
+Environment=PYTHONPATH=/home/harness/ams/src
+Environment=PATH=/home/harness/venv/bin:/home/harness/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Interpreter path must match deploy/apparmor/ams-harness attachment glob: staging,
+# provisioning and every corectl call create a user namespace (run_admin /
+# run_as_service), and only this interpreter is allowed to.
+# Everything else -- the mirror URL (the LOCAL bare mirror; api is private and the
+# harness holds no credential for it), ref, node/pnpm pins, roster, privileges,
+# sites -- lives in <state>/platform/core.toml, so this unit never changes when
+# the platform does.
+# No flock(1) wrapper: the tick takes <state>/platform/core.lock itself
+# (coresync.locked), which also covers a hand-run `ams platform core ship` or
+# `release --rollback`. A flock(1) on the same file would deadlock against it.
+ExecStart=/home/harness/venv/bin/python3 -m ams platform core sync
+# One tick may run `pnpm install`, `node scripts/build.mjs`, the release health
+# gate and a 120 s probation wait. The per-step timeouts inside are tighter; this
+# is the outer backstop for a tick that wedges somewhere none of them cover.
+TimeoutStartSec=1800
+# No Restart=: a failed tick is reported on stdout as JSON lines and retried by
+# the timer 60 s later -- and a failed content key or release sha is never
+# retried at all (coresync docstring), so a restart loop would buy nothing.
+# Do NOT set NoNewPrivileges=yes or an empty CapabilityBoundingSet= here, for the
+# same reason as ams-harness.service: staging and provisioning exec the setuid
+# newuidmap/newgidmap helpers to write the admin uid map.
+NoNewPrivileges=no

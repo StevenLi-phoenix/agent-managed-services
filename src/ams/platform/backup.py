@@ -19,6 +19,34 @@ three differences that follow from ams's model:
    never argv. `RCLONE_CONFIG` is pointed at `/dev/null` so a stray
    `~/.config/rclone/rclone.conf` cannot quietly supply a different remote.
 
+Byte stores (core mode, PLAN-core §4.2)
+---------------------------------------
+Core's store/oss/pages plugins keep immutable, content-named files in
+directories named ``blobs``, ``oss-bytes`` and ``pages-content`` somewhere under
+``<root>/data``. Re-uploading gigabytes of them into every dated archive would
+be the litestream bill again, so -- like phm's ``core-daily-backup`` -- they go
+up with ``rclone copy --immutable``: only files the bucket lacks are sent, an
+existing object is never overwritten, and nothing is ever deleted remotely.
+Three rules make that safe:
+
+* the destination is ``<bytes_prefix>/<id>/<path under data>`` (default
+  ``bytes/``), a prefix the retention sweep can never reach -- ``prune`` runs
+  ``rclone delete --min-age`` over ``<prefix>/`` and rclone keeps the source
+  mtime, so a blob under ``daily/`` would be deleted as soon as it was a
+  fortnight old. `BackupConfig` refuses a layout where either prefix contains
+  the other;
+* they are copied **after** every sqlite snapshot of the run, so a snapshot
+  never references a blob the bucket does not hold yet;
+* rclone runs inside the admin namespace (as inner root, with the credentials
+  in its environment, never argv): the files belong to the service's uid block
+  and the harness cannot read them otherwise.
+
+Only ``<root>/data`` is ever scanned, so a core root's ``releases/``,
+``build/``, ``run/`` and ``etc/`` (the config bundle: secrets, D16) are out of
+reach by construction. The databases need no special case: ``discover``'s
+``-maxdepth 2`` already reaches ``data/core.sqlite`` and the store plugin's
+``data/data/state.sqlite``, with ordinary ``daily/core/...`` keys.
+
 Nothing here logs a credential. `R2Credentials` has no useful `repr`, and every
 subprocess failure message is passed through `R2Credentials.redact` before it
 reaches a log record, an exception or the JSON-lines report.
@@ -53,6 +81,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -118,15 +147,24 @@ DATA_DIRNAME = "data"
 #: (PLAN-pool §3.3). Only the member ids matter here.
 POOL_MANIFEST_FILENAME = "pool.json"
 
+#: Directory names under `<root>/data/**` holding immutable, content-named
+#: files (core's store, oss and pages plugins). Copied, never archived.
+BYTE_STORE_NAMES = ("blobs", "oss-bytes", "pages-content")
+
 DEFAULT_RETENTION_DAYS = 14
 DEFAULT_REMOTE = "r2"
 DEFAULT_PREFIX = "daily"
+#: Where byte stores go. Must stay outside `DEFAULT_PREFIX`: see the module doc.
+DEFAULT_BYTES_PREFIX = "bytes"
 GZIP_LEVEL = 9
 
 #: A snapshot of a multi-hundred-MB database on one vCPU is slow; a hung
 #: `sqlite3` connection must still not wedge the timer unit forever.
 SNAPSHOT_TIMEOUT_S = 600.0
 RCLONE_TIMEOUT_S = 900.0
+#: The first copy of a byte store is every file it holds. A timeout is not a
+#: loss: `rclone copy` is resumable, and the next run sends only what is missing.
+BYTE_STORE_TIMEOUT_S = 3600.0
 DISCOVER_TIMEOUT_S = 60.0
 
 
@@ -208,6 +246,21 @@ class BackupConfig:
     prefix: str = DEFAULT_PREFIX
     retention_days: int = DEFAULT_RETENTION_DAYS
     rclone: Path = field(default_factory=lambda: default_rclone_path())
+    bytes_prefix: str = DEFAULT_BYTES_PREFIX
+
+    def __post_init__(self) -> None:
+        # The retention sweep deletes old objects under `prefix/`. If the byte
+        # stores lived there (or the sweep's prefix covered them), every blob
+        # would be deleted once it was older than the retention window.
+        for name, value in (("prefix", self.prefix), ("bytes_prefix", self.bytes_prefix)):
+            if not value or value.startswith("/") or value.endswith("/"):
+                raise ValueError(f"backup {name} {value!r} must be non-empty with no edge '/'")
+        daily, stable = self.prefix + "/", self.bytes_prefix + "/"
+        if daily.startswith(stable) or stable.startswith(daily):
+            raise ValueError(
+                f"bytes_prefix {self.bytes_prefix!r} and prefix {self.prefix!r} overlap: "
+                "the retention prune would delete byte-store objects"
+            )
 
     def remote_dir(self, service_id: str) -> str:
         return f"{self.remote}:{self.bucket}/{self.prefix}/{service_id}"
@@ -217,6 +270,17 @@ class BackupConfig:
 
     def prune_target(self) -> str:
         return f"{self.remote}:{self.bucket}/{self.prefix}/"
+
+    def byte_store_remote(self, store: ByteStore) -> str:
+        """`<remote>:<bucket>/<bytes_prefix>/<label-or-id>/<path under data>`.
+
+        The path under the data dir, not just the store's name: it is what a
+        restore copies back to, 1:1, and two stores of one service can never
+        merge into one key space.
+        """
+        return (
+            f"{self.remote}:{self.bucket}/{self.bytes_prefix}/{store.effective_label}/{store.rel}"
+        )
 
 
 def default_rclone_path(store: RuntimeStore | None = None) -> Path:
@@ -402,6 +466,127 @@ def _parse_find_output(stdout: bytes, data_dir: Path, service_id: str) -> list[P
     return out
 
 
+@dataclass(frozen=True)
+class ByteStore:
+    """One immutable byte-store directory to copy, plus the block to read it.
+
+    ``rel`` is the directory's path under the data dir -- or under
+    `data/<member>/` when ``label`` names a pool member, mirroring `Target` --
+    and becomes the tail of its remote key (`BackupConfig.byte_store_remote`).
+    """
+
+    service_id: str
+    path: Path
+    block: UidBlock
+    rel: str
+    label: str = ""
+
+    @property
+    def effective_label(self) -> str:
+        return self.label or self.service_id
+
+
+def discover_byte_stores(
+    state: StateDir,
+    allocator: Any,
+    *,
+    only: Sequence[str] | None = None,
+    run_admin_fn: AdminRunner = run_admin,
+    timeout_s: float = DISCOVER_TIMEOUT_S,
+) -> list[ByteStore]:
+    """Every `<root>/data/**/{blobs,oss-bytes,pages-content}` directory.
+
+    A separate listing from `discover`, deliberately: that one's argv and
+    output are pinned by the pre-1.1 tests and its keys must not move. Same
+    rules otherwise -- the listing runs in the admin namespace, a service
+    without a data dir costs no fork, one without a uid block is skipped, a
+    failing listing is a warning, and the output is untrusted.
+    """
+    wanted = set(only) if only else None
+    stores: list[ByteStore] = []
+    for service_id in state.list_service_ids():
+        if wanted is not None and service_id not in wanted:
+            continue
+        service_root = state.service_root(service_id)
+        data_dir = service_root / DATA_DIRNAME
+        if not data_dir.is_dir():
+            continue
+        block = allocator.get(service_id)
+        if block is None:
+            log.warning("%s: no uid block allocated; cannot list %s", service_id, data_dir)
+            continue
+        result = run_admin_fn(_byte_store_find_argv(data_dir), block, timeout_s=timeout_s)
+        if not result.ok:
+            log.warning(
+                "%s: listing byte stores under %s failed (rc=%d): %s",
+                service_id,
+                data_dir,
+                result.returncode,
+                result.stderr.decode(errors="replace").strip() or "(no stderr)",
+            )
+            continue
+        members = _pool_members(service_root)
+        for path in _parse_byte_store_output(result.stdout, data_dir, service_id):
+            label = _label_for(path, data_dir, members)
+            base = data_dir / label if label else data_dir
+            rel = path.relative_to(base).as_posix()
+            stores.append(ByteStore(service_id, path, block, rel, label))
+    stores.sort(key=lambda s: (s.service_id, str(s.path)))
+    log.info("found %d byte store(s)", len(stores))
+    return stores
+
+
+def _byte_store_find_argv(data_dir: Path) -> list[str]:
+    """`find <data> -mindepth 1 -type d ( -name blobs -o ... ) -print -prune`.
+
+    ``-prune`` after ``-print`` stops find descending into a store it has just
+    reported, so the walk never enumerates the (possibly millions of) files a
+    store holds -- only the directories around them. ``-type d`` without
+    ``-L`` never follows a symlink out of the data dir.
+    """
+    argv = ["find", str(data_dir), "-mindepth", "1", "-type", "d", "("]
+    for i, name in enumerate(BYTE_STORE_NAMES):
+        if i:
+            argv.append("-o")
+        argv += ["-name", name]
+    argv += [")", "-print", "-prune"]
+    return argv
+
+
+#: One path component of a byte store's location. It becomes part of an R2 key
+#: and of rclone argv, so anything beyond a plain name is refused.
+_SAFE_COMPONENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+
+
+def _parse_byte_store_output(stdout: bytes, data_dir: Path, service_id: str) -> list[Path]:
+    """`find -print` lines -> byte-store directories; untrusted like `_parse_find_output`.
+
+    Kept: inside the data dir, basename one of `BYTE_STORE_NAMES`, every
+    component a plain name, and not nested inside a store already kept (``-prune``
+    guarantees that for real output; the check keeps the parser honest on its own).
+    """
+    out: list[Path] = []
+    prefix = str(data_dir).rstrip("/") + "/"
+    for raw in stdout.decode("utf-8", "replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line[len(prefix) :].split("/") if line.startswith(prefix) else []
+        if (
+            not parts
+            or parts[-1] not in BYTE_STORE_NAMES
+            or not all(_SAFE_COMPONENT.fullmatch(p) for p in parts)
+        ):
+            log.warning("%s: ignoring unexpected byte-store find output %r", service_id, line)
+            continue
+        path = Path(line)
+        if any(kept in path.parents for kept in out):
+            log.info("%s: %s is inside a byte store already listed", service_id, path)
+            continue
+        out.append(path)
+    return out
+
+
 # ----------------------------------------------------------------- snapshot
 
 # Run as inner root in the admin namespace, with the two paths as argv. A fixed
@@ -420,6 +605,7 @@ def _parse_find_output(stdout: bytes, data_dir: Path, service_id: str) -> list[P
 # a hot WAL and would silently back up a stale snapshot.
 _SNAPSHOT_CODE = """\
 import os
+import re
 import sqlite3
 import sys
 
@@ -644,6 +830,54 @@ def prune(
     return cfg.prune_target()
 
 
+def byte_store_argv(store: ByteStore, cfg: BackupConfig) -> list[str]:
+    """The exact `rclone copy --immutable` argv for one byte store. Pure, like
+    `upload_argv`. ``copy`` never deletes at the destination and
+    ``--immutable`` refuses to overwrite an existing object, so a bug on the
+    host side can add objects but never destroy one already backed up."""
+    return [
+        str(cfg.rclone),
+        "copy",
+        "--immutable",
+        "--s3-no-check-bucket",
+        str(store.path),
+        cfg.byte_store_remote(store),
+    ]
+
+
+def copy_byte_store(
+    store: ByteStore,
+    cfg: BackupConfig,
+    creds: R2Credentials,
+    *,
+    run_admin_fn: AdminRunner = run_admin,
+    timeout_s: float = BYTE_STORE_TIMEOUT_S,
+) -> str:
+    """Copy one byte store's new files to R2; returns the remote directory.
+
+    Runs in the admin namespace because the files belong to the service's uid
+    block. The credentials reach rclone through the child's environment
+    (`run_admin`'s ``env``), exactly as the harness-side uploads do -- never
+    argv, never a file.
+    """
+    argv = byte_store_argv(store, cfg)
+    log.info("copying byte store %s -> %s", store.path, argv[-1])
+    result = run_admin_fn(
+        argv, store.block, timeout_s=timeout_s, env={**_base_env(), **creds.env()}
+    )
+    if not result.ok:
+        detail = (
+            result.stderr.decode(errors="replace").strip()
+            or result.stdout.decode(errors="replace").strip()
+        )
+        raise BackupError(
+            f"{store.service_id}: rclone copy of {store.rel} exited {result.returncode}: "
+            f"{creds.redact(detail or '(no output)')}"
+        )
+    log.info("byte store %s is up to date at %s", store.path, argv[-1])
+    return argv[-1]
+
+
 # ------------------------------------------------------------------ restore
 
 
@@ -712,16 +946,34 @@ class TargetResult:
 
 
 @dataclass(frozen=True)
+class ByteStoreResult:
+    service_id: str
+    store: str
+    status: str  # "ok" | "failed"
+    remote: str | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
+@dataclass(frozen=True)
 class Report:
     started_at: str
     stamp: str
     dry_run: bool
     results: tuple[TargetResult, ...] = ()
     prune_error: str | None = None
+    byte_stores: tuple[ByteStoreResult, ...] = ()
 
     @property
     def ok(self) -> bool:
-        return self.prune_error is None and all(r.ok for r in self.results)
+        return (
+            self.prune_error is None
+            and all(r.ok for r in self.results)
+            and all(b.ok for b in self.byte_stores)
+        )
 
     @property
     def exit_code(self) -> int:
@@ -785,6 +1037,14 @@ def run(
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
+    # Byte stores strictly after every snapshot above: a snapshot taken first
+    # can only reference blobs that exist by now, and blobs are never rewritten.
+    byte_results: list[ByteStoreResult] = []
+    for byte_store in discover_byte_stores(state, allocator, only=only, run_admin_fn=run_admin_fn):
+        byte_result = _copy_one(byte_store, cfg, creds, dry_run=dry_run, run_admin_fn=run_admin_fn)
+        byte_results.append(byte_result)
+        _emit(out, _byte_record_for(byte_result, byte_store, cfg, dry_run=dry_run))
+
     prune_error: str | None = None
     if dry_run:
         _emit(
@@ -819,6 +1079,7 @@ def run(
         dry_run=dry_run,
         results=tuple(results),
         prune_error=prune_error,
+        byte_stores=tuple(byte_results),
     )
     _emit(
         out,
@@ -834,6 +1095,8 @@ def run(
                 "targets": len(results),
                 "failed": sum(1 for r in results if not r.ok),
                 "prune_error": prune_error,
+                "byte_stores": len(byte_results),
+                "byte_stores_failed": sum(1 for b in byte_results if not b.ok),
             },
         ),
     )
@@ -904,6 +1167,46 @@ def _run_one(
     finally:
         if gz is not None:
             gz.unlink(missing_ok=True)
+
+
+def _copy_one(
+    store: ByteStore,
+    cfg: BackupConfig,
+    creds: R2Credentials,
+    *,
+    dry_run: bool,
+    run_admin_fn: AdminRunner,
+) -> ByteStoreResult:
+    remote = cfg.byte_store_remote(store)
+    if dry_run:
+        log.info("dry run: would copy byte store %s -> %s", store.path, remote)
+        return ByteStoreResult(store.service_id, str(store.path), "ok", remote=remote)
+    try:
+        copy_byte_store(store, cfg, creds, run_admin_fn=run_admin_fn)
+    except (BackupError, OSError) as e:
+        error = creds.redact(f"{type(e).__name__}: {e}")
+        log.warning("byte store %s failed: %s", store.path, error)
+        return ByteStoreResult(store.service_id, str(store.path), "failed", error=error)
+    return ByteStoreResult(store.service_id, str(store.path), "ok", remote=remote)
+
+
+def _byte_record_for(
+    result: ByteStoreResult, store: ByteStore, cfg: BackupConfig, *, dry_run: bool
+) -> dict[str, Any]:
+    """One JSON record per byte store; a dry run carries the argv and env NAMES."""
+    event = asdict(result)
+    if result.ok and dry_run:
+        event["argv"] = byte_store_argv(store, cfg)
+        event["env_names"] = list(RCLONE_ENV_NAMES)
+    return _record(
+        "ByteStoreSynced" if result.ok else "ByteStoreFailed",
+        result.service_id,
+        "log" if result.ok else "escalate",
+        ("dry run: byte store copy skipped" if dry_run else "byte store copied")
+        if result.ok
+        else (result.error or "byte store copy failed"),
+        event,
+    )
 
 
 def _record_for(result: TargetResult, cfg: BackupConfig, *, dry_run: bool) -> dict[str, Any]:

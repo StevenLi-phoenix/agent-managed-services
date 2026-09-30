@@ -1,0 +1,7 @@
+# api.lishuyu.app — core on 127.0.0.1:18080
+http://api.lishuyu.app:8080 {
+	log {
+		format json
+	}
+	reverse_proxy 127.0.0.1:18080
+}

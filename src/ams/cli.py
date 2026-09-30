@@ -59,10 +59,12 @@ EXIT_UNAVAILABLE = 2
 SUMMARY_INTERVAL_S = 60.0
 
 # Ceiling for the graceful-shutdown phase. deploy/ams-harness.service sets
-# TimeoutStopSec=30; the supervisor spends up to (this + ~1.5s) before it
+# TimeoutStopSec=50; the supervisor spends up to (this + ~1.5s) before it
 # force-kills, so a declaration with a huge stop.timeout_s must be clamped
-# rather than letting systemd SIGKILL the harness mid-shutdown.
-SHUTDOWN_BUDGET_S = 25.0
+# rather than letting systemd SIGKILL the harness mid-shutdown. 45 s covers
+# core mode's stop.timeout_s = 40 (upstream core.service TimeoutStopSec=40:
+# every plugin generation drains before the process exits).
+SHUTDOWN_BUDGET_S = 45.0
 
 # `ams ctl` operations. Duplicated from ams.control.OPS rather than imported at
 # module import time so that building the parser (and `ams validate`) never
@@ -336,7 +338,12 @@ def build_supervisor(
             "(development only)."
         ) from e
 
-    store, runtime_env_for = _load_runtime_layer(state) if isolation else (None, None)
+    # Loaded with or without isolation: the lookup is pure (no provisioning at
+    # start), and a plain spawn needs it just as much -- a managed-node service
+    # (core mode) would otherwise start with PATH=/usr/local/bin:/usr/bin:/bin
+    # and die on a missing `node`. Provisioning itself stays isolation-only
+    # (_register only provisions with a uid block).
+    store, runtime_env_for = _load_runtime_layer(state)
     # Declared secrets (D16) ride the same per-start lookup as runtime
     # activation and win over it; they are injected even without isolation,
     # because a service's need for its credential does not depend on how it is
@@ -554,7 +561,7 @@ def shutdown_timeout_for(declarations: dict[str, ServiceDecl]) -> float:
     if longest > SHUTDOWN_BUDGET_S:
         log.warning(
             "longest stop.timeout_s is %.1fs, over the %.1fs shutdown budget; "
-            "clamping so systemd's TimeoutStopSec=30 does not SIGKILL the harness "
+            "clamping so systemd's TimeoutStopSec=50 does not SIGKILL the harness "
             "mid-shutdown. Lower stop.timeout_s, or raise TimeoutStopSec in the unit.",
             longest,
             SHUTDOWN_BUDGET_S,

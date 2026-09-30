@@ -1,0 +1,7 @@
+# pages.shuyuli.com — core on 127.0.0.1:18081
+http://pages.shuyuli.com:8080 {
+	log {
+		format json
+	}
+	reverse_proxy 127.0.0.1:18081
+}

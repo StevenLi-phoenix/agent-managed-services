@@ -18,7 +18,10 @@ the single XFS ``reflink=1`` store (D8/D13):
     A per-service copy made with ``cp -a --reflink=auto`` *inside the admin user
     namespace*, then chowned to the service block. Same filesystem as the
     canonical tree, so the extents are shared and the second service on a sha
-    costs metadata only.
+    costs metadata only. ``stage(dest=...)`` puts it elsewhere under the root
+    (core mode stages ``releases/<sha>`` and flips a ``current`` symlink,
+    PLAN-core §2); ``stage_plain`` is the same copy without a namespace, for dev
+    hosts and ``--no-isolation``.
 
 Why ``git archive | tar`` rather than ``git worktree``: a worktree's metadata
 (``.git`` file, ``worktrees/<id>/`` in the bare repo) is written by git as the
@@ -75,8 +78,10 @@ SHA_MARKER = ".ams-sha"
 
 _INDEX_NAME = "index.json"
 _REPO_DIRNAME = "repo"
-_NEW_DIRNAME = "repo.new"
-_OLD_DIRNAME = "repo.old"
+# A staged tree is built at "<dest>.new" and the one it replaces parked at
+# "<dest>.old", beside it: same directory, so both mv's are renames.
+_NEW_SUFFIX = ".new"
+_OLD_SUFFIX = ".old"
 
 # Full or abbreviated commit ids only. Anything else would let a caller name a
 # directory outside <store>/src/<name>/.
@@ -84,6 +89,10 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
 # Branch/tag names we are willing to interpolate into "refs/heads/<ref>".
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+# One component of a stage destination. It reaches admin argv as part of a path,
+# so a leading "-" (an option to rm/cp/mv) and anything a human would misread
+# are refused along with "." and "..".
+_DEST_PART_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
 
 _TOOL_PATH = "/usr/local/bin:/usr/bin:/bin"
 
@@ -423,29 +432,38 @@ class SourceMirror:
         service_root: Path,
         block: UidBlock,
         *,
+        dest: str = _REPO_DIRNAME,
         harness_uid: int | None = None,
         harness_gid: int | None = None,
         timeout_s: float = DEFAULT_STAGE_TIMEOUT_S,
     ) -> Path:
-        """Put the tree for ``sha`` at ``<service_root>/repo``, owned by ``block``.
+        """Put the tree for ``sha`` at ``<service_root>/<dest>``, owned by ``block``.
 
-        A no-op when ``repo/.ams-sha`` already names ``sha``, which is the
+        ``dest`` is a plain relative path under the root: ``repo`` (the default,
+        every translated service) or ``releases/<sha>`` (core mode). Missing
+        parent directories are created through the admin namespace and chowned
+        to the service -- one level at a time, never ``-R``: a parent that
+        already exists may hold other releases, and walking them is exactly the
+        O(files) chown ``ensure_service_root`` is careful to avoid.
+
+        A no-op when ``<dest>/.ams-sha`` already names ``sha``, which is the
         common case on every sync tick. Otherwise the new tree is built beside
         the old one and swapped in with two ``mv``s, so a service root is never
         left holding a half-copied checkout.
         """
         sha = _check_sha(sha)
+        rel = _check_dest(dest)
         service_root = Path(service_root)
         if not service_root.is_absolute():
             raise ValueError(f"service root must be absolute, got {service_root}")
-        repo = service_root / _REPO_DIRNAME
+        repo = service_root.joinpath(*rel)
         if _read_marker(repo / SHA_MARKER) == sha:
             log.info("%s: %s already at %s; stage is a no-op", self.name, repo, sha)
             return repo
 
         canonical = self.materialize(sha)
-        new = service_root / _NEW_DIRNAME
-        old = service_root / _OLD_DIRNAME
+        new = repo.with_name(repo.name + _NEW_SUFFIX)
+        old = repo.with_name(repo.name + _OLD_SUFFIX)
         if not service_root.exists():
             ensure_service_root(
                 service_root, block, harness_uid=harness_uid, harness_gid=harness_gid
@@ -457,6 +475,24 @@ class SourceMirror:
             "harness_gid": harness_gid,
             "timeout_s": timeout_s,
         }
+        # Parents between the root and the tree ("releases/"). For the default
+        # dest there are none, so the argv sequence is exactly the pre-1.1 one.
+        missing = [p for p in _between(service_root, repo.parent) if not p.exists()]
+        if missing:
+            log.info(
+                "%s: creating %s under %s for the block",
+                self.name,
+                ", ".join(str(p.relative_to(service_root)) for p in missing),
+                service_root,
+            )
+            self._admin(
+                ["mkdir", "-p", str(repo.parent)], what="create stage parents", **admin_kwargs
+            )
+            self._admin(
+                ["chown", f"{INNER_UID}:{INNER_GID}", *(str(p) for p in missing)],
+                what="chown stage parents",
+                **admin_kwargs,
+            )
         with tempfile.TemporaryDirectory() as td:
             # The marker cannot be written directly: <root>/repo.new belongs to
             # the service uid the moment it is chowned, and belongs to inner
@@ -491,6 +527,97 @@ class SourceMirror:
         self._touch_index(sha)
         log.info("%s: staged %s into %s", self.name, sha, repo)
         return repo
+
+    def stage_plain(
+        self,
+        sha: str,
+        dest_dir: Path,
+        *,
+        timeout_s: float = DEFAULT_STAGE_TIMEOUT_S,
+    ) -> Path:
+        """Put the tree for ``sha`` at ``dest_dir`` as the current user, no namespace.
+
+        The dev / ``--no-isolation`` twin of :meth:`stage`: same marker, same
+        build-beside-then-swap, but plain ``cp`` and ``os.rename`` because the
+        destination is ours to write. macOS has no user namespace at all, which
+        is the main reason this exists.
+
+        ``cp -a --reflink=auto`` is tried first (GNU cp; shares extents on XFS
+        and btrfs), then plain ``cp -a`` -- the stock macOS ``cp`` rejects the
+        flag with "illegal option". A copy that fails both ways raises and leaves
+        neither ``dest_dir`` nor its ``.new`` sibling behind.
+        """
+        sha = _check_sha(sha)
+        dest_dir = Path(dest_dir)
+        if not dest_dir.is_absolute():
+            raise ValueError(f"stage_plain destination must be absolute, got {dest_dir}")
+        if _read_marker(dest_dir / SHA_MARKER) == sha:
+            log.info("%s: %s already at %s; stage_plain is a no-op", self.name, dest_dir, sha)
+            return dest_dir
+
+        canonical = self.materialize(sha)
+        new = dest_dir.with_name(dest_dir.name + _NEW_SUFFIX)
+        old = dest_dir.with_name(dest_dir.name + _OLD_SUFFIX)
+        dest_dir.parent.mkdir(parents=True, exist_ok=True)
+        for leftover in (new, old):
+            if leftover.exists() or leftover.is_symlink():
+                log.info("%s: removing leftover %s from an interrupted stage", self.name, leftover)
+                _remove(leftover)
+        try:
+            self._copy_tree(canonical, new, timeout_s)
+            (new / SHA_MARKER).write_text(sha + "\n", encoding="utf-8")
+        except BaseException:
+            _remove(new)
+            raise
+        had_old = dest_dir.exists() or dest_dir.is_symlink()
+        if had_old:
+            os.rename(dest_dir, old)
+        os.rename(new, dest_dir)
+        if had_old:
+            _remove(old)
+        self._touch_index(sha)
+        log.info("%s: staged %s into %s (plain, no namespace)", self.name, sha, dest_dir)
+        return dest_dir
+
+    def _copy_tree(self, src: Path, dst: Path, timeout_s: float) -> None:
+        """``cp -a`` ``src`` to a not-yet-existing ``dst``, reflinking where cp can."""
+        cp = _which("cp")
+        attempts = (
+            [cp, "-a", "--reflink=auto", str(src), str(dst)],
+            [cp, "-a", str(src), str(dst)],
+        )
+        failures: list[str] = []
+        for argv in attempts:
+            started = time.monotonic()
+            try:
+                proc = subprocess.run(  # noqa: S603 - argv list, never a shell string
+                    argv,
+                    capture_output=True,
+                    timeout=timeout_s,
+                    env={"PATH": _TOOL_PATH, "LC_ALL": "C"},
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as e:
+                _remove(dst)
+                raise SourceError(
+                    f"{self.name}: copy timed out after {timeout_s:.0f}s: {' '.join(argv)}"
+                ) from e
+            except OSError as e:
+                raise SourceError(f"{self.name}: could not run {' '.join(argv)}: {e}") from e
+            log.info(
+                "%s: %s -> rc=%d in %.1fs",
+                self.name,
+                " ".join(argv),
+                proc.returncode,
+                time.monotonic() - started,
+            )
+            if proc.returncode == 0:
+                return
+            stderr = _tail(proc.stderr.decode(errors="replace")) or "(no stderr)"
+            failures.append(f"{' '.join(argv)} (rc={proc.returncode}): {stderr}")
+            log.warning("%s: copy attempt failed, %s", self.name, failures[-1])
+            _remove(dst)
+        raise SourceError(f"{self.name}: copying {src} failed:\n" + "\n".join(failures))
 
     def _admin(
         self,
@@ -587,6 +714,41 @@ def _check_sha(sha: str) -> str:
     if not isinstance(sha, str) or not _SHA_RE.match(sha):
         raise SourceError(f"invalid commit sha {sha!r}")
     return sha
+
+
+def _check_dest(dest: str) -> tuple[str, ...]:
+    """Split a stage destination into components, refusing anything but a plain
+    relative path. Split on "/" by hand rather than through ``PurePosixPath``,
+    which would quietly normalise ``a//b`` and ``./a`` into something valid."""
+    if not isinstance(dest, str) or not dest:
+        raise SourceError(f"invalid stage dest {dest!r}: must be a non-empty relative path")
+    parts = tuple(dest.split("/"))
+    bad = [p for p in parts if not _DEST_PART_RE.fullmatch(p)]
+    if dest.startswith("/") or bad:
+        raise SourceError(
+            f"invalid stage dest {dest!r}: must be a relative path of plain components "
+            f"(no '..', '.', empty or option-like parts; offending: {bad or [dest]})"
+        )
+    return parts
+
+
+def _between(root: Path, parent: Path) -> list[Path]:
+    """Directories strictly below ``root`` down to and including ``parent``,
+    outermost first; empty when ``parent`` is ``root`` itself."""
+    out: list[Path] = []
+    cur = parent
+    while cur != root:
+        out.append(cur)
+        cur = cur.parent
+    return out[::-1]
+
+
+def _remove(path: Path) -> None:
+    """Remove a file, symlink or tree we own; missing is fine."""
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
 
 
 def _read_temp(fh: IO[bytes]) -> str:
