@@ -298,9 +298,9 @@ def ship(state, store, cfg, plugin_ids, *, force=False, isolation=True)     # fo
   `.claude/state/evidence/core-e2e-local-2026-09-29.txt` (2026-09-30: all six scenarios pass;
   two fixes — gate fails fast on a harness-`failed` core; Node trace-warnings hint is INFO)
 - [x] 5. Docs: `docs/platform-core.md`, `docs/platform.md` legacy banner, README, CLAUDE.md, CHANGELOG (merge the branch's), D31, PROGRESS; version 1.1.0 (2026-09-30; suite 1608 passed / 167 skipped)
-- [ ] 6. Commit on main
-- [ ] 7. `git filter-repo --replace-text` over all refs: 2 throwaway pilot `SVC_SECRET`s (06276ce, `examples/api-pilot/*/service.toml`) + 2 IPs (deleted DO droplet, tailnet)
-- [ ] 8. gitleaks + custom sweep re-scan → clean (only the known fake-key test fixture)
-- [ ] 9. Force-push main, `security-audit-fixes`, tag `v1.0.0` (rewritten) + new tag `v1.1.0`
-- [ ] 10. Repo → public; verify visibility; note open issue #3 (legacy Layer-0 port hijack) is public from then on
+- [x] 6. Commit on main
+- [x] 7. `git filter-repo --replace-text` over all refs: 2 throwaway pilot `SVC_SECRET`s (06276ce, `examples/api-pilot/*/service.toml`) + 2 IPs (deleted DO droplet, tailnet)
+- [x] 8. gitleaks + custom sweep re-scan → clean (only the known fake-key test fixture)
+- [x] 9. Push rewritten `main` + tags `v1.0.0` (rewritten) and `v1.1.0` to the recreated repo (no force-push needed; `security-audit-fixes` is merged into main and kept local only)
+- [x] 10. Repo → public (2026-09-30). Done as delete + recreate (refs/pull/13 kept the old history reachable by SHA; a force-push could not remove it): issues #1–#12 deleted first (#3 and review finding security-4 are recorded in DECISIONS Open), PR #13 gone with the old repo, releases v1.0.0/v1.1.0 recreated, secret scanning + push protection on
 - [ ] Open (user): re-provision racknerd for Linux live verification of core mode
