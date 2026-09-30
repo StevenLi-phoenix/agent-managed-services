@@ -56,9 +56,24 @@ _FLOAT_RE = re.compile(r"^[-+]?(0|[1-9][0-9]*)\.[0-9]+$")
 # Numeric-looking forms YAML 1.1 resolves in ways this parser deliberately does
 # not implement (octal, underscores, sexagesimal, exponents, .inf/.nan).
 _SUSPECT_NUMERIC_RE = re.compile(
-    r"^[-+]?(0[0-9_]+|0[xXoObB][0-9a-fA-F_]+|[0-9][0-9_]*[:.eE][0-9a-zA-Z_:.+-]*|\.(inf|Inf|INF|nan|NaN|NAN))$"
+    r"^[-+]?"
+    r"(0[0-9_]+"
+    r"|0[xXoObB][0-9a-fA-F_]+"
+    r"|[0-9][0-9_]*[:.eE][0-9a-zA-Z_:.+-]*"
+    r"|[0-9][0-9_]*_[0-9_]*"
+    r"|\.(inf|Inf|INF|nan|NaN|NAN))$"
 )
 _INDICATORS = "&*!|>%@`"
+
+# Flow collections nest (``[a, [b, {c}]]``); the flow parsers recurse into each
+# other with no other bound, so a cap here is what turns ``k: [[[[...`` into a
+# YamlSubsetError instead of a bare RecursionError that no per-manifest error
+# path catches. The deepest construct the real manifests use is 2 levels.
+_MAX_FLOW_DEPTH = 64
+
+# CPython refuses ``int()`` past 4300 digits ("Exceeds the limit", a bare
+# ValueError); no manifest field is a number with more digits than this.
+_MAX_SCALAR_DIGITS = 64
 
 
 @dataclass(frozen=True)
@@ -171,8 +186,12 @@ def _plain_scalar(line_no: int, raw: str) -> Any:
             f'bare {text!r} is a YAML 1.1 boolean; quote it ("{text}") to mean the string',
         )
     if _INT_RE.match(text):
+        if len(text) > _MAX_SCALAR_DIGITS:
+            raise _err(line_no, f"integer scalar of {len(text)} digits is too long")
         return int(text)
     if _FLOAT_RE.match(text):
+        if len(text) > _MAX_SCALAR_DIGITS:
+            raise _err(line_no, f"float scalar of {len(text)} digits is too long")
         return float(text)
     if _SUSPECT_NUMERIC_RE.match(text):
         raise _err(line_no, f"ambiguous numeric scalar {text!r}; quote it to mean the string")
@@ -271,11 +290,13 @@ def _find_quote_end(line_no: int, s: str, start: int) -> int:
 # --------------------------------------------------------------------------- flow
 
 
-def _parse_flow(line_no: int, s: str, i: int) -> tuple[Any, int]:
+def _parse_flow(line_no: int, s: str, i: int, depth: int = 0) -> tuple[Any, int]:
+    if depth > _MAX_FLOW_DEPTH:
+        raise _err(line_no, f"flow collection nested deeper than {_MAX_FLOW_DEPTH} levels")
     if s[i] == "[":
-        return _parse_flow_seq(line_no, s, i)
+        return _parse_flow_seq(line_no, s, i, depth)
     if s[i] == "{":
-        return _parse_flow_map(line_no, s, i)
+        return _parse_flow_map(line_no, s, i, depth)
     raise _err(line_no, "expected a flow collection")
 
 
@@ -285,7 +306,7 @@ def _skip_ws(s: str, i: int) -> int:
     return i
 
 
-def _parse_flow_scalar(line_no: int, s: str, i: int, stop: str) -> tuple[Any, int]:
+def _parse_flow_scalar(line_no: int, s: str, i: int, stop: str, depth: int = 0) -> tuple[Any, int]:
     i = _skip_ws(s, i)
     if i >= len(s):
         raise _err(line_no, "unterminated flow collection")
@@ -293,14 +314,14 @@ def _parse_flow_scalar(line_no: int, s: str, i: int, stop: str) -> tuple[Any, in
         end = _find_quote_end(line_no, s, i)
         return _unquote(line_no, s[i : end + 1]), end + 1
     if s[i] in "[{":
-        return _parse_flow(line_no, s, i)
+        return _parse_flow(line_no, s, i, depth + 1)
     j = i
     while j < len(s) and s[j] not in stop:
         j += 1
     return _plain_scalar(line_no, s[i:j]), j
 
 
-def _parse_flow_seq(line_no: int, s: str, i: int) -> tuple[list[Any], int]:
+def _parse_flow_seq(line_no: int, s: str, i: int, depth: int = 0) -> tuple[list[Any], int]:
     i += 1  # past '['
     out: list[Any] = []
     while True:
@@ -309,7 +330,7 @@ def _parse_flow_seq(line_no: int, s: str, i: int) -> tuple[list[Any], int]:
             raise _err(line_no, "unterminated flow sequence")
         if s[i] == "]":
             return out, i + 1
-        value, i = _parse_flow_scalar(line_no, s, i, ",]")
+        value, i = _parse_flow_scalar(line_no, s, i, ",]", depth)
         out.append(value)
         i = _skip_ws(s, i)
         if i < len(s) and s[i] == ",":
@@ -320,7 +341,7 @@ def _parse_flow_seq(line_no: int, s: str, i: int) -> tuple[list[Any], int]:
             raise _err(line_no, "expected ',' or ']' in flow sequence")
 
 
-def _parse_flow_map(line_no: int, s: str, i: int) -> tuple[dict[str, Any], int]:
+def _parse_flow_map(line_no: int, s: str, i: int, depth: int = 0) -> tuple[dict[str, Any], int]:
     i += 1  # past '{'
     out: dict[str, Any] = {}
     while True:
@@ -329,13 +350,13 @@ def _parse_flow_map(line_no: int, s: str, i: int) -> tuple[dict[str, Any], int]:
             raise _err(line_no, "unterminated flow mapping")
         if s[i] == "}":
             return out, i + 1
-        key, i = _parse_flow_scalar(line_no, s, i, ":,}")
+        key, i = _parse_flow_scalar(line_no, s, i, ":,}", depth)
         if not isinstance(key, str):
             raise _err(line_no, f"flow mapping key {key!r} must be a string")
         i = _skip_ws(s, i)
         if i >= len(s) or s[i] != ":":
             raise _err(line_no, f"expected ':' after flow mapping key {key!r}")
-        value, i = _parse_flow_scalar(line_no, s, i + 1, ",}")
+        value, i = _parse_flow_scalar(line_no, s, i + 1, ",}", depth)
         if key in out:
             raise _err(line_no, f"duplicate key {key!r} in flow mapping")
         out[key] = value

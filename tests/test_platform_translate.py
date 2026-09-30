@@ -130,6 +130,9 @@ def test_yaml_subset_matches_pyyaml_on_synthetic_cases(text: str):
         ("restart: no\n", "YAML 1.1 boolean"),
         ("a:\n\tb: 1\n", "tab in indentation"),
         ("a: 0755\n", "ambiguous numeric"),
+        # A bare underscore integer is exactly what PyYAML resolves to an int
+        # (1000); it must be rejected like 0755/.inf, not kept as a string.
+        ("a: 1_000\n", "ambiguous numeric"),
         ("a: 'unterminated\n", "unterminated"),
         ("a: {b: 1\n", "flow mapping"),
         ("a: [1, 2\n", "flow sequence"),
@@ -140,6 +143,34 @@ def test_yaml_subset_rejects_unsupported_constructs(text: str, needle: str):
         yparse(text)
     assert needle in str(exc.value)
     assert str(exc.value).startswith("line ")
+
+
+@pytest.mark.parametrize(
+    "text,needle",
+    [
+        # Flow nesting beyond the parser's cap: a bare RecursionError here would
+        # escape every per-manifest error path (issue #2).
+        ("k: " + "[" * 100, "nested deeper"),
+        ("k: " + "{a: " * 100 + "1" + "}" * 100, "nested deeper"),
+        # CPython refuses int()/float() past 4300 digits with a bare ValueError
+        # (Py 3.11+ int_max_str_digits); the parser must reject it first.
+        ("x: " + "9" * 100, "too long"),
+        ("x: " + "9" * 100 + "." + "9" * 100, "too long"),
+    ],
+)
+def test_yaml_subset_rejects_pathological_scalars(text: str, needle: str):
+    with pytest.raises(YamlSubsetError) as exc:
+        yparse(text)
+    assert needle in str(exc.value)
+
+
+def test_translate_wraps_deep_block_nesting_as_translate_error():
+    # Block nesting is bounded only by the recursion limit itself (the flow cap
+    # does not apply); `translate` must still surface it as a TranslateError so
+    # one manifest cannot take the sync tick down (issue #2).
+    text = "".join(f"{'  ' * i}k:\n" for i in range(3000))
+    with pytest.raises(TranslateError):
+        translate(text, ctx())
 
 
 # ------------------------------------------------------------------- goldens

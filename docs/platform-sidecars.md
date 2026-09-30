@@ -16,9 +16,14 @@ beside it as **sidecars**: small, versioned JSON documents produced by
 `ams.platform.translate` and consumed by the gateway renderer, the registry
 client and the sync loop.
 
-Every sidecar carries `"version": 1` as its first key. A consumer that reads a
-version it does not know must fail loudly rather than guess. All three shapes
-are written with `ams.state.write_json_atomic` (sorted keys, trailing newline).
+Every sidecar carries `"version": 1`. A consumer that reads a version it does
+not know must fail loudly rather than guess. All three shapes are written
+atomically with sorted keys, but through two writers: `mount.json` and
+`registry.json` go through `sync._write_json_if_changed` (sorted keys, trailing
+newline, no write at all when the bytes are unchanged), `platform-state.json`
+through `ams.state.write_json_atomic` (sorted keys, no trailing newline). The
+examples below and the committed goldens list `version` first; an on-disk file
+does not — sorted keys put it last — so nothing may depend on key order.
 
 ## Locations
 
@@ -145,6 +150,7 @@ State record:
 | `error` | string \| null | one-line reason the service is at `failed`; `null` otherwise |
 | `manual_restart` | bool | from the manifest. `true` = the sync loop applies everything but does not restart the service (self-deploy of core services). |
 | `escalated` | bool | an escalation has already been emitted for the current `(sha, stage, error)`. Cleared on any stage change. Guarantees "a repeated translate failure escalates once, not per tick" (T3.3). |
+| `health_failed_at` | string | UTC ISO-8601 `...Z`; when the health gate last **failed** for this service. Written only on a failure and omitted by `as_json` while unset; read only while the record is `failed` — it is the clock the 900 s retry hold (`failed_health_retry_s`) runs on, so a failed service that nothing moved re-probes every 15 min instead of every tick. |
 | `updated_at` | string | UTC ISO-8601 `...Z`, second precision; touched on every write |
 | `stage_since` | string | UTC ISO-8601 `...Z`; when the service entered the current `stage`. The health gate's "failing for N minutes" is measured from here. |
 

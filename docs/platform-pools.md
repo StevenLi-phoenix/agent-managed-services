@@ -299,7 +299,9 @@ it (verified in the spike). `_build_member`, `_startup_member` and
 [<member>] pool: <phase> failed: <type>: <msg>` line rather than letting it
 escape. A member that fails to build or start is recorded in `failed` and
 skipped; the rest of the pool keeps serving. The process itself exits
-non-zero only when **zero** members started.
+non-zero when **zero** members started — and also when, with members up, the
+`/_pool/health` admin listener fails to start (`_serve` returns 1 there too);
+both paths hand the pool to the restart policy.
 
 ### `/_pool/health`
 
@@ -431,8 +433,11 @@ For each member, `adopt`:
 1. stops it over the control socket, and waits for the supervisor to confirm
    it is down — a process writing to a database is not a process whose
    database may move;
-2. moves `services/<member>/root/data/*` into
-   `services/pool-<name>/root/data/<member>/` and hands it to the pool's uid;
+2. renames the member's whole `services/<member>/root/data/` directory — first
+   into the staging area, then whole into
+   `services/pool-<name>/root/data/<member>/` — hands it to the pool's uid,
+   and leaves a fresh empty `data/` in the legacy root (why a whole-directory
+   move and two hops: below);
 3. copies `secrets/<member>/<NAME>` to `secrets/pool-<name>/<NAME>__<MANGLED>`
    (never overwriting a value that is already there);
 4. unlinks `services/<member>/service.toml` — the pool's declaration is what
@@ -447,20 +452,29 @@ maps exactly one uid block into the namespace it forks (inner 0 = the
 harness, inner 1000 = *that* block). A member's `data/` is owned by the
 member's block and the pool's `data/` by the pool's, so no single admin
 namespace holds `CAP_DAC_OVERRIDE` over both, and a direct `mv` fails with
-`EACCES` on whichever end is unmapped. The move is therefore two renames
-through a harness-owned staging directory that is inner 0 in *both*
-namespaces:
+`EACCES` on whichever end is unmapped. The move is therefore two renames of
+the **whole directory** through a harness-owned staging directory that is
+inner 0 in *both* namespaces:
 
 ```
-<member-root>/data/*  --(member block)-->  <state>/platform/adopt/<member>/
-<state>/platform/adopt/<member>/*  --(pool block)-->  <pool-root>/data/<member>/
+<member-root>/data  --(member block)-->  <state>/platform/adopt/<member>/data
+<state>/platform/adopt/<member>/data  --(pool block)-->  <pool-root>/data/<member>
 ```
 
 Both hops are renames on one filesystem, so a multi-gigabyte database moves
-in constant time and is never copied. A run that dies between the hops
-leaves files in staging; the next run drains them into the pool before
-touching the member's own `data/`, which is what makes a half-finished
-adoption recoverable by re-running `adopt`.
+in constant time and is never copied. Each hop moves the directory, not a
+per-entry name list: the plan is computed while the fleet is still running,
+and a WAL-mode SQLite service deletes its `-wal`/`-shm` sidecars when it
+stops cleanly, so a name list taken before the stop names files that no
+longer exist by the time the move runs — the failure that forced the
+whole-directory form (`.claude/state/diagnosis-pool-cutover.md`). The legacy
+root gets its empty `data/` back right after hop one. Only when the pool's
+target `<pool-root>/data/<member>` already holds something does `adopt` fall
+back to per-entry `mv -n` merges, refusing outright on a name clash (an
+operator decision, never a silent overwrite). A run that dies between the
+hops leaves the payload parked in staging; the next run drains it into the
+pool before touching the member's own `data/`, which is what makes a
+half-finished adoption recoverable by re-running `adopt`.
 
 `adopt` refuses, before touching anything, if the pool process is currently
 up, or if a member's target directory in the pool root already holds a

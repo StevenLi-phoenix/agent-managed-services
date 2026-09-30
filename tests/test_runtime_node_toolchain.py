@@ -407,7 +407,15 @@ class AdminRecorder:
             while rest and "=" in rest[0] and not rest[0].startswith("/"):
                 k, _, v = rest.pop(0).partition("=")
                 env[k] = v
-        self.calls.append({"argv": argv, "shown": shown, "env": env, "what": kw.get("what")})
+        self.calls.append(
+            {
+                "argv": argv,
+                "shown": shown,
+                "env": env,
+                "what": kw.get("what"),
+                "mask": list(kw.get("mask") or ()),
+            }
+        )
         if self.fail_on and self.fail_on in " ".join(shown):
             raise ProvisionError(f"{kw.get('what')} failed (rc=1): boom")
         return AdminResult(tuple(argv), 0, b"", b"")
@@ -494,7 +502,8 @@ def install_tool(bin_dir: Path, name: str, record: Path, extra: str = "") -> Non
 
 @pytest.fixture
 def tree(tmp_path: Path) -> Path:
-    t = tmp_path / "releases" / "abc123"
+    # Inside a service root, where provision_tree derives its provisioning mask.
+    t = tmp_path / "state" / "services" / "core" / "root" / "releases" / "abc123"
     t.mkdir(parents=True)
     (t / "package.json").write_text('{"name": "x", "private": true}')
     (t / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
@@ -667,6 +676,31 @@ def test_provision_tree_isolated_runs_as_inner_root_then_chowns(
     assert install["env"]["PATH"].split(":")[:2] == list(node_toolchain(store, NODE, PNPM).bin_dirs)
     # the admin path keeps the reflink-only import method (one XFS store, D8).
     assert install["env"]["npm_config_package_import_method"] == "clone"
+    # install scripts and the build are untrusted code: both run masked (issue #1),
+    # the closing chown is a harness op and sees the real files.
+    state = tree.parents[4]
+    expected = rt_mod.provisioning_mask(state / "services" / "core" / "root")
+    assert state / "secrets" in expected
+    assert [c["mask"] for c in admin.calls] == [expected, expected, []]
+
+
+def test_provision_tree_isolated_refuses_a_tree_outside_any_service_root(
+    monkeypatch: pytest.MonkeyPatch, store: RuntimeStore, tmp_path: Path, own_block: UidBlock
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    admin = AdminRecorder()
+    monkeypatch.setattr(rt_mod, "_admin", admin)
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    (loose / "package.json").write_text("{}")
+    with pytest.raises(ProvisionError, match="not inside a service root"):
+        provision_tree(loose, schema.RuntimeSpec(kind="pnpm"), block=own_block, store=store)
+    assert admin.calls == []
+    # an explicit mask is honoured as given
+    provision_tree(
+        loose, schema.RuntimeSpec(kind="pnpm"), block=own_block, store=store, mask=[tmp_path / "s"]
+    )
+    assert admin.calls[0]["mask"] == [tmp_path / "s"]
 
 
 def test_provision_tree_isolated_failure_stops_before_build(

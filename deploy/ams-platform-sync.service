@@ -45,15 +45,16 @@ ExecStart=/home/harness/venv/bin/python3 -m ams platform sync \
     --only commentservice --only emailservice --only kvservice \
     --only llmgateway --only logservice --only messageservice \
     --only notificationservice --only wechatservice --only timeservice
-# `oss` and `secretsservice` are deliberately NOT in that list. Neither can
-# start in the replica: oss calls ensure_bucket() against R2 inside its FastAPI
-# lifespan and dies on the placeholder credentials, and secretsservice requires
-# SECRETS_MASTER_KEY, which no manifest or service.ams.toml declares (T4.1).
-# Both are recorded `failed` + `escalated` in the platform state, which is the
-# honest record. Leaving them in would spend 2 x 90 s of health gate on every
-# 60 s tick -- back-to-back ticks on one vCPU -- for a condition a retry cannot
-# fix, which is the same reasoning as the missing `Restart=` below. Put them
-# back the moment a real credential is set.
+# Only `oss` is genuinely absent from that list: it is standalone and calls
+# ensure_bucket() against R2 inside its FastAPI lifespan, dying on the
+# placeholder credentials. Since pools (D29), the eight member ids above drag
+# the WHOLE pool into the tick -- `--only <member>` selects all 15 of
+# pool-core (docs/platform-pools.md) -- including `secretsservice` and
+# `resume`, which cannot start (SECRETS_MASTER_KEY is declared by no manifest
+# or service.ams.toml) and burn one 90 s health gate each on every 60 s tick.
+# That is the cost of a pool being one process: a dead member cannot be
+# dropped from a tick. A real credential, not this list, is what turns their
+# gates green.
 # One tick fetches, may run `uv sync` for several services and then waits on
 # each health gate. The per-step timeouts inside the job (git fetch, uv sync,
 # the health deadline) are all tighter; this is the outer backstop for a tick

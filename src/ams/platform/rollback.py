@@ -263,7 +263,15 @@ def _find_translation(
                 sha=sha, services_dir=services_dir, extra_secret_names=overlay.secrets
             )
             translation = translate(manifest.read_text(encoding="utf-8"), ctx)
-        except (TranslateError, StaticError, DeclError, OSError, UnicodeDecodeError) as e:
+        except (
+            TranslateError,
+            StaticError,
+            DeclError,
+            OSError,
+            UnicodeDecodeError,
+            RecursionError,
+            ValueError,
+        ) as e:
             log.debug("%s does not translate at %s (%s); skipping", manifest, sha[:12], e)
             continue
         if translation.id != service_id:

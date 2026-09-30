@@ -570,11 +570,17 @@ def _admin(
     display: Sequence[str] | None = None,
     log_path: Path | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    mask: Sequence[Path] = (),
 ) -> AdminResult:
-    """Run one command as inner root, log it, and turn failure into ProvisionError."""
+    """Run one command as inner root, log it, and turn failure into ProvisionError.
+
+    ``mask`` forwards to :func:`ams.userns.run_admin` -- set only when the
+    command executes untrusted code (see :func:`provisioning_mask`); harness
+    ops like the closing ``chown`` need the real files.
+    """
     shown = " ".join(display if display is not None else argv)
     started = time.monotonic()
-    result = run_admin(list(argv), block, timeout_s=timeout_s)
+    result = run_admin(list(argv), block, timeout_s=timeout_s, mask=mask)
     return _finish(result, what=what, shown=shown, started=started, log_path=log_path)
 
 
@@ -669,12 +675,16 @@ def _tool(
     what: str,
     log_path: Path | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    mask: Sequence[Path] = (),
 ) -> AdminResult:
     """Run a provisioning tool in ``workdir`` with ``env``.
 
     ``run_admin`` execs with its own fixed environment and inherits the
     harness cwd, so both are set by wrapping the call in coreutils ``env``
     (``-i`` for a clean slate, ``-C`` to chdir). Never a shell string.
+    ``mask`` must carry :func:`provisioning_mask`'s paths: the tool executes
+    package build hooks, which are untrusted code running with the harness
+    uid's read access unless the private paths are mounted over first.
     """
     wrapped = [
         "env",
@@ -691,6 +701,7 @@ def _tool(
         display=argv,
         log_path=log_path,
         timeout_s=timeout_s,
+        mask=mask,
     )
 
 
@@ -702,6 +713,37 @@ def _require_linux() -> None:
         raise ProvisionError(
             f"runtime provisioning needs Linux (user namespaces); this is {sys.platform}"
         )
+
+
+def provisioning_mask(service_root: Path) -> list[Path]:
+    """Harness-private paths provisioning tools must not see (issue #1).
+
+    Provisioning runs untrusted code -- uv/pnpm/bun execute package build
+    hooks -- as inner root under the admin map, where the harness uid's read
+    access is the tool's read access. The service's *own* tree stays visible
+    (the tools work in it); the SecretStore, harness state, the platform dir,
+    the control socket and every *sibling* service tree (other services' data,
+    Layer-0 key material) are mounted over empty in the child's private mount
+    namespace.
+
+    Entries are disjoint by construction (never nest -- see
+    :func:`ams.userns._apply_mask`). Paths that do not exist are skipped by
+    the mask itself, so a fixed layout is safe to pass.
+    """
+    root = Path(service_root)
+    state = root.parent.parent.parent  # <state>/services/<id>/root -> <state>
+    own = root.parent  # <state>/services/<id>
+    mask = [
+        state / "secrets",
+        state / "state",
+        state / "logs",
+        state / "control.sock",
+        state / "platform",
+    ]
+    services = state / "services"
+    if services.is_dir():
+        mask.extend(p for p in services.iterdir() if p != own)
+    return mask
 
 
 def _ensure_root(decl: ServiceDecl, service_root: Path, workdir: Path, block: UidBlock) -> None:
@@ -723,6 +765,7 @@ def _install_python_interpreter(
     env: Mapping[str, str],
     log_path: Path | None,
     timeout_s: float,
+    mask: Sequence[Path] = (),
 ) -> None:
     """``uv python install <version>`` into the shared managed-interpreter dir.
 
@@ -738,6 +781,7 @@ def _install_python_interpreter(
         what=f"{decl.id}: uv python install",
         log_path=log_path,
         timeout_s=timeout_s,
+        mask=mask,
     )
 
 
@@ -748,6 +792,7 @@ def _provision_uv_sync(
     env: Mapping[str, str],
     log_path: Path | None,
     timeout_s: float,
+    mask: Sequence[Path] = (),
 ) -> None:
     """``kind = "uv"`` + ``sync = true``: the workdir is a uv project.
 
@@ -791,6 +836,7 @@ def _provision_uv_sync(
         what=f"{decl.id}: {' '.join(argv)}",
         log_path=log_path,
         timeout_s=timeout_s,
+        mask=mask,
     )
 
 
@@ -802,6 +848,7 @@ def _provision_python(
     env: Mapping[str, str],
     log_path: Path | None,
     timeout_s: float,
+    mask: Sequence[Path] = (),
 ) -> None:
     """``kind = venv | uv``: both are provisioned by uv.
 
@@ -816,8 +863,8 @@ def _provision_python(
     """
     rt = decl.runtime
     if rt.sync:
-        _install_python_interpreter(decl, workdir, block, env, log_path, timeout_s)
-        _provision_uv_sync(decl, workdir, block, env, log_path, timeout_s)
+        _install_python_interpreter(decl, workdir, block, env, log_path, timeout_s, mask)
+        _provision_uv_sync(decl, workdir, block, env, log_path, timeout_s, mask)
         return
 
     venv = venv_dir(service_root)
@@ -832,7 +879,7 @@ def _provision_python(
         install += ["-r", str(req)]
     install += list(rt.packages)
 
-    _install_python_interpreter(decl, workdir, block, env, log_path, timeout_s)
+    _install_python_interpreter(decl, workdir, block, env, log_path, timeout_s, mask)
     if not (venv / "pyvenv.cfg").exists():
         argv = ["uv", "venv", "-q"]
         if rt.python:
@@ -845,6 +892,7 @@ def _provision_python(
             what=f"{decl.id}: uv venv",
             log_path=log_path,
             timeout_s=timeout_s,
+            mask=mask,
         )
     else:
         log.info("%s: reusing existing venv %s", decl.id, venv)
@@ -859,6 +907,7 @@ def _provision_python(
         what=f"{decl.id}: uv pip install",
         log_path=log_path,
         timeout_s=timeout_s,
+        mask=mask,
     )
 
 
@@ -890,6 +939,7 @@ def _provision_node(
     env: Mapping[str, str],
     log_path: Path | None,
     timeout_s: float,
+    mask: Sequence[Path] = (),
 ) -> None:
     """``kind = pnpm | bun``: install into ``<workdir>/node_modules``.
 
@@ -927,6 +977,7 @@ def _provision_node(
         what=f"{decl.id}: {rt.kind} install",
         log_path=log_path,
         timeout_s=timeout_s,
+        mask=mask,
     )
     if rt.packages:
         _tool(
@@ -937,6 +988,7 @@ def _provision_node(
             what=f"{decl.id}: {rt.kind} add",
             log_path=log_path,
             timeout_s=timeout_s,
+            mask=mask,
         )
     if rt.build:
         _tool(
@@ -947,6 +999,7 @@ def _provision_node(
             what=f"{decl.id}: build",
             log_path=log_path,
             timeout_s=timeout_s,
+            mask=mask,
         )
 
 
@@ -998,11 +1051,12 @@ def provision(
     workdir = service_workdir(decl, service_root)
     _ensure_root(decl, service_root, workdir, block)
     env = provisioning_env(store, decl.runtime)
+    mask = provisioning_mask(service_root)
 
     if decl.runtime.is_python:
-        _provision_python(decl, service_root, workdir, block, env, log_path, timeout_s)
+        _provision_python(decl, service_root, workdir, block, env, log_path, timeout_s, mask)
     else:
-        _provision_node(decl, workdir, block, env, log_path, timeout_s)
+        _provision_node(decl, workdir, block, env, log_path, timeout_s, mask)
 
     _admin(
         ["chown", "-R", f"{INNER_UID}:{INNER_GID}", str(service_root)],
@@ -1021,6 +1075,17 @@ def provision(
     return result
 
 
+def _containing_service_root(tree: Path) -> Path:
+    """The ``<state>/services/<id>/root`` directory ``tree`` lives in."""
+    for p in (tree, *tree.parents):
+        if p.name == "root" and p.parent.parent.name == "services":
+            return p
+    raise ProvisionError(
+        f"provision_tree: {tree} is not inside a service root "
+        "(<state>/services/<id>/root); pass mask= explicitly"
+    )
+
+
 def provision_tree(
     tree: Path,
     spec: RuntimeSpec,
@@ -1031,6 +1096,7 @@ def provision_tree(
     log_path: Path | None = None,
     env: Mapping[str, str] | None = None,
     timeout_s: float = TREE_TIMEOUT_S,
+    mask: Sequence[Path] | None = None,
 ) -> None:
     """Install (and build) a staged pnpm repository tree in place.
 
@@ -1049,6 +1115,13 @@ def provision_tree(
     ``env`` is merged over the provisioning environment, the caller winning
     (e.g. ``CORE_SOURCE_COMMIT``). On the admin path its values travel in the
     ``env -i`` argv, so it must never carry a secret.
+
+    ``mask`` (admin path only): the install runs package lifecycle scripts and
+    the build runs repository code -- untrusted code with the harness uid's read
+    access -- so both run with :func:`provisioning_mask` applied (issue #1).
+    ``None`` derives it from the service root that contains ``tree``
+    (``<state>/services/<id>/root/...``); a tree outside any service root is
+    refused rather than provisioned unmasked.
     """
     tree = Path(tree)
     if spec.kind != "pnpm":
@@ -1057,8 +1130,10 @@ def provision_tree(
         raise ProvisionError(f"provision_tree: tree {tree} does not exist")
     if not (tree / _PACKAGE_JSON).is_file():
         raise ProvisionError(f"provision_tree: no {_PACKAGE_JSON} in {tree}")
+    tool_mask: Sequence[Path] = ()
     if block is not None:
         _require_linux()
+        tool_mask = mask if mask is not None else provisioning_mask(_containing_service_root(tree))
 
     store.ensure()
     if spec.managed_node and spec.node is not None:
@@ -1098,6 +1173,7 @@ def provision_tree(
                 what=label,
                 log_path=log_path,
                 timeout_s=timeout_s,
+                mask=tool_mask,
             )
 
     if block is not None:
