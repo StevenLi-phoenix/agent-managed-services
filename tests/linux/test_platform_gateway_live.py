@@ -185,4 +185,3 @@ def test_running_caddy_answers_the_harness_health_probe(tmp_path: Path) -> None:
         except subprocess.TimeoutExpired:  # pragma: no cover - defensive
             proc.kill()
             proc.wait(timeout=10)
-

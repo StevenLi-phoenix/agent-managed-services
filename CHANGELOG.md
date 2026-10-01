@@ -16,6 +16,10 @@ mode**；core mode 成为唯一的 platform 模式，通用 supervisor 核心与
 
 ### Added
 
+- **CI**（`.github/workflows/ci.yml`）：`portable`（ubuntu-24.04 + macOS，ruff + pytest）与
+  `linux-isolation`（ubuntu-24.04 runner 上 `deploy/install-host.sh` 建 harness 用户、
+  subuid、AppArmor profile，再 `scripts/linux-test.sh` 以 harness 身份在委托 cgroup 里跑
+  全部测试）。这两步与在测试宿主上手工执行的完全相同。
 - `LICENSE`（MIT），`pyproject.toml` 声明 `license = "MIT"`。
 - **escalation 日志**（`ams.escalations`）：每条 escalation 除了写 stdout，还追加到
   `<state>/logs/escalations.jsonl`（0600，单次 `O_APPEND` 写，超 8 MiB 轮转一代），
