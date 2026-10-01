@@ -133,7 +133,7 @@ def test_caddyfile_turns_off_https_and_the_admin_api() -> None:
 
 def test_entry_site_keeps_the_harness_health_probe() -> None:
     caddyfile = rendered("empty")["Caddyfile"]
-    assert "http://127.0.0.1:8080 {" in caddyfile
+    assert "http://:8080 {" in caddyfile
     assert f"handle {gateway.HEALTH_PATH} {{" in caddyfile
     assert 'respond "ok" 200' in caddyfile
 
@@ -315,3 +315,13 @@ def test_the_caddy_declaration_is_a_valid_fixed_port_service(tmp_path: Path) -> 
 def test_the_caddy_declaration_refuses_a_bad_port(tmp_path: Path, port: object) -> None:
     with pytest.raises(GatewayError, match="caddy port"):
         gateway.caddy_declaration(StateDir(tmp_path), tmp_path, port)  # type: ignore[arg-type]
+
+
+def test_the_entry_site_catches_every_host_without_a_site() -> None:
+    """Found live: with the entry site on `http://127.0.0.1:<port>` only Host
+    127.0.0.1 reached the JSON 404, and any other unknown host got Caddy's
+    default empty 200 -- indistinguishable from a working route. The entry is a
+    port-wide catch-all; Caddy matches the specific [[site]] hosts first."""
+    caddyfile = rendered("basic")["Caddyfile"]
+    assert f"http://:{LISTEN_PORT} {{" in caddyfile
+    assert "http://127.0.0.1:" not in caddyfile

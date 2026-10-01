@@ -162,6 +162,14 @@ def test_running_caddy_answers_the_harness_health_probe(tmp_path: Path) -> None:
         assert b'"error":"not_found"' in resp.read()
         conn.close()
 
+        # ... and so is every Host that has no [[site]] (not Caddy's empty 200).
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        conn.request("GET", "/", headers={"Host": "unknown.example.test"})
+        resp = conn.getresponse()
+        assert resp.status == 404
+        assert b'"error":"not_found"' in resp.read()
+        conn.close()
+
         # A [[site]] host is reverse-proxied to its loopback port.
         proxied = None
         deadline = time.monotonic() + 10

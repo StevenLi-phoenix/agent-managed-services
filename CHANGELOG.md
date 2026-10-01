@@ -85,6 +85,14 @@ mode**；core mode 成为唯一的 platform 模式，通用 supervisor 核心与
 
 ### Fixed
 
+- **gateway：未知 Host 不再得到 Caddy 默认的空 200。** 入口站点原为
+  `http://127.0.0.1:<port>`，只匹配 Host 127.0.0.1；任何没有 `[[site]]` 的 Host 都拿到
+  空 200，与正常路由无法区分。入口改为同端口 catch-all `http://:<port>`（具体 host 的
+  站点优先匹配），未知 Host 得到 JSON 404。在 Linux 实机 e2e 中发现。
+- `test_run_as_service_timeout_kills_the_whole_group` 在 Linux 上误报：前面的测试让
+  pytest 进程成了 child subreaper，被杀的孙进程成了僵尸，`kill(pid, 0)` 仍成功；改为
+  僵尸也算已退出。
+
 - `deploy/install-host.sh` 在 useradd 没分配 subuid 时不再写死 `100000:65536`
   （宿主第一个登录用户通常已占用），改取所有现有区段之后的第一段。
 - Linux 测试不再写死 uid 块 `100000`，改从 harness 真实的 `/etc/subuid` 推导

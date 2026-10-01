@@ -8,8 +8,10 @@
 	persist_config off
 }
 
-# Entry site: the harness health probe only.
-http://127.0.0.1:8080 {
+# Entry site: every Host on this port without a [[site]] of its own
+# (Caddy matches the specific hosts first). The harness health probe,
+# and a JSON 404 rather than Caddy's default empty 200.
+http://:8080 {
 	log {
 		format json
 	}

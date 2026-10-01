@@ -78,6 +78,8 @@ class GatewayConfig:
     """
 
     listen_port: int
+    #: The Host the harness health probe sends. No [[site]] may claim it, or
+    #: the probe would reach core instead of ``HEALTH_PATH``.
     entry_host: str = "127.0.0.1"
     log_dir: Path | None = None
     plain_http: bool = True
@@ -223,8 +225,12 @@ def _render_core_caddyfile(sites: Sequence[CoreSite], cfg: GatewayConfig) -> str
     block.add("}")
     block.add()
 
-    block.comment("Entry site: the harness health probe only.")
-    block.add(f"{cfg.site_address(cfg.entry_host)} {{")
+    block.comment(
+        "Entry site: every Host on this port without a [[site]] of its own\n"
+        "(Caddy matches the specific hosts first). The harness health probe,\n"
+        "and a JSON 404 rather than Caddy's default empty 200."
+    )
+    block.add(f"http://:{cfg.listen_port} {{")
     _log_block(block, cfg, "entry", 1)
     block.add()
     block.comment(
