@@ -13,14 +13,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import linuxhost
 import pytest
 
-from ams.uidmap import UidBlock
 from ams.userns import run_admin
 
 pytestmark = pytest.mark.linux
 
-BLOCK = UidBlock(uid_start=100_000, gid_start=100_000)
+BLOCK = linuxhost.block(0)
 
 
 def test_mask_hides_harness_private_files(tmp_path: Path) -> None:

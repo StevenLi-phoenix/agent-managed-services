@@ -1,11 +1,11 @@
 """One core-mode tick: fetch, stage, release core, ship changed plugins, gate, record.
 
 The moving half of core mode (PLAN-core §4.3); the static half is
-:mod:`ams.platform.core`. Like the legacy :mod:`ams.platform.sync` this is **a
-process, not a loop**: ``pnpm install``, ``node scripts/build.mjs`` and the
-artifact builds block for seconds to minutes and the supervisor is single-threaded
-(D17), so a 60 s timer (``deploy/ams-core-sync.timer``) runs one tick and it talks
-to the running harness over the control socket and to core through corectl.
+:mod:`ams.platform.core`. This is **a process, not a loop**: ``pnpm install``,
+``node scripts/build.mjs`` and the artifact builds block for seconds to minutes
+and the supervisor is single-threaded (D17), so a 60 s timer
+(``deploy/ams-core-sync.timer``) runs one tick and it talks to the running
+harness over the control socket and to core through corectl.
 
 What a tick does, in order::
 
@@ -62,6 +62,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Protocol
 
+from ams.escalations import EscalationJournal, journal_path
 from ams.platform import core as core_mod
 from ams.platform.core import CORE_ID, CoreConfig, CoreLayout
 from ams.platform.corectl import CoreControl, CoreControlError, Runner
@@ -248,8 +249,7 @@ def make_planner(state: StateDir, layout: CoreLayout, block: UidBlock | None) ->
     """The real planner: place core_plan.mjs under ``<root>/build`` and run it.
 
     The asset is copied into the service root because in isolated mode the planner
-    runs as the service uid, which cannot read the harness's ams checkout (the
-    same reason the pool runner is placed, PLAN-pool §4.1).
+    runs as the service uid, which cannot read the harness's ams checkout.
 
     In isolated mode the placement runs **as the service** (the ``runner``), never
     as inner root: ``build/`` is service-owned and core keeps running while a tick
@@ -340,12 +340,12 @@ class SocketSupervisor:
         self.timeout_s = timeout_s
 
     def _call(self, op: str, service_id: str | None = None) -> dict[str, Any]:
-        from ams.platform import sync as sync_mod
+        from ams.platform import common
 
         if op == "reload":
-            response = sync_mod.ctl_reload(self.state, timeout_s=self.timeout_s)
+            response = common.ctl_reload(self.state, timeout_s=self.timeout_s)
         elif op == "restart" and service_id is not None:
-            response = sync_mod.ctl_restart(self.state, service_id, timeout_s=self.timeout_s)
+            response = common.ctl_restart(self.state, service_id, timeout_s=self.timeout_s)
         else:
             from ams.control import control_socket_path
             from ams.control import request as control_request
@@ -404,18 +404,16 @@ def default_gateway(state: StateDir, cfg: CoreConfig) -> list[str]:
     from ams.platform import gateway as gateway_mod
 
     sites = [gateway_mod.CoreSite(host=s.host, port=s.port) for s in cfg.sites]
-    gcfg = gateway_mod.GatewayConfig(
-        listen_port=cfg.caddy_port, static_root=gateway_mod.static_root(state)
-    )
+    gcfg = gateway_mod.GatewayConfig(listen_port=cfg.caddy_port)
     changed = gateway_mod.write(state, gateway_mod.render_core(sites, gcfg))
     root = gateway_mod.gateway_dir(state)
     return [p.relative_to(root).as_posix() if p.is_relative_to(root) else p.name for p in changed]
 
 
 def default_block(state: StateDir) -> UidBlock:
-    from ams.platform import sync as sync_mod
+    from ams.platform import common
 
-    return sync_mod.uid_allocator(state).allocate(CORE_ID)
+    return common.uid_allocator(state).allocate(CORE_ID)
 
 
 def default_mirror(cfg: CoreConfig, store: RuntimeStore) -> Any:
@@ -693,6 +691,7 @@ class _Tick:
         self.cfg = cfg
         self.isolation = isolation
         self.stream = stream
+        self.journal = EscalationJournal(journal_path(state), source="core-sync")
         self.now = now
         self.sleep = sleep
         self.hooks = hooks
@@ -783,6 +782,7 @@ class _Tick:
         self.escalations.append(record)
         self.stream.write(json.dumps(record, default=str) + "\n")
         self.stream.flush()
+        self.journal.append(record)
         log.error("escalating %s%s %s: %s", CORE_ID, f"/{plugin}" if plugin else "", kind, cause)
 
     def forget_unobserved(self) -> None:
@@ -917,10 +917,10 @@ class _Tick:
 
     def declare(self) -> bool:
         """Write the declaration; ``True`` when it changed on disk."""
-        from ams.platform.sync import _write_if_changed
+        from ams.platform.common import write_if_changed
 
         text = core_mod.core_declaration(self.cfg, self.layout)
-        changed = _write_if_changed(self.state.service_decl_path(CORE_ID), text)
+        changed = write_if_changed(self.state.service_decl_path(CORE_ID), text)
         if changed:
             log.info("core declaration written")
         return changed
@@ -1947,9 +1947,8 @@ def bootstrap(
     """
     h = hooks or Hooks()
     if cfg.sites:
-        from ams.platform import layer0
-        from ams.platform.gateway import CADDY_SERVICE_ID
-        from ams.platform.sync import _write_if_changed
+        from ams.platform.common import write_if_changed
+        from ams.platform.gateway import CADDY_SERVICE_ID, caddy_declaration
 
         state.ensure()
         try:
@@ -1962,8 +1961,8 @@ def bootstrap(
             log.warning(
                 "bootstrap: %s is missing; caddy will not start (deploy/install-host.sh)", caddy_bin
             )
-        text = layer0._caddy_declaration_text(state, store, cfg.caddy_port)
-        if _write_if_changed(state.service_decl_path(CADDY_SERVICE_ID), text):
+        text = caddy_declaration(state, store.root, cfg.caddy_port)
+        if write_if_changed(state.service_decl_path(CADDY_SERVICE_ID), text):
             log.info("bootstrap: caddy declared on %d", cfg.caddy_port)
             try:
                 h.supervisor_factory(state).reload()

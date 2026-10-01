@@ -7,11 +7,117 @@
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-01
+
+外部 review 的整改版本。**破坏性变更：删除了 1.1.0 起 deprecated 的 legacy manifest
+mode**；core mode 成为唯一的 platform 模式，通用 supervisor 核心与 platform 层的边界由
+测试锁定。Linux 隔离路径（含此前从未实机跑过的 core mode `run_as_service` /
+`run_admin` mask 路径）首次在一台 Ubuntu 24.04 宿主上跑通全部 Linux 测试。
+
+### Added
+
+- **Linux 隔离模式 core e2e 证据**：`docs/design/evidence/core-e2e-linux-2026-10-01.txt`
+  （7 个场景：bootstrap、空闲 tick、单插件 ship、坏插件被拒、core release、回滚、harness
+  重启；core 以独立 subuid 运行、CapEff 0、NoNewPrivs 1、harness uid 不在映射内）。
+- **CI**（`.github/workflows/ci.yml`）：`portable`（ubuntu-24.04 + macOS，ruff + pytest）与
+  `linux-isolation`（ubuntu-24.04 runner 上 `deploy/install-host.sh` 建 harness 用户、
+  subuid、AppArmor profile，再 `scripts/linux-test.sh` 以 harness 身份在委托 cgroup 里跑
+  全部测试）。这两步与在测试宿主上手工执行的完全相同。
+- `LICENSE`（MIT），`pyproject.toml` 声明 `license = "MIT"`。
+- **escalation 日志**（`ams.escalations`）：每条 escalation 除了写 stdout，还追加到
+  `<state>/logs/escalations.jsonl`（0600，单次 `O_APPEND` 写，超 8 MiB 轮转一代），
+  带 `ts` 与 `source`（`harness` / `core-sync` / `backup`，备份只记失败）。
+- `ams escalations [-n N] [--service ID] [--since ISO] [--json]`：读取该日志；默认的
+  人类可读格式会剥掉终端控制字符（记录里是服务原样输出，不可信）。
+- `docs/agent-loop.md`：决策层是确定性规则，agent 是由人启动、消费 escalation 的操作者
+  会话；为什么不让 LLM 进 suppress-or-fix 循环（日志文本是攻击者可控输入等）；操作流程。
+- `tests/test_core_boundary.py`：锁住"supervisor 核心不依赖 platform"——核心模块不在
+  模块级 import `ams.platform`，只有 `cli` 会懒加载它；`ams.platform` 不可导入时 CLI
+  照常 validate/run，`platform` 子命令自动消失，`--policy platform` 给出明确错误。
+- `examples/hello/service.toml`：与 api 无关的最小通用服务示例。
+- `scripts/linux-test.sh`：在宿主本地以 `harness` 身份、`systemd-run -p Delegate=yes`
+  跑 Linux 测试；CI 与 `scripts/remote-test.sh` 共用。
+- `deploy/install-host.sh` 新增开关：`AMS_STORE_FS=xfs|plain`（plain 不建 XFS loop
+  文件）、`AMS_WITH_TOOLS=0`、`AMS_TEST_DEPS=1`、`AMS_INSTALL_UNIT=0`。
+
+### Changed
+
+- **README 重写**：写清这是给愿意自己管 Linux 机器的操作者及其 agent 的，不是"一键托管"；
+  状态表逐项列出验证过什么、没验证什么（无生产使用、无外部审计、CI 尚未在 GitHub 跑过）；
+  supervisor 核心与 platform 层分开介绍；"agent 在哪里"、"事件循环与慢操作"、宿主要求
+  （必需 vs 可选）、"为什么不用 rootless podman / systemd --user"。
+- 新增 `docs/event-loop.md`（循环里跑什么、什么绝不能进循环、仍可能停顿的有界操作）。
+- `docs/platform-core.md` 状态更新为 Linux 隔离模式实测结果；`docs/design/DECISIONS.md`
+  新增 D33–D37。
+- core mode 复用的小函数移到 `ams.platform.common`（`write_if_changed`、
+  `uid_allocator`、`ctl_reload`、`ctl_restart`）；`gateway.caddy_declaration(state, store,
+  port)` 直接生成固定端口的 Caddy 声明（取代 `layer0._caddy_declaration_text`）。
+  已部署宿主上 caddy 的 `service.toml` 注释会变，首次 tick 会重写它并重启 caddy 一次。
+- `scripts/deploy-racknerd.sh` → `scripts/deploy.sh`：`AMS_HOST` 必填，远端用 `sudo -n`。
+
+
+- **tcp/http 健康探测不再阻塞 supervisor 循环。** 每次探测是一个 `ams.health.Probe`：
+  非阻塞 socket + 小状态机（connect → send → 读状态行），注册进 supervisor 自己的
+  selector，`deadline` 并入计时器；一个永不应答的 `/health` 只占一个 fd 和一个计时器。
+  此前 http 探测内联调用 `http.client`，每次最多阻塞整个循环 `health.timeout_s`，
+  期间所有服务的日志读取、重启和探测都被推迟。探测超时的 detail 为
+  `timed out after Ns (<阶段>)`。`check_tcp` / `check_http` 保留给循环外的一次性调用者，
+  复用同一状态机。
+- **XFS reflink 存储变为可选。** pnpm 的 import method 统一为 `clone-or-copy`
+  （`ams.runtime.PNPM_IMPORT_METHOD`）：XFS `reflink=1` 上照样 clone，ext4 等文件系统上
+  复制。此前隔离路径用硬 `clone`，在非 reflink 文件系统上 `pnpm install` 直接失败——
+  这是"必须 XFS"的唯一来源。uv 的 `clone` 本来就会回退到复制。
+- `scripts/remote-test.sh` 不再写死 racknerd：`AMS_HOST=<ssh 主机>`，远端以有免密 sudo
+  的登录用户运行 `scripts/linux-test.sh`。
+
+### Removed
+
+- `.claude/state/` 不再进版本库：设计记录移到 `docs/design/`（`DECISIONS.md`、
+  `PLAN-core.md`、`PROGRESS.md`），1.0.0 时期的工作笔记与证据移到
+  `docs/design/history/`，加 `docs/design/README.md` 索引；所有引用同步更新，个人
+  绝对路径脱敏。`.gitignore` 改为整体忽略 `.claude/`（`CLAUDE.md` 除外）。
+
+- **legacy manifest mode**（api v2.0.0）整体删除：`ams.platform.{yamlsubset, translate,
+  sync, bootstrap, layer0, registryclient, rollback, pool, static}`、`assets/pool_runner.py`；
+  CLI `ams platform {sync, status, bootstrap, rollback, pool}`；
+  `deploy/ams-platform-sync.{service,timer}` 及 `ams-core-sync.service` 上的 `Conflicts=`；
+  `scripts/platform-bootstrap.sh`、`scripts/pilot-api.sh`；`examples/api-pilot`、
+  `examples/platform`；`docs/platform.md`、`docs/platform-pools.md`、
+  `docs/manifest-translation.md`、`docs/platform-sidecars.md`；对应的测试、goldens
+  （`tests/golden/platform/`、`tests/golden/gateway/{path,subdomain,static,tls,logdir}`）
+  与 fixtures。约 9 千行源码、1.4 万行测试。
+- `gateway.render()`（按 mount sidecar 渲染）及其 CSP/CORS/static 数据；`GatewayConfig`
+  不再有 `static_root`。
+- `PlatformPolicy` 的 post-sync 健康门禁、sync 后崩溃循环提示与 registry 心跳降噪——它们
+  读的是 legacy 的 `<state>/platform/state.json`，core mode 下从不触发；
+  `DedupingEscalation`（只有 legacy sync 用）。`make_policy()` 不再接受 state。
+- backup 的 pool 成员标签（`Target.label`、`ByteStore.label`）。
+
+### Fixed
+
+- **wheel 缺少 `assets/core_plan.mjs`**：`pyproject.toml` 未声明 package data，pip 安装
+  的 ams 跑 core mode 会找不到 planner（rsync 源码树部署不受影响，所以一直没暴露）。
+- **gateway：未知 Host 不再得到 Caddy 默认的空 200。** 入口站点原为
+  `http://127.0.0.1:<port>`，只匹配 Host 127.0.0.1；任何没有 `[[site]]` 的 Host 都拿到
+  空 200，与正常路由无法区分。入口改为同端口 catch-all `http://:<port>`（具体 host 的
+  站点优先匹配），未知 Host 得到 JSON 404。在 Linux 实机 e2e 中发现。
+- `test_run_as_service_timeout_kills_the_whole_group` 在 Linux 上误报：前面的测试让
+  pytest 进程成了 child subreaper，被杀的孙进程成了僵尸，`kill(pid, 0)` 仍成功；改为
+  僵尸也算已退出。
+
+- `deploy/install-host.sh` 在 useradd 没分配 subuid 时不再写死 `100000:65536`
+  （宿主第一个登录用户通常已占用），改取所有现有区段之后的第一段。
+- Linux 测试不再写死 uid 块 `100000`，改从 harness 真实的 `/etc/subuid` 推导
+  （`tests/linux/linuxhost.py`）；在 harness 区段不是 100000 的宿主上它们原本全部失败。
+- `test_files_it_writes_belong_to_the_block_on_the_host` 的断言本身是错的：harness
+  按设计无法进入服务 0750 的 `data/`，改在 admin namespace 里 stat。
+- reflink 省空间的测量从 staging 正确性测试中拆出，非 reflink 存储上只跳过测量。
+
 ## [1.1.0] - 2026-09-29
 
 托管 api v3.x 的 Cordis core（一个 Node 进程 + 插件），即 **core mode**；1.0.0 的
 manifest 模式原样保留并标记为 deprecated。端到端说明见 `docs/platform-core.md`，
-设计取舍见 `.claude/state/DECISIONS.md` D31/D32。Linux 隔离路径尚未在真机上跑过
+设计取舍见 `docs/design/DECISIONS.md` D31/D32。Linux 隔离路径尚未在真机上跑过
 （racknerd 已拆除），本地 macOS `--no-isolation` 端到端 6 个场景全部通过。
 
 ### Added

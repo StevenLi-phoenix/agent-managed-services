@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from ams.escalations import journal_path, read_records
 from ams.platform import core, coresync
 from ams.platform.corectl import CoreControlError
 from ams.platform.coresync import Hooks, PluginPlan
@@ -652,6 +653,10 @@ def test_failed_content_key_is_not_retried_but_new_content_is(world: World) -> N
     assert esc["service_id"] == "core" and esc["action"] == "escalate"
     assert w.record()["plugins"]["timeservice"]["outcome"] == "failed"
     assert w.record()["plugins"]["timeservice"]["content_key"] == "ck-timeservice-bad"
+    # the same record is in the escalation journal `ams escalations` reads
+    [journaled] = read_records(journal_path(w.state))
+    assert journaled["source"] == "core-sync"
+    assert journaled["event"] == esc["event"] and journaled["reason"] == esc["reason"]
 
     # commit C: same (failed) content -> not shipped, not escalated again, exit 0
     w.mirror.head = SHA_C

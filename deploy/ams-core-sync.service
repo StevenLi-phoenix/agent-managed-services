@@ -7,9 +7,6 @@ Documentation=file:///home/harness/ams/src/ams/platform/coresync.py
 # unit chain. After= only, so a boot brings the harness up first.
 After=network-online.target ams-harness.service
 Wants=network-online.target
-# Core mode replaces the manifest mode; the two must never run against one state
-# dir (both render <state>/gateway/ and both would declare services).
-Conflicts=ams-platform-sync.timer ams-platform-sync.service
 
 [Service]
 Type=oneshot

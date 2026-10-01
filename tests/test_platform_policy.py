@@ -11,23 +11,18 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import dataclass
-from datetime import UTC
 
 import pytest
 
 from ams.decision import Action, Decision, DefaultPolicy, ServiceContext
 from ams.events import HealthChanged, LogLine, ServiceExited, Severity, classify
 from ams.platform.policy import (
-    DEFAULT_HEALTH_GRACE_S,
-    DEFAULT_WINDOW_S,
-    DedupingEscalation,
     EscalationDeduper,
     PlatformPolicy,
     cause_key,
     cause_key_for_event,
     make_policy,
     normalize_cause_text,
-    platform_state_path,
 )
 from ams.schema import loads
 from ams.state import StateDir
@@ -82,26 +77,6 @@ class Recorder:
 
     def escalate(self, event, decision, ctx) -> None:  # noqa: ANN001
         self.records.append((event, decision, ctx))
-
-
-def write_state(state: StateDir, services: dict, version: int = 1) -> None:
-    path = platform_state_path(state)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"version": version, "services": services}), encoding="utf-8")
-
-
-def write_mount(state: StateDir, service_id: str, content: str | dict | None) -> None:
-    """Write (or corrupt) `<state>/platform/mounts/<id>.json` (`docs/platform-sidecars.md`)."""
-    path = state.root / "platform" / "mounts" / f"{service_id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(content, dict):
-        path.write_text(json.dumps(content), encoding="utf-8")
-    else:
-        path.write_text(content or "", encoding="utf-8")
-
-
-def iso(text: str) -> str:
-    return text
 
 
 # --------------------------------------------------------------- normalization
@@ -208,23 +183,6 @@ def test_deduper_rolls_over_without_an_explicit_expire() -> None:
 def test_deduper_rejects_a_non_positive_window() -> None:
     with pytest.raises(ValueError):
         EscalationDeduper(window_s=0)
-
-
-def test_deduping_escalation_wraps_a_sink() -> None:
-    """The shape the sync loop (T3.1) can put around its own JSONL sink."""
-    clock = FakeClock()
-    inner = Recorder()
-    sink = DedupingEscalation(inner=inner, deduper=EscalationDeduper(60.0), clock=clock)
-    ctx = ctx_for("files")
-    for _ in range(4):
-        sink.escalate(line("translate failed: bad field", "files"), Decision(Action.ESCALATE), ctx)
-        clock.advance(1.0)
-    assert len(inner.records) == 1
-    clock.advance(100.0)
-    emitted = sink.flush()
-    assert len(emitted) == 1
-    assert "repeated 4 times in window" in emitted[0].event.text
-    assert len(inner.records) == 2
 
 
 # --------------------------------------------------------------------- dedupe
@@ -465,306 +423,6 @@ def test_caddy_rules_do_not_apply_to_other_services() -> None:
     assert policy.decide(event, ctx_for("files")).action is Action.ESCALATE
 
 
-# ------------------------------------------------------------ heartbeat noise
-
-HEARTBEAT_LINES = [
-    "ERROR sdk.registry: heartbeat failed: HTTPConnectionPool(host='127.0.0.1', port=20100): "
-    "Max retries exceeded (Connection refused)",
-    "ERROR sdk.acl: acl-refresh failed: [Errno 111] Connection refused",
-]
-
-
-@pytest.mark.parametrize("text", HEARTBEAT_LINES)
-def test_heartbeat_noise_is_logged_before_the_registry_is_ready(text: str) -> None:
-    policy = PlatformPolicy(clock=FakeClock())
-    d = policy.decide(line(text, "files"), ctx_for("files"))
-    assert d.action is Action.LOG
-    assert "registry" in d.reason
-
-
-@pytest.mark.parametrize("text", HEARTBEAT_LINES)
-def test_heartbeat_escalates_once_the_registry_is_ready(text: str) -> None:
-    clock = FakeClock()
-    policy = PlatformPolicy(clock=clock)
-    assert policy.registry_ready_at is None
-    policy.decide(HealthChanged("registry", healthy=True), ctx_for("registry"))
-    assert policy.registry_ready_at == clock.now
-
-    first = policy.decide(line(text, "files"), ctx_for("files"))
-    clock.advance(10.0)
-    second = policy.decide(line(text, "files"), ctx_for("files"))
-    assert first.action is Action.ESCALATE
-    assert second.action is Action.LOG and second.reason.startswith("deduped (n=2)")
-
-
-def test_an_unhealthy_registry_does_not_arm_the_suppression() -> None:
-    policy = PlatformPolicy(clock=FakeClock())
-    policy.decide(HealthChanged("registry", healthy=False), ctx_for("registry"))
-    assert policy.registry_ready_at is None
-    assert policy.decide(line(HEARTBEAT_LINES[0], "files"), ctx_for("files")).action is Action.LOG
-
-
-def test_a_real_error_is_not_swallowed_by_the_heartbeat_rule() -> None:
-    policy = PlatformPolicy(clock=FakeClock())
-    text = "ERROR files.db: disk quota exceeded"
-    assert policy.decide(line(text, "files"), ctx_for("files")).action is Action.ESCALATE
-
-
-def test_the_registrys_own_lines_are_not_downgraded() -> None:
-    policy = PlatformPolicy(clock=FakeClock())
-    d = policy.decide(line(HEARTBEAT_LINES[0], "registry"), ctx_for("registry"))
-    assert d.action is Action.ESCALATE
-
-
-# ------------------------------------------------------------------ health gate
-
-
-def state_dir(tmp_path) -> StateDir:  # noqa: ANN001
-    return StateDir(tmp_path)
-
-
-def record(
-    *,
-    stage: str = "reloaded",
-    sha: str = "a" * 40,
-    prev_sha: str = "b" * 40,
-    stage_since: str = "2026-09-02T13:00:00Z",
-    updated_at: str = "2026-09-02T13:00:00Z",
-    error: str | None = None,
-) -> dict:
-    return {
-        "sha": sha,
-        "prev_sha": prev_sha,
-        "stage": stage,
-        "error": error,
-        "manual_restart": False,
-        "escalated": False,
-        "updated_at": updated_at,
-        "stage_since": stage_since,
-    }
-
-
-# 2026-09-02T13:00:00Z as epoch seconds.
-STAGE_SINCE_EPOCH = 1_788_872_400.0
-
-
-def _epoch(text: str) -> float:
-    from datetime import datetime
-
-    return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=UTC).timestamp()
-
-
-def test_health_gate_stays_quiet_inside_the_grace_period(tmp_path) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    write_state(state, {"files": record(stage="failed", error="uv sync exited 1")})
-    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S - 1)
-    policy = make_policy(state, clock=clock)
-    assert policy.flush() == []
-
-
-def test_health_gate_escalates_once_with_both_shas(tmp_path) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    write_state(state, {"files": record(stage="failed", error="uv sync exited 1")})
-    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 1)
-    policy = make_policy(state, clock=clock)
-
-    emitted = policy.flush()
-    assert len(emitted) == 1
-    text = emitted[0].event.text
-    assert "a" * 40 in text and "b" * 40 in text
-    assert "rollback to prev_sha" in text
-    assert "uv sync exited 1" in text
-    assert emitted[0].event.severity is Severity.ERROR
-
-    # Repeated ticks say nothing more.
-    clock.advance(60.0)
-    assert policy.flush() == []
-    clock.advance(DEFAULT_WINDOW_S * 2)
-    assert policy.flush() == []
-
-
-def test_health_gate_re_arms_on_a_new_sha(tmp_path) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    write_state(state, {"files": record(stage="failed")})
-    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 1)
-    policy = make_policy(state, clock=clock)
-    assert len(policy.flush()) == 1
-
-    write_state(state, {"files": record(stage="failed", sha="c" * 40, prev_sha="a" * 40)})
-    assert len(policy.flush()) == 1
-
-
-def test_health_gate_ignores_a_healthy_service(tmp_path) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    write_state(state, {"files": record(stage="healthy")})
-    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + 10_000)
-    assert make_policy(state, clock=clock).flush() == []
-
-
-def test_health_gate_measures_from_stage_since_not_updated_at(tmp_path) -> None:  # noqa: ANN001
-    """A sync loop retrying every 60 s refreshes `updated_at` forever (see the sidecar doc)."""
-    state = state_dir(tmp_path)
-    write_state(
-        state,
-        {
-            "files": record(
-                stage="failed",
-                stage_since="2026-09-02T13:00:00Z",
-                updated_at="2026-09-02T13:20:00Z",
-            )
-        },
-    )
-    clock = FakeClock(_epoch("2026-09-02T13:20:30Z"))
-    assert len(make_policy(state, clock=clock).flush()) == 1
-
-
-def test_health_gate_falls_back_to_updated_at(tmp_path) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    rec = record(stage="declared")
-    del rec["stage_since"]
-    write_state(state, {"files": rec})
-    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 1)
-    assert len(make_policy(state, clock=clock).flush()) == 1
-
-
-def test_health_gate_ignores_a_static_mount_stuck_at_declared(tmp_path) -> None:  # noqa: ANN001
-    """`declared` is a static mount's terminal stage (D28 open item) -- not stuck."""
-    state = state_dir(tmp_path)
-    write_state(state, {"files-web": record(stage="declared")})
-    write_mount(state, "files-web", {"version": 1, "id": "files-web", "kind": "static"})
-    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 1)
-    assert make_policy(state, clock=clock).flush() == []
-
-
-def test_health_gate_still_escalates_a_service_mount_stuck_at_declared(tmp_path) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    write_state(state, {"files": record(stage="declared")})
-    write_mount(state, "files", {"version": 1, "id": "files", "kind": "service"})
-    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 1)
-    assert len(make_policy(state, clock=clock).flush()) == 1
-
-
-@pytest.mark.parametrize(
-    "content",
-    [
-        pytest.param(None, id="absent"),
-        pytest.param("not json at all {", id="corrupt"),
-        pytest.param(json.dumps([1, 2, 3]), id="not-an-object"),
-        pytest.param(json.dumps({"id": "files-web"}), id="no-kind-key"),
-    ],
-)
-def test_health_gate_treats_a_broken_mount_sidecar_as_non_static(tmp_path, content) -> None:  # noqa: ANN001
-    """Fail-safe: a missing or malformed mount sidecar must not suppress a real gate."""
-    state = state_dir(tmp_path)
-    write_state(state, {"files-web": record(stage="declared")})
-    if content is not None:
-        write_mount(state, "files-web", content)
-    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 1)
-    assert len(make_policy(state, clock=clock).flush()) == 1
-
-
-BAD_STATE_DOCUMENTS = [
-    pytest.param(None, id="absent"),
-    pytest.param("not json at all {", id="corrupt"),
-    pytest.param(json.dumps([1, 2, 3]), id="not-an-object"),
-    pytest.param(json.dumps({"version": 2, "services": {}}), id="unknown-version"),
-    pytest.param(json.dumps({"version": 1}), id="no-services-key"),
-    pytest.param(json.dumps({"version": 1, "services": {"files": "nope"}}), id="bad-record"),
-    pytest.param(
-        json.dumps(
-            {"version": 1, "services": {"files": {"stage": "failed", "stage_since": "yesterday"}}}
-        ),
-        id="unparseable-timestamp",
-    ),
-]
-
-
-@pytest.mark.parametrize("content", BAD_STATE_DOCUMENTS)
-def test_health_gate_tolerates_a_missing_or_broken_state_file(tmp_path, content) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    if content is not None:
-        path = platform_state_path(state)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-    policy = make_policy(state, clock=FakeClock(_epoch("2026-09-02T23:00:00Z")))
-    assert policy.flush() == []
-    # And ordinary decisions keep working with no state file at all.
-    assert policy.decide(line("ERROR boom"), ctx_for()).action is Action.ESCALATE
-
-
-def test_policy_without_a_state_dir_never_gates() -> None:
-    policy = PlatformPolicy(clock=FakeClock())
-    assert policy.flush() == []
-
-
-# ------------------------------------------------------------------ crash loop
-
-
-def test_crash_loop_after_a_sync_escalates_with_the_sha_pair(tmp_path) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    write_state(state, {"files": record(stage="reloaded", updated_at="2026-09-02T13:00:00Z")})
-    clock = FakeClock(_epoch("2026-09-02T13:00:30Z"))
-    policy = make_policy(state, clock=clock)
-    ctx = ctx_for("files", consecutive_failures=2)
-
-    d = policy.decide(ServiceExited("files", 1, 1, None, 0.4), ctx)
-    assert d.action is Action.RESTART  # the delegated action is untouched
-    emitted = policy.flush()
-    assert len(emitted) == 1
-    assert "a" * 40 in emitted[0].event.text and "b" * 40 in emitted[0].event.text
-    assert "rollback to prev_sha" in emitted[0].event.text
-
-    # A second crash of the same cause adds nothing.
-    clock.advance(1.0)
-    policy.decide(ServiceExited("files", 2, 1, None, 0.4), ctx)
-    assert policy.flush() == []
-
-
-def test_crash_loop_long_after_a_sync_is_not_attributed_to_it(tmp_path) -> None:  # noqa: ANN001
-    # `stage_since` is recent so the health gate stays quiet; only the crash-loop
-    # rule (which measures from `updated_at`) is under test here.
-    state = state_dir(tmp_path)
-    write_state(
-        state,
-        {
-            "files": record(
-                stage="reloaded",
-                updated_at="2026-09-02T13:00:00Z",
-                stage_since="2026-09-02T13:05:00Z",
-            )
-        },
-    )
-    clock = FakeClock(_epoch("2026-09-02T13:00:00Z") + DEFAULT_HEALTH_GRACE_S + 60)
-    policy = make_policy(state, clock=clock)
-    policy.decide(ServiceExited("files", 1, 1, None, 0.4), ctx_for("files", consecutive_failures=3))
-    assert policy.flush() == []
-
-
-def test_a_single_failure_is_not_a_crash_loop(tmp_path) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    write_state(state, {"files": record(stage="reloaded")})
-    policy = make_policy(state, clock=FakeClock(_epoch("2026-09-02T13:00:30Z")))
-    policy.decide(ServiceExited("files", 1, 1, None, 0.4), ctx_for("files", consecutive_failures=1))
-    assert policy.flush() == []
-
-
-def test_an_expected_exit_is_never_a_crash_loop(tmp_path) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    write_state(state, {"files": record(stage="reloaded")})
-    policy = make_policy(state, clock=FakeClock(_epoch("2026-09-02T13:00:30Z")))
-    ctx = ctx_for("files", consecutive_failures=5)
-    policy.decide(ServiceExited("files", 1, 143, None, 0.4, expected=True), ctx)
-    assert policy.flush() == []
-
-
-def test_crash_loop_for_a_service_absent_from_the_state_file(tmp_path) -> None:  # noqa: ANN001
-    state = state_dir(tmp_path)
-    write_state(state, {"other": record()})
-    policy = make_policy(state, clock=FakeClock(_epoch("2026-09-02T13:00:30Z")))
-    policy.decide(ServiceExited("files", 1, 1, None, 0.4), ctx_for("files", consecutive_failures=4))
-    assert policy.flush() == []
-
-
 # --------------------------------------------------------------- the invariant
 
 
@@ -856,7 +514,7 @@ def test_build_supervisor_accepts_the_platform_policy(tmp_path) -> None:  # noqa
     (service_dir / "service.toml").write_text(
         'id = "hello"\n[start]\nargv = ["/bin/sleep", "30"]\n', encoding="utf-8"
     )
-    policy = make_policy(state)
+    policy = make_policy()
     asm = build_supervisor(state, isolation=False, policy=policy)
     assert asm.supervisor.policy is policy
     assert "hello" in asm.registered

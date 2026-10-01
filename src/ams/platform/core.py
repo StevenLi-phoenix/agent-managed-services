@@ -66,8 +66,8 @@ LOG_LEVELS: tuple[str, ...] = ("debug", "info", "warn", "error")
 
 GATEWAY_PORT_NAME = "gateway"
 DEFAULT_GATEWAY_PORT = 18080
-#: Same fixed number as the Layer-0 bring-up's gateway (``layer0.CADDY_PORT``): a
-#: public front is pointed at by a tunnel, so it must not move between hosts.
+#: Fixed: a public front is pointed at by a tunnel, so it must not move between
+#: hosts.
 DEFAULT_CADDY_PORT = 20180
 DEFAULT_CORE_PATHS: tuple[str, ...] = (
     "packages/core/",
@@ -259,7 +259,7 @@ def _check_sites_render(sites: Sequence[SiteConfig], caddy_port: int) -> None:
             raise CoreConfigError(f"site[{i}].host: {e}") from None
     try:
         # static_root is unused by render_core; any path satisfies the dataclass.
-        render_core(core_sites, GatewayConfig(listen_port=caddy_port, static_root=Path("/")))
+        render_core(core_sites, GatewayConfig(listen_port=caddy_port))
     except GatewayError as e:
         raise CoreConfigError(f"site: {e}") from None
 

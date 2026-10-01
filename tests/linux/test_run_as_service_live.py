@@ -14,10 +14,10 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 
+import linuxhost
 import pytest
 
-from ams.spawn import DATA_DIRNAME
-from ams.uidmap import UidBlock
+from ams.spawn import DATA_DIRNAME, INNER_GID, INNER_UID
 from ams.userns import (
     SpawnError,
     ensure_service_root,
@@ -28,7 +28,7 @@ from ams.userns import (
 
 pytestmark = pytest.mark.linux
 
-BLOCK = UidBlock(100_000, 100_000, 1024)
+BLOCK = linuxhost.block(0)
 PATH = "/usr/local/bin:/usr/bin:/bin"
 ENV = {"PATH": PATH, "LC_ALL": "C"}
 
@@ -74,8 +74,12 @@ def test_files_it_writes_belong_to_the_block_on_the_host(svc_root: Path) -> None
     run_as_service(
         ["touch", f"{DATA_DIRNAME}/written-by-service"], BLOCK, env=ENV, cwd=str(svc_root)
     ).check()
-    assert os.stat(target).st_uid == BLOCK.uid_start
-    assert os.stat(target).st_gid == BLOCK.gid_start
+    # <root>/data is 0750 and the service's: the harness cannot even stat into
+    # it, by design. The admin map can (inner 0 = harness, inner 1000 = the
+    # block's first host id), so inner 1000:1000 is host uid_start:gid_start.
+    res = run_admin(["stat", "-c", "%u:%g", str(target)], BLOCK).check()
+    assert res.stdout.decode().strip() == f"{INNER_UID}:{INNER_GID}"
+    assert os.stat(svc_root / DATA_DIRNAME).st_uid == BLOCK.uid_start
 
 
 def test_harness_private_files_are_out_of_reach(base: Path) -> None:

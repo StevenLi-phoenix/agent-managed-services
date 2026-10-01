@@ -1,0 +1,32 @@
+# Taken with docs/design/history/evidence/ams-measure.sh, racknerd, 2026-09-03
+# 08:53-08:55 UTC, fleet idle. pool-core running 15 members (13 ok, 2 failed:
+# resume, secretsservice). n=3, 60 s apart.
+#
+# NOTE: time_health_via_caddy_s below sends `Host: api.lishuyu.app`, which
+# matches NO site block (the entry site is http://127.0.0.1:20180), so Caddy
+# answers an empty 200. That row times the fallthrough handler, NOT the
+# service, in the before file as well. Corrected latency at the bottom.
+== sample 1 08:53:25
+python_processes=5 fleet_service_procs=8 layer1_sum_MiB=275 all_services_MiB=464 free_available_MiB=1146 load=0.27
+pool_memory_current_MiB=133 pool_pids_current=27 pool_threads=27
+time_health_via_caddy_s=0.005392 http=200
+== sample 2 08:54:25
+python_processes=5 fleet_service_procs=8 layer1_sum_MiB=275 all_services_MiB=465 free_available_MiB=1146 load=0.21
+pool_memory_current_MiB=134 pool_pids_current=27 pool_threads=27
+time_health_via_caddy_s=0.002993 http=200
+== sample 3 08:55:25
+python_processes=5 fleet_service_procs=8 layer1_sum_MiB=275 all_services_MiB=465 free_available_MiB=1147 load=0.12
+pool_memory_current_MiB=134 pool_pids_current=27 pool_threads=27
+time_health_via_caddy_s=0.004843 http=200
+
+== corrected latency, entry site, no Host override, n=20 each, p50/min/max ms
+/time/health  (pool member)          5.39  4.20  35.15
+/kv/health    (pool member)          5.46  4.08  12.43
+/llm/health   (standalone control)   5.82  4.80  40.05
+
+== per-cgroup memory.current at rest, MiB
+pool-core 130   files 80   registry 76   llmgateway 60
+auth 49   caddy 34   hello 9   pyhello 9
+
+== cold start
+spawned  2026-09-03T08:43:37   last member serving 2026-09-03T08:43:58  = 21 s

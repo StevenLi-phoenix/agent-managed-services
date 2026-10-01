@@ -21,20 +21,20 @@ import os
 import shutil
 import subprocess
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+import linuxhost
 import pytest
 
 from ams.platform.sources import SHA_MARKER, SourceMirror
-from ams.uidmap import UidBlock
 from ams.userns import remove_service_root
 
 pytestmark = [pytest.mark.linux, pytest.mark.timeout(300)]
 
 # First block of the harness' /etc/subuid range; pinned so ownership assertions
 # are exact (in production the allocator hands these out).
-BLOCK = UidBlock(100_000, 100_000, 1024)
+BLOCK = linuxhost.block(0)
 HOST_UID = BLOCK.uid_start
 
 # The reflink store. Both the canonical checkout and the service roots must be
@@ -85,6 +85,8 @@ class Fixture:
     sha1: str
     sha2: str
     roots: list[Path]
+    #: Free-space deltas of the first test's steps (control, stage a, stage b).
+    costs: dict[str, int] = field(default_factory=dict)
 
 
 @pytest.fixture(scope="module")
@@ -121,7 +123,7 @@ def env() -> Iterator[Fixture]:
     shutil.rmtree(BASE, ignore_errors=True)
 
 
-def test_a_second_service_on_the_same_sha_is_almost_free(env: Fixture) -> None:
+def test_two_services_stage_the_same_sha(env: Fixture) -> None:
     root_a, root_b = env.roots
 
     before = _free_bytes()
@@ -132,25 +134,31 @@ def test_a_second_service_on_the_same_sha_is_almost_free(env: Fixture) -> None:
     repo_b = env.mirror.stage(env.sha1, root_b, BLOCK)
     after_b = _free_bytes()
 
-    control = before - after_materialize
-    cost_a = after_materialize - after_a
-    cost_b = after_a - after_b
-    print(
-        f"\ncanonical extraction: {control / MB:.2f} MiB\n"
-        f"stage -> root-a:      {cost_a / MB:.2f} MiB\n"
-        f"stage -> root-b:      {cost_b / MB:.2f} MiB"
+    env.costs.update(
+        control=before - after_materialize, a=after_materialize - after_a, b=after_a - after_b
     )
-
+    print(
+        f"\ncanonical extraction: {env.costs['control'] / MB:.2f} MiB\n"
+        f"stage -> root-a:      {env.costs['a'] / MB:.2f} MiB\n"
+        f"stage -> root-b:      {env.costs['b'] / MB:.2f} MiB"
+    )
     tree_bytes = sum(p.stat().st_size for p in canonical.rglob("*") if p.is_file())
     assert tree_bytes >= TREE_FILES * TREE_FILE_BYTES
-    # Control: the measurement can see a real ~17 MiB write.
-    assert control >= CONTROL_FLOOR, f"control extraction only cost {control} bytes"
-    assert cost_a < REFLINK_BUDGET, f"first stage cost {cost_a} bytes"
-    assert cost_b < REFLINK_BUDGET, f"second stage cost {cost_b} bytes"
     assert repo_a.is_dir() and repo_b.is_dir()
     for repo in (repo_a, repo_b):
         assert (repo / SHA_MARKER).read_text().strip() == env.sha1
         assert (repo / "blob00.bin").read_bytes() == (canonical / "blob00.bin").read_bytes()
+
+
+@pytest.mark.skipif(
+    not linuxhost.reflink_capable(STORE_ROOT), reason="store cannot reflink (plain store)"
+)
+def test_a_second_service_on_the_same_sha_is_almost_free(env: Fixture) -> None:
+    assert env.costs, "test_two_services_stage_the_same_sha must run first"
+    # Control: the measurement can see a real ~17 MiB write.
+    assert env.costs["control"] >= CONTROL_FLOOR, f"control extraction only cost {env.costs}"
+    assert env.costs["a"] < REFLINK_BUDGET, f"first stage cost {env.costs['a']} bytes"
+    assert env.costs["b"] < REFLINK_BUDGET, f"second stage cost {env.costs['b']} bytes"
 
 
 def test_the_staged_tree_belongs_to_the_service_block(env: Fixture) -> None:

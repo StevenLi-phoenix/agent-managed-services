@@ -506,12 +506,21 @@ def runtime_env(decl: ServiceDecl, service_root: Path, store: RuntimeStore) -> R
     raise ProvisionError(f"unknown runtime kind {kind!r}")  # pragma: no cover - schema-checked
 
 
+#: pnpm's import method everywhere. ``clone`` alone fails outright on a
+#: filesystem without reflink (ext4); ``clone-or-copy`` still clones on XFS
+#: ``reflink=1`` and copies elsewhere, so the XFS store is an optimisation,
+#: not a requirement.
+PNPM_IMPORT_METHOD = "clone-or-copy"
+
+
 def provisioning_env(store: RuntimeStore, spec: RuntimeSpec | None = None) -> dict[str, str]:
     """Pure: the environment the provisioning tools run under, as inner root.
 
-    ``UV_LINK_MODE=clone`` / ``npm_config_package_import_method=clone`` /
-    ``--backend=copyfile`` are what make a second environment nearly free on the
-    reflink store; ``UV_PYTHON_PREFERENCE=only-managed`` keeps services off the
+    ``UV_LINK_MODE=clone`` / ``npm_config_package_import_method=clone-or-copy`` /
+    ``--backend=copyfile`` are what make a second environment nearly free on a
+    reflink store, and each degrades to a plain copy on a filesystem that cannot
+    clone (ext4: correct, just not free -- the store is an optimisation, D8/D13).
+    ``UV_PYTHON_PREFERENCE=only-managed`` keeps services off the
     host interpreter (which AppArmor confines, see D3). For a ``spec`` that
     pins a managed node, its bin dirs come first on PATH, so ``node``, ``npm``,
     ``pnpm`` and every ``#!/usr/bin/env node`` script resolve to the pinned ones.
@@ -540,7 +549,7 @@ def provisioning_env(store: RuntimeStore, spec: RuntimeSpec | None = None) -> di
         "UV_PYTHON_PREFERENCE": "only-managed",
         "PNPM_HOME": str(store.pnpm_home),
         "npm_config_store_dir": str(store.pnpm_store),
-        "npm_config_package_import_method": "clone",
+        "npm_config_package_import_method": PNPM_IMPORT_METHOD,
         "BUN_INSTALL": str(store.bun_install),
         "BUN_INSTALL_CACHE_DIR": str(store.bun_cache),
     }
@@ -575,7 +584,7 @@ def service_provisioning_env(
         "PNPM_HOME": str(cache / "pnpm-home"),
         "npm_config_store_dir": str(cache / "pnpm-store"),
         "npm_config_cache": str(cache / "npm"),
-        "npm_config_package_import_method": "clone",
+        "npm_config_package_import_method": PNPM_IMPORT_METHOD,
     }
 
 
@@ -1260,9 +1269,7 @@ def provision_tree(
     chowns it); the pnpm store, caches and HOME are the service's own under
     ``<root>/.cache`` (:func:`service_provisioning_env`), so no chown follows.
     ``block`` None: a plain subprocess as the current user, for development,
-    ``--no-isolation`` and macOS; there the pnpm import method is
-    ``clone-or-copy``, because a dev tree and store need not share a filesystem
-    and a hard ``clone`` would fail.
+    ``--no-isolation`` and macOS.
 
     ``env`` is merged over the provisioning environment, the caller winning
     (e.g. ``CORE_SOURCE_COMMIT``); it must never carry a secret.
@@ -1290,7 +1297,6 @@ def provision_tree(
         ensure_node_toolchain(store, spec.node, spec.pnpm)
     if service_root is None:
         tool_env = provisioning_env(store, spec)
-        tool_env["npm_config_package_import_method"] = "clone-or-copy"
     else:
         tool_env = service_provisioning_env(store, spec, service_root)
     tool_env.update(env or {})

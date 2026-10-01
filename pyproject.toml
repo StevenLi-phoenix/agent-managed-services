@@ -1,8 +1,10 @@
 [project]
 name = "ams"
-version = "1.1.0"
-description = "Agent managed services: rootless supervisor core (userns + cgroup v2)"
+version = "2.0.0"
+description = "Agent managed services: a rootless Linux supervisor (userns + cgroup v2) with an escalation channel for an operator agent"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = []
 
 [project.optional-dependencies]
@@ -12,11 +14,15 @@ dev = ["pytest>=8", "pytest-timeout>=2", "ruff>=0.5"]
 ams = "ams.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# Package data, never imported: core_plan.mjs runs under the tree's own node.
+"ams.platform" = ["assets/*.mjs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -30,6 +36,8 @@ log_cli_level = "DEBUG"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# one-off probe scripts kept as evidence, not maintained code
+extend-exclude = ["docs/design/history"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

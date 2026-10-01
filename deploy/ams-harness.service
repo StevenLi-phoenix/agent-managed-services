@@ -17,10 +17,9 @@ Environment=AMS_STORE_DIR=/home/harness/store
 Environment=PYTHONPATH=/home/harness/ams/src
 Environment=PATH=/home/harness/venv/bin:/home/harness/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Interpreter path must match deploy/apparmor/ams-harness attachment glob.
-# --policy platform (T4.1): cause dedupe, the post-sync health gate and the
-# Caddy/registry suppression rules (ams.platform.policy). Without it the
-# gateway's four start-up WARNINGs escalate on every Caddy start (see
-# .claude/state/platform-layer0.md §7) and a crash loop escalates per line.
+# --policy platform: cause dedupe and the Caddy rules (ams.platform.policy).
+# Without it Caddy's start-up WARNINGs escalate on every start and a crash loop
+# escalates per line. A host without the platform layer drops the flag.
 ExecStart=/home/harness/venv/bin/python3 -m ams run --policy platform
 # `systemctl reload ams-harness` rescans services/*/service.toml and adds,
 # removes or restarts only what changed (ams.reload). This exists so a

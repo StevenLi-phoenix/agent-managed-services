@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable:
+    # The supervisor core, the platform layer and their tests with no isolation:
+    # what `--no-isolation` (development, macOS) exercises.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test tools
+        run: python -m pip install "pytest>=8" "pytest-timeout>=2" "ruff>=0.5"
+      - name: ruff
+        run: ruff check . && ruff format --check src tests
+      - name: pytest
+        run: python -m pytest -q -o log_cli=false -rs
+
+  linux-isolation:
+    # The isolation path for real: user namespaces through setuid newuidmap,
+    # the AppArmor userns grant (24.04 sets apparmor_restrict_unprivileged_userns=1),
+    # a delegated cgroup v2 subtree, run_as_service / run_admin with a mount mask.
+    # The same two steps prepare and run any test host (scripts/linux-test.sh).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host facts
+        run: |
+          uname -r
+          stat -fc %T /sys/fs/cgroup
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          systemctl --version | head -1
+          cat /etc/subuid
+      - name: Prepare the host (harness user, subuid, AppArmor profile, venv, caddy)
+        run: |
+          sudo env AMS_STORE_FS=plain AMS_WITH_TOOLS=1 AMS_TEST_DEPS=1 AMS_INSTALL_UNIT=0 \
+            bash deploy/install-host.sh
+      - name: Every test, as harness, in a delegated cgroup
+        run: sudo bash scripts/linux-test.sh ci tests

@@ -710,7 +710,8 @@ def test_provision_tree_isolated_runs_every_step_as_the_service(
     env = install["env"]
     assert env["CORE_SOURCE_COMMIT"] == "f" * 40
     assert env["PATH"].split(":")[:2] == list(node_toolchain(store, NODE, PNPM).bin_dirs)
-    assert env["npm_config_package_import_method"] == "clone"  # same XFS store (D8)
+    # reflink on an XFS store (D8), a copy on any other filesystem
+    assert env["npm_config_package_import_method"] == "clone-or-copy"
     assert env["HOME"] == str(cache / "home")
     for key in ("npm_config_store_dir", "npm_config_cache", "PNPM_HOME", "XDG_CACHE_HOME"):
         assert env[key].startswith(str(cache) + "/"), key

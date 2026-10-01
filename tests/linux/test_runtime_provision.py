@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import select
+import shutil
 import signal
 import stat as statmod
 import time
@@ -27,20 +28,20 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import linuxhost
 import pytest
 
 from ams import schema
 from ams.isolated import IsolatedSpawner, make_isolated_spawner
 from ams.runtime import ProvisionError, RuntimeEnv, RuntimeStore, provision, python_venv_dir
 from ams.spawn import SpawnedService, SpawnRequest
-from ams.uidmap import UidBlock
 from ams.userns import remove_service_root
 
 pytestmark = pytest.mark.linux
 
 # First block of the harness' /etc/subuid range; pinned so ownership assertions
 # are exact (in production the allocator hands these out).
-BLOCK = UidBlock(100_000, 100_000, 1024)
+BLOCK = linuxhost.block(0)
 HOST_UID = BLOCK.uid_start
 
 # The reflink store (D8/D13). Service roots must be on this filesystem.
@@ -441,6 +442,10 @@ def test_uv_sync_without_a_project_names_the_missing_file(
 
 
 @pytest.mark.timeout(600)
+@pytest.mark.skipif(
+    shutil.which("node", path="/usr/local/bin:/usr/bin:/bin") is None,
+    reason="no system node on the service PATH (unpinned pnpm runtimes need one)",
+)
 def test_pnpm_installs_into_the_workdir_without_sharing_inodes(
     store: RuntimeStore, roots: Callable[[str], Path], run_service: Run
 ) -> None:

@@ -316,7 +316,7 @@ def _params(fn: Any) -> dict[str, inspect.Parameter]:
 
 def test_the_calls_core_mode_makes_match_the_slices_that_serve_them() -> None:
     from ams import runtime, userns
-    from ams.platform import gateway, layer0
+    from ams.platform import gateway
     from ams.platform.sources import SourceMirror
 
     # coresync._Tick.stage / release -> SourceMirror (Task C)
@@ -344,10 +344,10 @@ def test_the_calls_core_mode_makes_match_the_slices_that_serve_them() -> None:
         ["node"], BLOCK, env={"PATH": "/p"}, cwd="/c", timeout_s=1.0
     )
     assert {"env", "cwd"} <= set(_params(userns.run_admin))
-    # default_gateway / bootstrap -> gateway + layer0 (Task C / existing)
+    # default_gateway / bootstrap -> gateway
     inspect.signature(gateway.render_core).bind([], object())
     assert {"host", "port"} == set(_params(gateway.CoreSite))
-    inspect.signature(layer0._caddy_declaration_text).bind(object(), object(), 20180)
+    inspect.signature(gateway.caddy_declaration).bind(object(), object(), 20180)
 
 
 def test_the_declared_runtime_is_the_managed_toolchain(state: StateDir) -> None:

@@ -1,11 +1,11 @@
 """Linux-only checks that the rendered gateway config is real Caddy config.
 
-The portable tests pin the *bytes* (tests/test_platform_gateway.py). Only Caddy
+The portable tests pin the *bytes* (tests/test_platform_gateway_core.py). Only Caddy
 itself can say whether those bytes are a config it accepts, and that is the
 failure mode a golden file cannot catch: a header block that is byte-perfect and
 syntactically invalid still takes the whole gateway down at restart.
 
-Run via ``scripts/remote-test.sh ams-gw tests/linux/test_platform_gateway_live.py``.
+Run via ``scripts/linux-test.sh ams-gw tests/linux/test_platform_gateway_live.py``.
 Skipped unless the pinned binary from ``deploy/install-host.sh`` is present.
 """
 
@@ -22,12 +22,13 @@ from pathlib import Path
 import pytest
 
 from ams.platform import gateway
-from ams.platform.gateway import GatewayConfig
+from ams.platform.gateway import CoreSite, GatewayConfig, render_core
 from ams.state import StateDir
 
 pytestmark = pytest.mark.linux
 
-GOLDEN_DIR = Path(__file__).parents[1] / "golden" / "gateway"
+GOLDEN_DIR = Path(__file__).parents[1] / "golden" / "gateway" / "core"
+SCENARIOS = ["basic", "empty", "logdir"]
 STORE = Path(os.environ.get("AMS_STORE_DIR", "/home/harness/store"))
 CADDY = STORE / "bin" / "caddy"
 
@@ -54,7 +55,7 @@ def free_port() -> int:
 
 
 @needs_caddy
-@pytest.mark.parametrize("scenario", ["path", "subdomain", "static", "logdir", "tls"])
+@pytest.mark.parametrize("scenario", SCENARIOS)
 def test_golden_config_is_accepted_by_caddy(scenario: str, tmp_path: Path) -> None:
     """Every golden render must survive `caddy validate` exit 0."""
     work = tmp_path / scenario
@@ -62,14 +63,15 @@ def test_golden_config_is_accepted_by_caddy(scenario: str, tmp_path: Path) -> No
     # The goldens name machine-independent stand-ins; the log directory is the
     # one that must exist, because Caddy opens the writer while provisioning.
     (tmp_path / "srv-logs").mkdir()
-    caddyfile = work / "Caddyfile"
-    caddyfile.write_text(caddyfile.read_text().replace("/srv/ams/logs", str(tmp_path / "srv-logs")))
-    result = validate(caddyfile)
+    for path in work.rglob("*"):
+        if path.is_file():
+            path.write_text(path.read_text().replace("/srv/ams/logs", str(tmp_path / "srv-logs")))
+    result = validate(work / "Caddyfile")
     assert result.returncode == 0, f"caddy validate failed:\n{result.stderr}"
 
 
 @needs_caddy
-@pytest.mark.parametrize("scenario", ["path", "subdomain", "static", "logdir", "tls"])
+@pytest.mark.parametrize("scenario", SCENARIOS)
 def test_rendered_config_is_already_in_caddy_fmt_canonical_form(
     scenario: str, tmp_path: Path
 ) -> None:
@@ -91,48 +93,11 @@ def test_rendered_config_is_already_in_caddy_fmt_canonical_form(
 
 @needs_caddy
 def test_a_freshly_written_config_validates(tmp_path: Path) -> None:
-    """`render()` + `write()` end to end, not a checked-in file."""
+    """`render_core()` + `write()` end to end, not a checked-in file."""
     state = StateDir(tmp_path / "state")
-    mounts = [
-        {
-            "version": 1,
-            "id": "files",
-            "kind": "service",
-            "gateway": "api.lishuyu.app",
-            "path": "/files",
-            "subdomain": None,
-            "port_name": "main",
-            "static_root": None,
-            "build": [],
-            "headers": {},
-        },
-        {
-            "version": 1,
-            "id": "pages",
-            "kind": "service",
-            "gateway": "pages.shuyuli.com",
-            "path": None,
-            "subdomain": "pages",
-            "port_name": "main",
-            "static_root": None,
-            "build": [],
-            "headers": {"Referrer-Policy": "no-referrer"},
-        },
-        {
-            "version": 1,
-            "id": "files-web",
-            "kind": "static",
-            "gateway": "file.lishuyu.app",
-            "path": None,
-            "subdomain": "file",
-            "port_name": None,
-            "static_root": "files-web",
-            "build": [],
-            "headers": {},
-        },
-    ]
-    cfg = GatewayConfig(listen_port=free_port(), static_root=gateway.static_root(state))
-    changed = gateway.write(state, gateway.render(mounts, {"files": 9206, "pages": 9216}, cfg))
+    sites = [CoreSite("api.lishuyu.app", 18080), CoreSite("pages.shuyuli.com", 18081)]
+    cfg = GatewayConfig(listen_port=free_port())
+    changed = gateway.write(state, render_core(sites, cfg))
     assert changed
     result = validate(gateway.caddyfile_path(state))
     assert result.returncode == 0, f"caddy validate failed:\n{result.stderr}"
@@ -141,11 +106,19 @@ def test_a_freshly_written_config_validates(tmp_path: Path) -> None:
 @needs_caddy
 def test_running_caddy_answers_the_harness_health_probe(tmp_path: Path) -> None:
     """The health path in `caddy_declaration()` has to be a route Caddy actually
-    serves, or the harness marks a working gateway unhealthy forever."""
+    serves, or the harness marks a working gateway unhealthy forever; and a
+    site must actually reach its loopback port."""
     state = StateDir(tmp_path / "state")
     port = free_port()
-    cfg = GatewayConfig(listen_port=port, static_root=gateway.static_root(state))
-    gateway.write(state, gateway.render([], {}, cfg))
+    backend = free_port()
+    cfg = GatewayConfig(listen_port=port)
+    gateway.write(state, render_core([CoreSite("api.example.test", backend)], cfg))
+    origin = subprocess.Popen(
+        ["python3", "-m", "http.server", str(backend), "--bind", "127.0.0.1"],
+        cwd=tmp_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
     env = dict(os.environ, XDG_CONFIG_HOME=str(tmp_path / "cfg"), XDG_DATA_HOME=str(tmp_path / "d"))
     proc = subprocess.Popen(
@@ -180,7 +153,7 @@ def test_running_caddy_answers_the_harness_health_probe(tmp_path: Path) -> None:
         assert status == 200, f"health probe never returned 200 (got {status})"
         assert body == "ok"
 
-        # The 404 catch-all, so a probe on an unmounted path is distinguishable
+        # The 404 catch-all, so a request for an unknown host is distinguishable
         # from a dead gateway.
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
         conn.request("GET", "/nope")
@@ -188,7 +161,32 @@ def test_running_caddy_answers_the_harness_health_probe(tmp_path: Path) -> None:
         assert resp.status == 404
         assert b'"error":"not_found"' in resp.read()
         conn.close()
+
+        # ... and so is every Host that has no [[site]] (not Caddy's empty 200).
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        conn.request("GET", "/", headers={"Host": "unknown.example.test"})
+        resp = conn.getresponse()
+        assert resp.status == 404
+        assert b'"error":"not_found"' in resp.read()
+        conn.close()
+
+        # A [[site]] host is reverse-proxied to its loopback port.
+        proxied = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            conn.request("GET", "/", headers={"Host": "api.example.test"})
+            resp = conn.getresponse()
+            proxied = resp.status
+            resp.read()
+            conn.close()
+            if proxied == 200:
+                break
+            time.sleep(0.2)  # the origin may still be binding
+        assert proxied == 200, f"site api.example.test was not proxied (got {proxied})"
     finally:
+        origin.terminate()
+        origin.wait(timeout=10)
         proc.terminate()
         try:
             proc.wait(timeout=10)

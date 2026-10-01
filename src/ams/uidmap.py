@@ -6,7 +6,7 @@ block carved out of it; assignments are persisted so a service keeps its block
 (and therefore file ownership) across harness restarts.
 
 Only ``UidBlock`` is defined here for now; the allocator is implemented in the
-allocator task (see .claude/state/PROGRESS.md).
+allocator task (see docs/design/PROGRESS.md).
 """
 
 from __future__ import annotations
@@ -256,7 +256,7 @@ class UidAllocator:
         recursive chown in ``ensure_service_root`` then runs in a namespace with
         no authority over those files (EPERM on every one). That is not
         hypothetical -- it is how the first live Layer-0 bring-up failed; see
-        `.claude/state/diagnosis-layer0.md` and DECISIONS D24.
+        `docs/design/history/diagnosis-layer0.md` and DECISIONS D24.
 
         The re-read costs nothing on the warm path: a known id never reaches it.
         It also feeds ``_lowest_free_index`` the blocks other processes carved,

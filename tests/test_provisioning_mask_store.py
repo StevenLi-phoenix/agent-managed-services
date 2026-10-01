@@ -4,8 +4,8 @@ Review 2026-09-29, security-5. The platform RS256 signing key lives in
 ``<store>/platform/jwt-rs256.pem`` -- a *sibling* of the state dir on the target
 host (``/home/harness/store/{state,platform}``) -- and the private api mirror in
 ``<store>/{upstream,repos}``; the harness home holds ``~/.ssh``, ``~/.npmrc`` and
-friends. Legacy provisioning and static builds still run untrusted code as inner
-root (the harness uid) under the admin map, so their masks must hide those too,
+friends. `ams provision` (uv/venv/pnpm/bun runtimes) still runs untrusted code as
+inner root (the harness uid) under the admin map, so its mask must hide those too,
 while leaving the caches and toolchain the tools need (and the tree they work in)
 visible. Core mode no longer needs a mask: it runs those steps as the service.
 """
@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 
 from ams import runtime
-from ams.platform import static
 from ams.runtime import RuntimeStore
 from ams.state import StateDir
 
@@ -70,18 +69,3 @@ def test_a_home_dotdir_holding_the_store_is_never_masked(
     mask = runtime.provisioning_mask(root, store=store)
     assert home / ".config" not in mask
     assert home / ".ssh" in mask
-
-
-def test_static_build_mask_hides_the_platform_signing_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store, state, _root, home = _layout(tmp_path)
-    monkeypatch.setenv("HOME", str(home))
-    checkout = store.root / "src" / "api" / ("a" * 40)
-    checkout.mkdir(parents=True)
-    mask = static._build_mask(state, store=store, keep=(checkout,))
-    assert store.root / "platform" in mask
-    assert home / ".ssh" in mask
-    assert store.root / "src" not in mask  # holds the checkout being built
-    static_base = static.static_root(state)
-    assert not any(m == static_base or static_base in m.parents for m in mask)

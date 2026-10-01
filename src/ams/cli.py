@@ -97,8 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--policy",
         choices=("default", "platform"),
         default="default",
-        help="decision policy: 'platform' adds cause dedupe, the post-sync health "
-        "gate and the Caddy/registry rules (ams.platform.policy)",
+        help="decision policy: 'platform' adds cause dedupe and the Caddy rules "
+        "(ams.platform.policy)",
     )
     p_run.add_argument("--log-level", default="INFO")
 
@@ -117,19 +117,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("check-host", help="report host prerequisites")
 
+    p_esc = sub.add_parser(
+        "escalations", help="read the escalation journal (<state>/logs/escalations.jsonl)"
+    )
+    p_esc.add_argument("--state-dir", type=Path, default=None, help="overrides $AMS_STATE_DIR")
+    p_esc.add_argument("-n", type=int, default=50, help="newest N records (0 = all)")
+    p_esc.add_argument("--service", default=None, help="only this service id")
+    p_esc.add_argument("--since", default=None, help="only records at or after this UTC ISO time")
+    p_esc.add_argument("--json", action="store_true", help="raw JSON lines (untrusted content)")
+
     # `ams secret set|rm|list|check`. Argument wiring and handlers live in
     # ams.secrets so that every line that can touch a value sits in one module.
     from ams.secrets import add_subparser as _add_secret_subparser
 
     _add_secret_subparser(sub)
 
-    # `ams platform sync|status|bootstrap`. Same pattern as `secret`: the
-    # replica platform's arguments and handlers live in ams.platform.cli so the
-    # supervisor core never imports the translation/gateway/registry layer.
-    from ams.platform.cli import add_subparser as _add_platform_subparser
-
-    _add_platform_subparser(sub)
+    # `ams platform ...`. Same pattern as `secret`: the platform's arguments and
+    # handlers live in ams.platform.cli. The platform is optional -- the
+    # supervisor core works with the platform/ package deleted, and then this
+    # subcommand simply does not exist (tests/test_core_boundary.py).
+    platform_cli = _platform_cli()
+    if platform_cli is not None:
+        platform_cli.add_subparser(sub)
     return parser
+
+
+def _platform_cli() -> Any | None:
+    """``ams.platform.cli`` if the platform layer is installed, else None."""
+    try:
+        from ams.platform import cli as platform_cli
+    except ModuleNotFoundError as e:
+        if e.name is None or not (e.name == "ams.platform" or e.name.startswith("ams.platform.")):
+            raise  # a real missing dependency inside the platform, not its absence
+        log.debug("platform layer not installed (%s); core commands only", e)
+        return None
+    return platform_cli
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -147,12 +169,40 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ctl":
         return cmd_ctl(args)
     if args.command == "platform":
-        from ams.platform.cli import cmd_platform
-
-        return cmd_platform(args)
+        platform_cli = _platform_cli()
+        assert platform_cli is not None  # the subcommand exists only when it imports
+        return platform_cli.cmd_platform(args)
     if args.command == "check-host":
         return cmd_check_host()
+    if args.command == "escalations":
+        return cmd_escalations(args)
     return EXIT_ERROR  # pragma: no cover - argparse enforces the choices
+
+
+# ------------------------------------------------------------------ escalations
+
+
+def cmd_escalations(args: argparse.Namespace) -> int:
+    """Print the escalation journal, oldest first, newest ``-n`` records."""
+    import json
+
+    from ams.escalations import format_record, journal_path, read_records
+
+    path = journal_path(_state_dir(args.state_dir))
+    records = read_records(path)
+    if args.service:
+        records = [r for r in records if r.get("service_id") == args.service]
+    if args.since:
+        since = args.since if args.since.endswith("Z") else args.since + "Z"
+        records = [r for r in records if str(r.get("ts", "")) >= since]
+    if args.n > 0:
+        records = records[-args.n :]
+    if not records:
+        print(f"no escalations in {path}", file=sys.stderr)
+        return EXIT_OK
+    for rec in records:
+        print(json.dumps(rec, default=str) if args.json else format_record(rec))
+    return EXIT_OK
 
 
 # --------------------------------------------------------------------- validate
@@ -610,15 +660,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"ams run needs ams.state/ams.decision: {e}", file=sys.stderr)
         return EXIT_UNAVAILABLE
 
-    escalation = JsonLinesEscalation() if args.escalate == "jsonl" else NullEscalation()
+    from ams.escalations import EscalationJournal, journal_path
+
+    escalation = (
+        JsonLinesEscalation(journal=EscalationJournal(journal_path(state), source="harness"))
+        if args.escalate == "jsonl"
+        else NullEscalation()
+    )
     # Lazy, like every other optional layer here: `ams run` on a host without the
     # platform package must still supervise.
     platform_policy = None
     if getattr(args, "policy", "default") == "platform":
+        if _platform_cli() is None:
+            print("--policy platform: ams.platform is not installed", file=sys.stderr)
+            return EXIT_UNAVAILABLE
         from ams.platform.policy import make_policy
 
-        platform_policy = make_policy(state, escalation=escalation)
-        log.info("platform policy: cause dedupe, post-sync health gate, caddy/registry rules")
+        platform_policy = make_policy(escalation=escalation)
+        log.info("platform policy: cause dedupe, caddy rules")
     try:
         asm = build_supervisor(
             state,

@@ -1,0 +1,289 @@
+ams core mode — local end-to-end against the real api (PLAN-core §6.2)
+=====================================================================
+Run: 2026-09-29 23:51 → 2026-09-30 00:05 (local, EDT). macOS 26.5 arm64, --no-isolation.
+ams: ~/Codes/agent-managed-services, main @ 1c0460e + uncommitted working tree
+     (the review-fix pass), plus the two fixes recorded at the end of this file.
+api: scratch clone `git clone --no-local ~/Codes/api /tmp/amse2e/work/api-src`
+     at f99fb863 (api v3.1.0). The real ~/Codes/api was never modified.
+     All test commits went to the clone only.
+No secrets in this file: plugins.json and the keys are never printed; `config import` prints names.
+
+Setup
+-----
+AMS_STATE_DIR=/tmp/amse2e/state  AMS_STORE_DIR=/tmp/amse2e/store
+  core socket = /tmp/amse2e/state/services/core/root/run/control.sock (53 bytes < 104)
+core.toml: url=/tmp/amse2e/work/api-src ref=main node=24.20.0 pnpm=11.19.0 gateway_port=28080
+  caddy_port=28180 probation_timeout_s=120 health_timeout_s=90
+  plugins=[secrets, store, gateway, auth, health, timeservice]  privileges: health=[ops.read]
+  [[site]] host=api.e2e.test port=28080   (caddy = copy of /opt/homebrew/bin/caddy in <store>/bin)
+plugins.json modelled on api/test/core-harness.ts foundation(): store dataDirectory + namespaces,
+  gateway port 28080, auth configDirectory + section (fresh RS256 pair from openssl, issuer
+  https://auth.example.test, audiences [auth, registry], hashConcurrency 1), empty sections for
+  secrets/health/timeservice. Written with production paths, rebased on import.
+
+$ ams platform core config import plugins.json --rebase /var/lib/core=@data --rebase /etc/core=@etc --jwt-dir keys/
+INFO ams.platform.core: core bundle: rebased 1 value(s) from /var/lib/core to /tmp/amse2e/state/services/core/root/data
+INFO ams.platform.core: core bundle: rebased 1 value(s) from /etc/core to /tmp/amse2e/state/services/core/root/etc
+INFO ams.platform.core: core bundle: stored 3 file(s) in /tmp/amse2e/state/secrets/core/bundle
+jwt.pem
+jwt.pub
+plugins.json                                   rc=0   (master copy 0700 dir / 0600 files)
+
+$ ams run --no-isolation --policy platform &        harness PID 76711 (later 91031, see fix 2)
+
+
+1. bootstrap: first release, foundation + timeservice live      rc=0  elapsed 74 s
+------------------------------------------------------------------------------------
+$ ams platform core bootstrap --no-isolation
+INFO ams.platform.gateway: gateway config changed: Caddyfile, api.e2e.test.caddy
+INFO ams.platform.coresync: bootstrap: caddy declared on 28180
+INFO ams.platform.sources: api: mirror created at /tmp/amse2e/store/repos/api.git
+INFO ams.platform.coresync: main -> f99fb863d0d4
+INFO ams.platform.sources: api: staged f99fb863… into …/root/releases/f99fb863… (plain, no namespace)
+INFO ams.runtime: downloading https://nodejs.org/dist/v24.20.0/node-v24.20.0-darwin-arm64.tar.gz
+INFO ams.runtime: downloaded …node-v24.20.0-darwin-arm64.tar.gz (52813331 bytes)
+INFO ams.runtime: node 24.20.0: node-v24.20.0-darwin-arm64.tar.gz verified (sha256 40e5607e5ecb3db9)
+INFO ams.runtime: installed managed node 24.20.0 at /tmp/amse2e/store/node/v24.20.0
+INFO ams.runtime: pnpm 11.19.0: npm install: …/node/v24.20.0/bin/npm install -g --prefix …/pnpm/.tmp-11.19.0-… pnpm@11.19.0 -> rc=0 in 2.1s
+INFO ams.runtime: installed managed pnpm 11.19.0 at /tmp/amse2e/store/pnpm/11.19.0
+INFO ams.runtime: f99fb863…: pnpm install: pnpm install --frozen-lockfile -> rc=0 in 3.7s
+INFO ams.platform.coresync: no release yet: releasing f99fb863d0d4
+INFO ams.runtime: f99fb863…: build: node scripts/build.mjs -> rc=0 in 0.8s
+INFO ams.platform.coresync: releasing f99fb863d0d4 (previous None, /health before: not 200, 0 plugin(s) serving)
+WARNING ams.platform.corectl: corectl status -> rc=1 … connect ENOENT …/run/control.sock     (core still starting)
+INFO ams.platform.coresync: released f99fb863d0d4 (control socket answers (no gateway installed))
+INFO ams.platform.coresync: planned 6 plugin(s) in 0.6s (0 error(s))
+INFO ams.platform.coresync: secrets: deployed a4f042a6d9ac; in probation
+INFO ams.platform.coresync: store: deployed 4f4e235108bb; in probation
+INFO ams.platform.coresync: gateway: deployed cbd6d7e24467; in probation
+INFO ams.platform.coresync: auth: deployed 110b6d80b1aa; in probation
+INFO ams.platform.coresync: health: deployed b0f15727d544; in probation
+INFO ams.platform.coresync: health: privileges ops.read granted before probation
+INFO ams.platform.coresync: timeservice: deployed 7118109fff2a; in probation
+INFO ams.platform.coresync: secrets: live on a4f042a6d9ac   … store, gateway, auth, health, timeservice: live
+INFO ams.platform.coresync: core tick done: core f99fb863d0d4; release=ok;
+     shipped=secrets,store,gateway,auth,health,timeservice; live=secrets,store,gateway,auth,health,timeservice;
+     privileges_changed=health; record written
+(escalation stdout of the tick: empty)
+(core logs: core.boot_complete started=[], node v24.20.0 — the managed toolchain, not nvm's v20.20.0)
+
+$ ams platform core status --no-isolation
+release   f99fb863d0d4  previous -  staged f99fb863d0d4  core reachable
+PLUGIN       PHASE      LIVE       ARTIFACT      COMMIT        AMS
+secrets      active     active     a4f042a6d9ac  f99fb863d0d4  live a4f042a6d9ac @f99fb863d0d4
+store        active     active     4f4e235108bb  f99fb863d0d4  live 4f4e235108bb @f99fb863d0d4
+gateway      active     active     cbd6d7e24467  f99fb863d0d4  live cbd6d7e24467 @f99fb863d0d4
+auth         active     active     110b6d80b1aa  f99fb863d0d4  live 110b6d80b1aa @f99fb863d0d4
+health       active     active     b0f15727d544  f99fb863d0d4  live b0f15727d544 @f99fb863d0d4
+timeservice  active     active     7118109fff2a  f99fb863d0d4  live 7118109fff2a @f99fb863d0d4
+
+$ curl http://127.0.0.1:28080/health
+{"ok":true,"plugins":{"auth":"active","gateway":"active","health":"active","secrets":"active","store":"active","timeservice":"active"}}   -> 200
+$ curl http://127.0.0.1:28080/time/now
+{"now":"2026-09-30T03:53:02.566+00:00"}   -> 200
+$ curl -H 'Host: api.e2e.test' http://127.0.0.1:28180/time/now          (through the Caddy front)
+{"now":"2026-09-30T03:53:02.574+00:00"}   -> 200
+harness: "core health=ok http 127.0.0.1:28080/health HTTP 200 OK" (the declaration's own health check)
+
+
+2. second tick, no change: no ship, core.json not rewritten      rc=0  elapsed 0.17 s
+------------------------------------------------------------------------------------
+before core.json mtime=1790740375.614677516 sha256=43f65879cb4a5411  service.toml mtime=1790740311.116101651
+$ ams platform core sync --no-isolation
+INFO ams.platform.coresync: main -> f99fb863d0d4
+INFO ams.platform.coresync: core tick done: core f99fb863d0d4; no change
+after  core.json mtime=1790740375.614677516 sha256=43f65879cb4a5411  service.toml mtime=1790740311.116101651
+escalation lines: 0; no upload/deploy; steady state = git fetch + corectl status.
+
+
+3. content change to one plugin ships only that plugin          rc=0  elapsed 65 s
+------------------------------------------------------------------------------------
+clone: 87e3aebc "e2e: timeservice docs content change" (one line appended to plugins/timeservice/docs/index.md)
+$ ams platform core sync --no-isolation
+INFO ams.platform.coresync: main -> 87e3aebc903b
+INFO ams.platform.coresync: staged + installed 87e3aebc903b
+INFO ams.platform.coresync: 87e3aebc903b leaves core paths alone; core stays at f99fb863d0d4
+INFO ams.platform.coresync: planned 6 plugin(s) in 0.7s (0 error(s))
+INFO ams.platform.corectl: uploaded timeservice-e5186671d794.artifact.json as e5186671d794
+INFO ams.platform.coresync: timeservice: deployed e5186671d794; in probation
+INFO ams.platform.coresync: timeservice: live on e5186671d794
+INFO ams.platform.coresync: core tick done: core 87e3aebc903b; shipped=timeservice; live=timeservice; record written
+All 6 plugins were planned; only timeservice's content key differed (the other five still
+show commit f99fb863 in status). corectl transitions: deploy ok, probation_passed "0/13 failed".
+$ ams platform core status → timeservice  active  active  e5186671d794  87e3aebc903b  live e5186671d794 @87e3aebc903b
+GET /health -> 200 (all active); GET /time/agents.md serves the new docs.
+
+
+4. broken plugin: rejected, escalated once, old artifact serves, not retried
+------------------------------------------------------------------------------------
+4a. (observation, not an ams defect) d8a19622 "deliberately broken timeservice health":
+    health() is ok on its 1st call (core's install check), throws afterwards. ams shipped it
+    and core PASSED its probation: transition probation_passed "12/71 failed" = 17% < the
+    20% probationFailureRate. My own /time/now probe loop (1 per 2 s) and the health plugin's
+    polling were counted as successful facade calls and diluted the 12 failing health probes.
+    ams recorded it `live` because core said so. An upstream property of core's probation:
+    a plugin whose health always fails can pass under enough traffic (api, manager.ts
+    startProbation). Reverted in b80b3fa7, and the next tick shipped the healthy content:
+    "shipped=timeservice; live=timeservice" (live on bacf6b4c2a12, 65 s).
+
+4b. 4e61caf3 "deliberately broken timeservice apply" (setup throws)     rc=1  elapsed 4 s
+$ ams platform core sync --no-isolation          (with /time/now probed every 2 s in parallel)
+INFO ams.platform.coresync: main -> 4e61caf3eb80
+INFO ams.platform.coresync: 4e61caf3eb80 leaves core paths alone; core stays at f99fb863d0d4
+INFO ams.platform.coresync: planned 6 plugin(s) in 0.8s (0 error(s))
+INFO ams.platform.corectl: uploaded timeservice-d85965406191.artifact.json as d85965406191
+ERROR ams.platform.coresync: escalating core/timeservice core_plugin_rejected: deploy failed: e2e: deliberately broken timeservice apply
+INFO ams.platform.coresync: core tick done: core 4e61caf3eb80; shipped=timeservice; failed=timeservice; 1 escalation(s); record written
+escalation JSONL on stdout (exactly one line):
+{"kind": "CoreSync", "service_id": "core", "action": "escalate", "reason": "core_plugin_rejected: deploy failed: e2e: deliberately broken timeservice apply", "event": {"kind": "core_plugin_rejected", "service": "core", "plugin": "timeservice", "cause": "deploy failed: e2e: deliberately broken timeservice apply", "sha": "4e61caf3eb80df099bd6d79fc2c3395d0115d269"}}
+/time/now probe during the tick: 5 × 200, 0 failures.
+
+4c. the next two ticks do NOT retry that content key
+tick 1 rc=0 elapsed=0.19s escalations=0 uploads=0
+  INFO ams.platform.coresync: cause cleared: timeservice|core_plugin_rejected|deploy failed: …
+  INFO ams.platform.coresync: core tick done: core 4e61caf3eb80; record written   (only the escalated map changed)
+tick 2 rc=0 elapsed=0.17s escalations=0 uploads=0
+  INFO ams.platform.coresync: core tick done: core 4e61caf3eb80; no change
+$ ams platform core status
+timeservice  active  active  bacf6b4c2a12  b80b3fa72074  failed d85965406191 @4e61caf3eb80
+             ams: deploy failed: e2e: deliberately broken timeservice apply
+GET /time/now -> 200, GET /health -> 200 (the previous artifact bacf6b4c2a12 keeps serving).
+Reverted in c7eeb6c9; the next tick shipped it: live on f27f1a8098fc (66 s).
+
+
+5. core release: packages/core touched → current flips, core restarts, plugins restored
+------------------------------------------------------------------------------------   rc=0  elapsed 8 s
+clone: c2b8c1a7 "e2e: touch packages/core (comment)" (a comment appended to packages/core/main.ts)
+core PID before: 77087 (current -> releases/f99fb863…)
+$ ams platform core sync --no-isolation          (/health probed every 1 s in parallel)
+INFO ams.platform.coresync: c2b8c1a7d6dc touches core paths (packages/core/main.ts); releasing
+INFO ams.platform.coresync: releasing c2b8c1a7d6dc (previous f99fb863d0d4, /health before: 200, 6 plugin(s) serving)
+INFO ams.platform.coresync: ctl stop core -> ok
+INFO ams.platform.coresync: core stopped
+INFO ams.platform.coresync: ctl start core -> ok
+INFO ams.platform.coresync: released c2b8c1a7d6dc (/health 200)
+INFO ams.platform.coresync: planned 6 plugin(s) in 0.4s (0 error(s))      (no content key changed → nothing shipped)
+INFO ams.platform.coresync: core tick done: core c2b8c1a7d6dc; release=ok; record written
+current -> releases/c2b8c1a7…; core PID after: 86321
+core log: core.boot_complete started=[health,secrets,store,timeservice,auth,gateway] failed=[]
+/health probe during the release: 5 × 200, 2 × 000 (≈2 s down), 2 × 200
+$ ams platform core status
+release   c2b8c1a7d6dc  previous f99fb863d0d4  staged c2b8c1a7d6dc  core reachable
+(all six plugins active/active on their previous artifacts; health still holds ops.read)
+GET /health -> 200, GET /time/now -> 200
+
+
+6. release rollback                                              rc=0  elapsed 3 s
+------------------------------------------------------------------------------------
+$ ams platform core release --rollback --no-isolation
+INFO ams.platform.coresync: ctl stop core -> ok
+INFO ams.platform.coresync: core stopped
+INFO ams.platform.coresync: ctl start core -> ok
+INFO ams.platform.coresync: rolled back c2b8c1a7d6dc -> f99fb863d0d4 (/health 200)
+INFO ams.platform.coresync: core rollback done: core c2b8c1a7d6dc; release=ok; rolled back; record written
+current -> releases/f99fb863…; core PID 86830
+$ ams platform core status
+release   f99fb863d0d4  previous c2b8c1a7d6dc  staged c2b8c1a7d6dc  core reachable
+held      c2b8c1a7d6dc (release failed or rolled back)
+(all six plugins active/active); GET /health -> 200, GET /time/now -> 200
+Next tick (0.17 s, rc=0, 0 escalations):
+  INFO ams.platform.coresync: release of c2b8c1a7d6dc failed or was rolled back; not retried at this sha
+  INFO ams.platform.coresync: core at c2b8c1a7d6dc is held; plugins built from it are not shipped onto core f99fb863d0d4
+  INFO ams.platform.coresync: core tick done: core c2b8c1a7d6dc; no change
+
+
+7. (extra) failed core release: gate fails, flip back, escalate — surfaced FIX 1
+------------------------------------------------------------------------------------
+clone: 35bbb28b "deliberately broken core release": main.ts throws before the control socket opens.
+BEFORE the fix                                                   rc=1  elapsed 98 s
+INFO ams.platform.coresync: releasing 35bbb28b96f8 (previous f99fb863d0d4, /health before: 200, 6 plugin(s) serving)
+INFO ams.platform.coresync: ctl stop core -> ok / core stopped / ctl start core -> ok
+   harness (15 s in): {"action": "stop", "reason": "5 consecutive failures >= max_retries", … "giving up on core …"}
+INFO ams.platform.coresync: ctl start core -> ok
+WARNING ams.platform.coresync: flipped back to f99fb863d0d4 (/health 200)
+INFO ams.platform.coresync: core tick done: core 35bbb28b96f8; release=FAILED; rolled back; 1 escalation(s); record written
+{"kind": "CoreSync", … "event": {"kind": "core_release_failed", "plugin": null, "cause": "release 35bbb28b96f8: health gate: control socket not answering: corectl status failed (rc=1): corectl: connect ENOENT …/run/control.sock", "sha": "35bbb28b96f8…"}}
+/health probe (every 2 s): 2 × 200, 46 × 000, 1 × 200  →  ≈92 s outage. The harness had
+given up on core (status `failed`, never restarted) after ~15 s, but the gate still waited
+out the whole health_timeout_s=90 before flipping back.
+
+AFTER the fix (bf840265, the same breakage at a new sha; harness restarted on the new code)
+                                                                 rc=1  elapsed 25 s
+INFO ams.platform.coresync: releasing bf840265bdef (previous f99fb863d0d4, /health before: 200, 6 plugin(s) serving)
+INFO ams.platform.coresync: ctl stop core -> ok / core stopped / ctl start core -> ok
+WARNING ams.platform.coresync: gate: the harness reports core failed; not waiting any longer
+ERROR ams.platform.coresync: escalating core core_release_failed: release bf840265bdef: health gate: control socket not answering: corectl status failed (rc=1): corectl: connect ENOENT …/run/control.sock; the harness gave up on core (status failed)
+INFO ams.platform.coresync: ctl start core -> ok
+WARNING ams.platform.coresync: flipped back to f99fb863d0d4 (/health 200)
+INFO ams.platform.coresync: core tick done: core bf840265bdef; release=FAILED; rolled back; 1 escalation(s); record written
+/health probe (every 1 s): 6 × 200, 17 × 000, 2 × 200  →  ≈17 s outage (was ≈92 s).
+current -> releases/f99fb863…
+
+
+8. (extra) harness restart: core reboots its plugins from core.sqlite
+------------------------------------------------------------------------------------
+kill -TERM 76711 → exited in 1 s, core (exit 0 after drain) and caddy stopped with it.
+Restarted: harness 91031, caddy 91033, core 91034:
+  core.boot_complete started=[health,secrets,store,timeservice,auth,gateway] failed=[]
+  GET /health -> 200 (all active). Harness escalations: 0 (fix 2 — see below).
+
+
+Fixes made (test first, then fix)
+---------------------------------
+FIX 1  src/ams/platform/coresync.py `_Tick.gate` + new `_Tick.harness_gave_up`
+  The release/rollback/flip-back gate now fails at once when the harness reports core
+  `failed`. `failed` is terminal (restart policy exhausted, desired=down), so waiting out
+  health_timeout_s only stretched the outage before the flip back (≈92 s → ≈17 s above).
+  A harness that cannot be asked is not taken as evidence (the gate keeps waiting).
+  Test: tests/test_platform_coresync.py::test_release_gate_gives_up_as_soon_as_the_harness_gave_up_on_core
+  (red before: no "gave up" in the cause, fake clock ran ≥ health_timeout_s).
+
+FIX 2  src/ams/events.py `_heuristic` + `_NOISE_PATTERNS`
+  Node prints "(Use `node --trace-warnings ...` to show where the warning was created)"
+  after its first process warning (core: an ExperimentalWarning for Web Crypto on the first
+  upload). The word "warning" made the harness escalate it as WARNING on every core start
+  (seen 3 times in run 1, plus a "3 occurrences in one window" escalation). That exact,
+  anchored hint line is now INFO; the warning line it follows is classified on its own.
+  Test: tests/test_events.py::test_classify_node_trace_hint_is_info.
+  Live after the fix: the hint is logged at INFO, 0 harness escalations on core start.
+
+
+Observations (not fixed; recorded for follow-up)
+------------------------------------------------
+- A broken plugin gets two signals on two streams: core-sync's single `core_plugin_rejected`
+  (above), and the harness's LogLine escalations of core's own `level:"warn"` lines
+  (`plugin.failure`, `core.transition … outcome failed`). A failed core release also gets
+  the harness's "giving up on core" next to core-sync's `core_release_failed`. Each stream
+  dedupes itself, but the two do not know about each other. A platform-policy rule that
+  suppresses core's own transition/failure lines in core mode would be a design decision
+  (DECISIONS.md), so I did not make it here.
+- Core probation can pass a plugin whose health always fails, when there is enough
+  successful traffic (4a). That is api upstream behaviour, outside ams.
+- Re-shipping reverted content deploys a new artifactId (buildInfo.commit changes), with a
+  60 s probation, even when core already serves identical content (bacf6b… vs f27f1a…).
+  Harmless, and it matches PLAN-core §4 ("a new commit with new content retries").
+- core logs JSON lines on stderr, not stdout as PLAN-core §0 says. Harmless: the
+  declaration's `[logging] format = "json"` classifies them on either stream.
+
+Timings
+-------
+bootstrap (incl. 52.8 MB node download + verify, pnpm 11.19.0 install, pnpm install,
+  build, 6 deploys + 60 s probation)            74 s
+no-change tick                                   0.17 s
+one-plugin content ship (60 s core probation)    65 s
+rejected deploy                                  4 s
+core release (≈2 s /health gap)                  8 s
+release rollback                                 3 s
+failed release + flip back                       98 s before fix 1 → 25 s after
+managed toolchain on disk: node 199 MB, pnpm 38 MB (under <store>)
+
+Cleanup
+-------
+Stopped harness 91031 by PID (command line checked first). Core 91403 and caddy 91033 went
+down with it. Afterwards: `pgrep "dist/core/main.js|caddy run|ams run"` shows nothing, and
+ports 28080/28180 are free. Scratch data is left at /tmp/amse2e (state, store, clone, logs)
+for inspection. It holds a throwaway RS256 key pair and no real secret.
+
+Full suite after the fixes: .venv/bin/python -m pytest -q -> 1608 passed, 167 skipped in 157.8 s
+(baseline at the start of this run, same working tree before the two fixes: 1606 passed, 167 skipped;
+ +2 = the two new tests). ruff check + ruff format --check clean on the four touched files.

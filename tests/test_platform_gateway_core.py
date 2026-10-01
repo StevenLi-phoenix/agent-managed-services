@@ -5,10 +5,10 @@ the single HTTP entry and owns routing, auth, CORS and every security header
 (each plugin route sets its own CSP), so the Caddy side is deliberately small.
 What must hold, and is pinned here:
 
-* the output shape is `render()`'s -- ``Caddyfile`` + ``sites/<name>.caddy`` --
-  so `write()` (and its stale-snippet sweep) is reused unchanged;
+* the output shape is ``Caddyfile`` + ``sites/<host>.caddy``, and `write()`
+  sweeps snippets of sites that are gone;
 * the harness health probe on the entry site survives, because the caddy
-  service declaration health-checks ``/ams-health`` whatever mode renders it;
+  service declaration health-checks ``/ams-health``;
 * plain HTTP only (TLS terminates at Cloudflare / the tunnel), no admin API;
 * every value that lands unquoted in the Caddyfile is validated first;
 * the text is `caddy fmt`-canonical (checked against a real caddy when one is
@@ -27,11 +27,18 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from test_platform_gateway import cfg, mount
 
 from ams.platform import gateway
-from ams.platform.gateway import CoreSite, GatewayError, render_core
+from ams.platform.gateway import CoreSite, GatewayConfig, GatewayError, render_core
 from ams.state import StateDir
+
+LISTEN_PORT = 8080
+
+
+def cfg(**overrides: object) -> GatewayConfig:
+    """The renderer config every scenario uses; Caddy listens on 8080."""
+    return GatewayConfig(listen_port=LISTEN_PORT, **overrides)  # type: ignore[arg-type]
+
 
 GOLDEN_DIR = Path(__file__).parent / "golden" / "gateway" / "core"
 LOG_DIR = Path("/srv/ams/logs")
@@ -86,7 +93,7 @@ def test_golden(scenario: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_output_shape_matches_render() -> None:
+def test_output_shape() -> None:
     files = rendered("basic")
     assert sorted(files) == [
         "Caddyfile",
@@ -126,7 +133,7 @@ def test_caddyfile_turns_off_https_and_the_admin_api() -> None:
 
 def test_entry_site_keeps_the_harness_health_probe() -> None:
     caddyfile = rendered("empty")["Caddyfile"]
-    assert "http://127.0.0.1:8080 {" in caddyfile
+    assert "http://:8080 {" in caddyfile
     assert f"handle {gateway.HEALTH_PATH} {{" in caddyfile
     assert 'respond "ok" 200' in caddyfile
 
@@ -226,10 +233,10 @@ def test_a_non_coresite_is_rejected() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_write_replaces_legacy_snippets_with_the_core_sites(tmp_path: Path) -> None:
+def test_write_sweeps_snippets_of_sites_that_are_gone(tmp_path: Path) -> None:
     state = StateDir(tmp_path / "state")
-    legacy = gateway.render([mount("files", path="/files")], {"files": 9206}, cfg())
-    gateway.write(state, legacy)
+    gone = render_core([CoreSite("files.lishuyu.app", 9206)], cfg())
+    gateway.write(state, gone)
 
     changed = gateway.write(state, rendered("basic"))
 
@@ -238,7 +245,7 @@ def test_write_replaces_legacy_snippets_with_the_core_sites(tmp_path: Path) -> N
         "api.lishuyu.app.caddy",
         "pages.shuyuli.com.caddy",
     ]
-    assert sites / "files.caddy" in changed
+    assert sites / "files.lishuyu.app.caddy" in changed
     assert gateway.write(state, rendered("basic")) == []
 
 
@@ -285,3 +292,36 @@ def test_output_passes_caddy_validate(tmp_path: Path) -> None:
         cwd=str(tmp_path),
     )
     assert proc.returncode == 0, proc.stderr
+
+
+# --------------------------------------------------------------------------- #
+# The caddy service declaration
+# --------------------------------------------------------------------------- #
+
+
+def test_the_caddy_declaration_is_a_valid_fixed_port_service(tmp_path: Path) -> None:
+    from ams.schema import loads
+
+    state = StateDir(tmp_path / "state")
+    decl = loads(gateway.caddy_declaration(state, tmp_path / "store", 20180))
+    assert decl.id == gateway.CADDY_SERVICE_ID
+    assert decl.ports == {"main": 20180}
+    assert decl.health.kind == "http" and decl.health.path == gateway.HEALTH_PATH
+    assert decl.start.argv[0] == str(tmp_path / "store" / "bin" / "caddy")
+    assert decl.restart.policy == "always"
+
+
+@pytest.mark.parametrize("port", [0, 80, 65536, True, "20180"])
+def test_the_caddy_declaration_refuses_a_bad_port(tmp_path: Path, port: object) -> None:
+    with pytest.raises(GatewayError, match="caddy port"):
+        gateway.caddy_declaration(StateDir(tmp_path), tmp_path, port)  # type: ignore[arg-type]
+
+
+def test_the_entry_site_catches_every_host_without_a_site() -> None:
+    """Found live: with the entry site on `http://127.0.0.1:<port>` only Host
+    127.0.0.1 reached the JSON 404, and any other unknown host got Caddy's
+    default empty 200 -- indistinguishable from a working route. The entry is a
+    port-wide catch-all; Caddy matches the specific [[site]] hosts first."""
+    caddyfile = rendered("basic")["Caddyfile"]
+    assert f"http://:{LISTEN_PORT} {{" in caddyfile
+    assert "http://127.0.0.1:" not in caddyfile

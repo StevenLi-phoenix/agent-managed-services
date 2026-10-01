@@ -54,7 +54,7 @@ from ams.events import (
     Stream,
     severity_of,
 )
-from ams.health import HealthMonitor
+from ams.health import HealthMonitor, Probe
 from ams.schema import ServiceDecl, StartSpec
 from ams.spawn import SpawnedService, Spawner, SpawnRequest
 
@@ -107,6 +107,13 @@ class _FdCallback:
     name: str = ""
 
 
+@dataclass(frozen=True)
+class _ProbeKey:
+    """Selector payload for a service's in-flight health probe socket."""
+
+    service_id: str
+
+
 # Orphans belong to no declaration, but the policy contract wants a context.
 _ORPHAN_DECL = ServiceDecl(id="orphan", start=StartSpec(argv=("<orphan>",)))
 _ORPHAN_CTX = ServiceContext(_ORPHAN_DECL)
@@ -134,6 +141,9 @@ class ServiceState:
     eof: set[str] = field(default_factory=set)
 
     monitor: HealthMonitor | None = None
+    # The tcp/http health check in flight, its socket registered in the loop's
+    # selector. At most one per service; cancelled whenever the monitor resets.
+    probe: Probe | None = None
     exited_at: float | None = None
     reaped: bool = False
     restart_pending: bool = False
@@ -241,6 +251,7 @@ class Supervisor:
             raise ValueError(f"declaration id {decl.id!r} does not match {service_id!r}")
         st.decl = decl
         st.ports = dict(ports)
+        self._cancel_probe(st)  # it is probing the previous port
         st.monitor = HealthMonitor(decl.health, st.ports, clock=self._clock)
         if st.spawned is None:
             st.monitor.stop()
@@ -327,6 +338,7 @@ class Supervisor:
         st.status = "starting" if st.decl.health.kind != "none" else "running"
         st.waiting_for = ()
         st.dep_alert = ""
+        self._cancel_probe(st)
         if st.monitor is not None:
             st.monitor.start(now)
         log.info("started %s pid=%d attempt=%d", st.id, svc.pid, st.attempt)
@@ -344,6 +356,7 @@ class Supervisor:
             if st.spawned is None:
                 st.status = "stopped" if not for_restart else st.status
                 st.waiting_for = ()
+            self._cancel_probe(st)
             if st.monitor is not None:
                 st.monitor.stop()
             return
@@ -353,6 +366,7 @@ class Supervisor:
         st.stop_deadline = self._clock() + st.decl.stop.timeout_s
         # No health probe applies to a process we are tearing down; leaving the
         # timer due would keep _poll_timeout at 0 for the whole stop window.
+        self._cancel_probe(st)
         if st.monitor is not None:
             st.monitor.stop()
         signum = st.decl.stop.signum
@@ -588,6 +602,8 @@ class Supervisor:
                 self._drain_wakeup(key.fd)
             elif isinstance(key.data, _FdCallback):
                 self._run_fd_callback(key.data, key.fd)
+            elif isinstance(key.data, _ProbeKey):
+                self._advance_probe(key.data.service_id, key.fd)
             else:
                 sid, stream = key.data
                 self._read_stream(sid, stream, key.fd)
@@ -707,6 +723,7 @@ class Supervisor:
                 break
             time.sleep(0.02)
         for st in self.services.values():
+            self._cancel_probe(st)
             if st.spawned is not None:
                 self._finalize(st, force=True)
         self._sel.close()
@@ -779,8 +796,15 @@ class Supervisor:
                 deadline = min(deadline, st.reset_at)
             if st.restart_at is not None and not live and st.desired == "up":
                 deadline = min(deadline, st.restart_at)
-            if st.monitor is not None and live and st.status in ("starting", "running"):
+            if (
+                st.monitor is not None
+                and live
+                and st.status in ("starting", "running")
+                and st.probe is None
+            ):
                 deadline = min(deadline, st.monitor.next_due)
+            if st.probe is not None:
+                deadline = min(deadline, st.probe.deadline)
             if st.reaped and live and st.exited_at is not None:
                 deadline = min(deadline, st.exited_at + self._eof_grace_s)
         if deadline is math.inf:
@@ -874,6 +898,7 @@ class Supervisor:
         st.exited_at = now
         st.stop_deadline = None
         st.healthy = None
+        self._cancel_probe(st)
         if st.monitor is not None:
             st.monitor.stop()
         # The only place operator intent is known: stop()/kill()/shutdown set
@@ -947,15 +972,17 @@ class Supervisor:
                     log.info("%s stable; clearing failure streak", st.id)
                 st.consecutive_failures = 0
                 st.reset_at = None
+            if st.probe is not None and now >= st.probe.deadline:
+                st.probe.expire()
+                self._finish_probe(st)
             if (
                 st.spawned is not None
                 and st.monitor is not None
                 and st.status in ("starting", "running")
+                and st.probe is None
                 and st.monitor.due(now)
             ):
-                healthy, detail = st.monitor.check(now)
-                if healthy is not None:
-                    self._set_health(st, healthy, detail)
+                self._begin_probe(st, now)
             if (
                 st.restart_at is not None
                 and now >= st.restart_at
@@ -964,6 +991,66 @@ class Supervisor:
             ):
                 st.restart_at = None
                 self.start(st.id)
+
+    # ---------------------------------------------------------------- probes
+    #
+    # A tcp/http check is a non-blocking socket in this selector plus a deadline
+    # in _run_timers -- never a blocking call inside the loop, where one hung
+    # endpoint used to stall every other service for health.timeout_s.
+
+    def _begin_probe(self, st: ServiceState, now: float) -> None:
+        assert st.monitor is not None
+        started = st.monitor.begin(now)
+        if not isinstance(started, Probe):
+            healthy, detail = started
+            if healthy is not None:
+                self._set_health(st, healthy, detail)
+            return
+        st.probe = started
+        log.debug("%s: %s probe of port %d started", st.id, started.kind, started.port)
+        if started.result is not None:  # refused or connected synchronously
+            self._finish_probe(st)
+            return
+        self._register(started.fileno(), _ProbeKey(st.id), events=started.events)
+        if started.fileno() not in self._registered:  # registration failed (logged)
+            started.expire()
+            self._finish_probe(st)
+
+    def _advance_probe(self, service_id: str, fd: int) -> None:
+        st = self.services.get(service_id)
+        probe = st.probe if st is not None else None
+        if st is None or probe is None or probe.fileno() != fd:
+            self._unregister(fd)
+            return
+        before = probe.events
+        probe.advance()
+        if probe.result is not None:
+            self._finish_probe(st)
+        elif probe.events != before:
+            self._unregister(fd)
+            self._register(fd, _ProbeKey(st.id), events=probe.events)
+
+    def _finish_probe(self, st: ServiceState) -> None:
+        probe = st.probe
+        if probe is None or st.monitor is None:
+            return
+        self._cancel_probe(st)
+        healthy, detail = st.monitor.finish(probe)
+        log.debug("%s: probe concluded: %s", st.id, detail)
+        if healthy is not None:
+            self._set_health(st, healthy, detail)
+
+    def _cancel_probe(self, st: ServiceState) -> None:
+        """Drop the in-flight probe, if any: unregister before close, so a
+        reused fd number can never be mistaken for it."""
+        probe = st.probe
+        if probe is None:
+            return
+        st.probe = None
+        fd = probe.fileno()
+        if fd >= 0:
+            self._unregister(fd)
+        probe.close()
 
     def _set_health(self, st: ServiceState, healthy: bool, detail: str) -> None:
         if st.healthy == healthy:

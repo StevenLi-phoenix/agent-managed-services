@@ -1,0 +1,91 @@
+ams core mode -- end to end on Linux, ISOLATED (user namespaces + delegated cgroup)
+====================================================================================
+Run: 2026-10-01 12:30 -> 12:39 (EDT). ams 2.0.0 (branch fix/review-2026-10-01).
+Host: Ubuntu 24.04.5, kernel 7.0.0-34-generic, x86_64, systemd 255, cgroup2,
+  kernel.apparmor_restrict_unprivileged_userns=1. A workstation, not racknerd.
+  Prepared with `AMS_STORE_FS=plain AMS_WITH_TOOLS=1 AMS_TEST_DEPS=1 AMS_INSTALL_UNIT=0
+  deploy/install-host.sh`: user `harness` (uid 1001), subuid/subgid 165536:65536 (the
+  login user already owns 100000:65536), AppArmor profile ams-harness, venv --copies,
+  pinned caddy 2.11.4. Store is a plain ext4 directory (no XFS, no reflink).
+api: v3.1.0 (f99fb863), bare mirror pushed to <store>/upstream/api.git. Test commits went
+  to a scratch clone and that mirror only, never to GitHub.
+Harness: `systemd-run --uid=harness -p Delegate=yes --unit=ams-e2e-harness
+  python3 -m ams run --policy platform` (isolated). Every `ams platform core` command ran
+  as harness, isolated (no --no-isolation anywhere).
+core.toml: node 24.20.0, pnpm 11.19.0, gateway_port 28080, caddy_port 28180, roster
+  secrets, store, gateway, auth, health, timeservice; privileges health=[ops.read];
+  [[site]] api.e2e.test -> 28080. plugins.json modelled on api test/core-harness.ts
+  foundation() with a throwaway RS256 pair; `config import` printed names only
+  (jwt.pem, jwt.pub, plugins.json).
+
+1. bootstrap (first release + whole roster)                       rc=0  71 s
+   - managed toolchain: node-v24.20.0-linux-x64.tar.gz downloaded, sha256 verified
+     against SHASUMS256.txt, installed at <store>/node/v24.20.0; pnpm 11.19.0 via the
+     managed npm.
+   - "as-service pnpm install --frozen-lockfile (block 166560) -> rc=0 in 2.9s": the
+     install (and its lifecycle scripts) ran as the service uid, not the harness.
+   - released f99fb863d0d4 (control socket answers); planned 6 plugins; all six deployed,
+     health granted ops.read before probation, all six live. Escalation stdout: empty.
+   - artifact ids identical to the macOS run of 2026-09-29 (a4f042a6d9ac, 4f4e235108bb,
+     cbd6d7e24467, 110b6d80b1aa, b0f15727d544, 7118109fff2a): the content keys are
+     platform-independent.
+   Isolation facts of the running core (pid 1755816):
+     Uid/Gid 166560 (block 1; caddy holds block 0), CapEff 0, NoNewPrivs 1
+     uid_map "1000 166560 1024"  -- the harness uid (1001) is not mapped
+     cgroup /system.slice/ams-e2e-harness.service/svc-core
+     memory.max 943718400 (900M), memory.swap.max 0, memory.current ~68 MB
+     exe /home/harness/store/node/v24.20.0/bin/node  (the managed toolchain)
+     from inside core's namespaces, `cat <state>/secrets/core/bundle/plugins.json`: denied
+     R/etc 0700 166560:166560, R/data 0750 166560:166560; escalations.jsonl 0600 harness
+   HTTP: Host api.e2e.test via caddy :28180 -> /health 200
+     {"ok":true,"plugins":{auth,gateway,health,secrets,store,timeservice: active}}
+
+   FOUND HERE: a Host with no [[site]] got Caddy's default empty 200, not the JSON 404
+   the entry site exists for (the entry was http://127.0.0.1:<port>, matching only that
+   Host). Fixed in this branch: the entry site is the port-wide catch-all
+   http://:<port>; after a tick re-rendered the Caddyfile and restarted caddy:
+     Host nope.test -> 404 {"error":"not_found","detail":"no such site"}
+     Host nope.test /ams-health -> 200; Host api.e2e.test /health -> 200
+
+2. no-change tick                                                 rc=0  0.15 s
+   "core tick done: core f99fb863d0d4; no change"; core.json mtime unchanged since
+   bootstrap; 0 escalations.
+
+3. content change to one plugin (timeservice docs)                rc=0  63 s
+   "3fd924431ac2 leaves core paths alone"; planned 6; only timeservice deployed
+   (2568098c6b63) and went live; the other five still at commit f99fb863d0d4.
+
+4. broken plugin (timeservice setup() throws)                     rc=1  2 s
+   exactly one escalation on stdout:
+   {"kind": "CoreSync", "service_id": "core", "action": "escalate", "reason":
+    "core_plugin_rejected: deploy failed: e2e: deliberately broken timeservice apply", ...}
+   two more ticks: rc=0, 0 escalations, 0 uploads (the failed content key is not retried)
+   /time/now probed every 1 s during the tick: 60 x 200 (the old artifact kept serving)
+   status: timeservice active/active 2568098c6b63 ... failed 89ae49b419c6 @a03c433fa7be
+   `ams escalations` (new in 2.0.0) listed, oldest first:
+     harness   core  LogLine   WARNING on stderr | {"event":"plugin.failure","pluginId":"timeservice",...}
+     harness   core  LogLine   WARNING on stderr | {"event":"core.transition",...,"kind":"deploy",...}
+     core-sync core  CoreSync  core_plugin_rejected: deploy failed: e2e: deliberately broken ...
+   (the "two escalation streams for one failure" open item, now in one journal)
+
+5. core release (revert the break + touch packages/core/main.ts)  rc=0  66 s
+   "96dcae12147f touches core paths (packages/core/main.ts); releasing"
+   "releasing 96dcae12147f (previous f99fb863d0d4, /health before: 200, 6 plugin(s) serving)"
+   core stopped -> current flipped -> started -> "released 96dcae12147f (/health 200)";
+   the repaired timeservice shipped in the same tick (01a015208d32, live).
+   core pid 1755816 -> 1758038; current -> releases/96dcae12147f...
+   /health probed every 1 s: 2 x 200, 2 x 502, 62 x 200  (~2 s down)
+
+6. release --rollback                                             rc=0  3 s
+   "rolled back 96dcae12147f -> f99fb863d0d4 (/health 200)"; current -> releases/f99fb863...
+   status: release f99fb863d0d4, previous 96dcae12147f, held 96dcae12147f
+   next tick: "release of 96dcae12147f failed or was rolled back; not retried at this sha";
+   "core at 96dcae12147f is held; plugins built from it are not shipped onto core
+   f99fb863d0d4"; no change. Isolation facts unchanged after both releases.
+
+7. harness restart (systemctl stop, then start)
+   stop: core and caddy exited 0 on SIGTERM, no process of uid 166560 left.
+   start: /health 200 after ~1 s, all six plugins active (core reboots them from core.sqlite).
+
+Not covered here: backup to R2 (no credentials on this host), a failed core release
+(covered on macOS 2026-09-29, scenario 7), production traffic.

@@ -2,8 +2,8 @@
 Description=Run one ams core-mode tick every 60 seconds
 
 [Timer]
-# Same 60 s poll as ams-platform-sync.timer (PLAN-allin Q1): a webhook would need
-# an inbound port, a route and an HMAC secret for the same latency.
+# A 60 s poll of the local mirror: a webhook would need an inbound port, a route
+# and an HMAC secret for the same latency.
 OnBootSec=2min
 OnUnitActiveSec=60s
 # Measured from the start of the last tick: a tick that runs long (a release, a
