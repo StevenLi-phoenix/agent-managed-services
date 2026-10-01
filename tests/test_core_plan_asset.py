@@ -180,3 +180,17 @@ def test_live_make_planner_plain_mode(tmp_path: Path) -> None:
     assert plans[0].error is None
     assert Path(plans[0].path).is_file()
     assert (layout.build / "core_plan.mjs").read_bytes() == ASSET.read_bytes()
+
+
+def test_the_asset_is_declared_package_data() -> None:
+    """A wheel ships only what package-data names: without this, a pip-installed
+    ams had no planner and every core tick failed (deploys rsync the source
+    tree, which is why it went unnoticed)."""
+    import fnmatch
+    import tomllib
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    patterns = data["tool"]["setuptools"]["package-data"]["ams.platform"]
+    rel = ASSET.relative_to(ASSET.parents[1]).as_posix()  # assets/core_plan.mjs
+    assert any(fnmatch.fnmatch(rel, p) for p in patterns), (rel, patterns)

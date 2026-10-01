@@ -20,6 +20,10 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# Package data, never imported: core_plan.mjs runs under the tree's own node.
+"ams.platform" = ["assets/*.mjs"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
