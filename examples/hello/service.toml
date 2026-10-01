@@ -1,0 +1,32 @@
+# The smallest useful ams service: no platform, no api, just the supervisor core.
+#
+#   mkdir -p "$AMS_STATE_DIR/services/hello"
+#   cp examples/hello/service.toml "$AMS_STATE_DIR/services/hello/"
+#   ams run --no-isolation          # macOS/dev: plain child processes
+#   ams run                         # Linux host from deploy/install-host.sh: userns + cgroup
+#   ams ctl status ; ams escalations
+#
+# Full reference: docs/service-declaration.md.
+id = "hello"
+
+[start]
+argv = ["python3", "-m", "http.server", "${PORT_main}", "--bind", "127.0.0.1"]
+
+[ports]
+main = 0                      # the harness allocates a free port >= 1024
+
+[health]
+kind = "http"
+port = "main"
+path = "/"
+interval_s = 5
+timeout_s = 2
+start_period_s = 10
+
+[limits]
+memory_max = "64M"
+pids_max = 16
+
+[restart]
+policy = "on-failure"
+max_retries = 3

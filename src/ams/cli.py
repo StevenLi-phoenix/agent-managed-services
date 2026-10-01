@@ -132,13 +132,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_secret_subparser(sub)
 
-    # `ams platform sync|status|bootstrap`. Same pattern as `secret`: the
-    # replica platform's arguments and handlers live in ams.platform.cli so the
-    # supervisor core never imports the translation/gateway/registry layer.
-    from ams.platform.cli import add_subparser as _add_platform_subparser
-
-    _add_platform_subparser(sub)
+    # `ams platform ...`. Same pattern as `secret`: the platform's arguments and
+    # handlers live in ams.platform.cli. The platform is optional -- the
+    # supervisor core works with the platform/ package deleted, and then this
+    # subcommand simply does not exist (tests/test_core_boundary.py).
+    platform_cli = _platform_cli()
+    if platform_cli is not None:
+        platform_cli.add_subparser(sub)
     return parser
+
+
+def _platform_cli() -> Any | None:
+    """``ams.platform.cli`` if the platform layer is installed, else None."""
+    try:
+        from ams.platform import cli as platform_cli
+    except ModuleNotFoundError as e:
+        if e.name is None or not (e.name == "ams.platform" or e.name.startswith("ams.platform.")):
+            raise  # a real missing dependency inside the platform, not its absence
+        log.debug("platform layer not installed (%s); core commands only", e)
+        return None
+    return platform_cli
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -156,9 +169,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ctl":
         return cmd_ctl(args)
     if args.command == "platform":
-        from ams.platform.cli import cmd_platform
-
-        return cmd_platform(args)
+        platform_cli = _platform_cli()
+        assert platform_cli is not None  # the subcommand exists only when it imports
+        return platform_cli.cmd_platform(args)
     if args.command == "check-host":
         return cmd_check_host()
     if args.command == "escalations":
@@ -658,6 +671,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     # platform package must still supervise.
     platform_policy = None
     if getattr(args, "policy", "default") == "platform":
+        if _platform_cli() is None:
+            print("--policy platform: ams.platform is not installed", file=sys.stderr)
+            return EXIT_UNAVAILABLE
         from ams.platform.policy import make_policy
 
         platform_policy = make_policy(state, escalation=escalation)

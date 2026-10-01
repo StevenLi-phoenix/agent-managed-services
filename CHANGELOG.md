@@ -17,6 +17,10 @@
   人类可读格式会剥掉终端控制字符（记录里是服务原样输出，不可信）。
 - `docs/agent-loop.md`：决策层是确定性规则，agent 是由人启动、消费 escalation 的操作者
   会话；为什么不让 LLM 进 suppress-or-fix 循环（日志文本是攻击者可控输入等）；操作流程。
+- `tests/test_core_boundary.py`：锁住"supervisor 核心不依赖 platform"——核心模块不在
+  模块级 import `ams.platform`，只有 `cli` 会懒加载它；`ams.platform` 不可导入时 CLI
+  照常 validate/run，`platform` 子命令自动消失，`--policy platform` 给出明确错误。
+- `examples/hello/service.toml`：与 api 无关的最小通用服务示例。
 - `scripts/linux-test.sh`：在宿主本地以 `harness` 身份、`systemd-run -p Delegate=yes`
   跑 Linux 测试；CI 与 `scripts/remote-test.sh` 共用。
 - `deploy/install-host.sh` 新增开关：`AMS_STORE_FS=xfs|plain`（plain 不建 XFS loop
