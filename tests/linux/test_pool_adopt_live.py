@@ -36,6 +36,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import linuxhost
 import pytest
 
 from ams.platform.pool import adopt, plan, staging_dir
@@ -51,10 +52,10 @@ pytestmark = [pytest.mark.linux, pytest.mark.timeout(300)]
 #: Three distinct 1024-wide blocks out of the harness' real /etc/subuid range.
 #: Distinct is the whole point: one namespace can map exactly one of them.
 MEMBER_BLOCKS = {
-    "alpha": UidBlock(100_000, 100_000, 1024),
-    "beta": UidBlock(101_024, 101_024, 1024),
+    "alpha": linuxhost.block(0),
+    "beta": linuxhost.block(1),
 }
-POOL_BLOCK = UidBlock(102_048, 102_048, 1024)
+POOL_BLOCK = linuxhost.block(2)
 
 STORE_ROOT = Path("/home/harness/store")
 #: Private scratch under the store, never the harness' own AMS_STATE_DIR.

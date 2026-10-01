@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import linuxhost
 import pytest
 
 from ams import schema
@@ -24,14 +25,13 @@ from ams.cgroup import ServiceCgroup
 from ams.hostcheck import check_host
 from ams.isolated import IsolatedSpawner, make_isolated_spawner
 from ams.spawn import SpawnedService, SpawnRequest
-from ams.uidmap import UidBlock
 from ams.userns import SpawnError, ensure_service_root, remove_service_root
 
 pytestmark = pytest.mark.linux
 
 # First block of harness' /etc/subuid range on the target box. In production the
 # allocator hands these out; here it is pinned so ownership assertions are exact.
-BLOCK = UidBlock(100_000, 100_000, 1024)
+BLOCK = linuxhost.block(0)
 HOST_UID = BLOCK.uid_start
 
 READ_TIMEOUT_S = 20.0

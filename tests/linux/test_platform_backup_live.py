@@ -32,6 +32,7 @@ import sys
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
+import linuxhost
 import pytest
 
 from ams.platform.backup import Target, discover, restore, snapshot
@@ -42,7 +43,7 @@ pytestmark = [pytest.mark.linux, pytest.mark.timeout(300)]
 
 # First block of the harness' /etc/subuid range, pinned so the ownership
 # assertions are exact. In production the allocator hands these out.
-BLOCK = UidBlock(100_000, 100_000, 1024)
+BLOCK = linuxhost.block(0)
 SERVICE_UID = BLOCK.uid_start  # host uid of inner 1000
 
 SERVICE_ID = "plat-bk-test"

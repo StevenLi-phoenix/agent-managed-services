@@ -17,18 +17,18 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import linuxhost
 import pytest
 
 from ams.platform import bootstrap as bs
 from ams.runtime import RuntimeStore
 from ams.state import StateDir
-from ams.uidmap import UidBlock
 from ams.userns import remove_service_root
 
 pytestmark = pytest.mark.linux
 
-#: racknerd gives `harness` subuid/subgid 100000:65536 (CLAUDE.md).
-BLOCK = UidBlock(100_000, 100_000)
+#: First block of the harness' real subuid/subgid range (tests/linux/linuxhost.py).
+BLOCK = linuxhost.block(0)
 SERVICE_ID = "plat-boot"
 LIVE_ROOT = Path(os.environ.get("AMS_LIVE_TEST_ROOT", "/home/harness/store/state"))
 

@@ -10,6 +10,25 @@
 ### Added
 
 - `LICENSE`（MIT），`pyproject.toml` 声明 `license = "MIT"`。
+- `scripts/linux-test.sh`：在宿主本地以 `harness` 身份、`systemd-run -p Delegate=yes`
+  跑 Linux 测试；CI 与 `scripts/remote-test.sh` 共用。
+- `deploy/install-host.sh` 新增开关：`AMS_STORE_FS=xfs|plain`（plain 不建 XFS loop
+  文件）、`AMS_WITH_TOOLS=0`、`AMS_TEST_DEPS=1`、`AMS_INSTALL_UNIT=0`。
+
+### Changed
+
+- `scripts/remote-test.sh` 不再写死 racknerd：`AMS_HOST=<ssh 主机>`，远端以有免密 sudo
+  的登录用户运行 `scripts/linux-test.sh`。
+
+### Fixed
+
+- `deploy/install-host.sh` 在 useradd 没分配 subuid 时不再写死 `100000:65536`
+  （宿主第一个登录用户通常已占用），改取所有现有区段之后的第一段。
+- Linux 测试不再写死 uid 块 `100000`，改从 harness 真实的 `/etc/subuid` 推导
+  （`tests/linux/linuxhost.py`）；在 harness 区段不是 100000 的宿主上它们原本全部失败。
+- `test_files_it_writes_belong_to_the_block_on_the_host` 的断言本身是错的：harness
+  按设计无法进入服务 0750 的 `data/`，改在 admin namespace 里 stat。
+- reflink 省空间的测量从 staging 正确性测试中拆出，非 reflink 存储上只跳过测量。
 
 ## [1.1.0] - 2026-09-29
 

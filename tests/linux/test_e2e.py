@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import linuxhost
 import pytest
 
 from ams.cli import build_supervisor
@@ -285,11 +286,12 @@ def test_the_service_process_runs_as_its_mapped_subuid(observed: Observed) -> No
     """The host sees the service's block uid, never the harness's own uid."""
     assert observed.echo_uid == observed.echo_block_uid
     assert observed.echo_uid != os.getuid()
-    assert observed.echo_uid is not None and observed.echo_uid >= 100_000
+    assert observed.echo_uid is not None and observed.echo_uid >= linuxhost.UID_START
 
 
 def test_blocks_are_carved_from_the_start_of_the_subuid_range(observed: Observed) -> None:
-    assert sorted(observed.block_starts.values()) == [100_000, 101_024]
+    first, second = linuxhost.block(0), linuxhost.block(1)
+    assert sorted(observed.block_starts.values()) == [first.uid_start, second.uid_start]
 
 
 def test_declared_limits_reached_the_cgroup(observed: Observed) -> None:
@@ -426,7 +428,7 @@ class Reloaded:
 def reloaded() -> Iterator[Reloaded]:
     """Add a service, then remove it, on a live isolated harness.
 
-    Its own state dir, so its uid blocks restart at 100000. That overlaps the
+    Its own state dir, so its uid blocks restart at the first block. That overlaps the
     main scenario's blocks on the host, which is harmless here only because
     ``observed`` has already shut every process down; two *live* harnesses would
     need distinct subuid ranges.
@@ -537,7 +539,7 @@ def test_reload_adds_a_service_with_its_own_cgroup_and_uid_block(reloaded: Reloa
     assert reloaded.added_cgroup.name == "svc-reload-added"
     # A real, distinct identity -- not the harness's uid, not the other service's.
     assert reloaded.added_uid == reloaded.added_block_uid
-    assert reloaded.added_uid is not None and reloaded.added_uid >= 100_000
+    assert reloaded.added_uid is not None and reloaded.added_uid >= linuxhost.UID_START
     assert reloaded.added_uid != os.getuid()
     assert 20000 <= reloaded.added_port <= 29999
 

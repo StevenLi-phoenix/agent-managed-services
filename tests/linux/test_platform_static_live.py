@@ -28,12 +28,12 @@ import shutil
 from collections.abc import Iterator
 from pathlib import Path
 
+import linuxhost
 import pytest
 
 from ams.platform.static import publish_static
 from ams.runtime import RuntimeStore
 from ams.state import StateDir
-from ams.uidmap import UidBlock
 from ams.userns import run_admin
 
 pytestmark = [pytest.mark.linux, pytest.mark.timeout(300)]
@@ -42,7 +42,7 @@ pytestmark = [pytest.mark.linux, pytest.mark.timeout(300)]
 # tests). Never chowned to here -- a static publish is never chowned to any
 # block (see `publish_static`'s docstring) -- so this block is used only to
 # read the result back as a genuinely different, mapped uid.
-BLOCK = UidBlock(100_000, 100_000, 1024)
+BLOCK = linuxhost.block(0)
 
 #: The reflink store (D8/D13): `_copy_reflink` needs the checkout and the
 #: published tree on the same filesystem, and bun/pnpm's caches live here too.

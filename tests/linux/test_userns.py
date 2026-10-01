@@ -17,19 +17,19 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+import linuxhost
 import pytest
 
 from ams import schema
 from ams.isolated import IsolatedSpawner, make_isolated_spawner
 from ams.spawn import DATA_DIRNAME, SpawnedService, SpawnRequest
-from ams.uidmap import UidBlock
 from ams.userns import ensure_service_root, remove_service_root, run_admin
 
 pytestmark = pytest.mark.linux
 
 # Pinned so ownership assertions are exact; in production the allocator hands
 # these out. Same first block the other Linux tests use.
-BLOCK = UidBlock(100_000, 100_000, 1024)
+BLOCK = linuxhost.block(0)
 HOST_UID = BLOCK.uid_start
 
 READ_TIMEOUT_S = 20.0
