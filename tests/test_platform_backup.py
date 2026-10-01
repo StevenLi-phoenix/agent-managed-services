@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from ams.escalations import journal_path, read_records
 from ams.platform import backup
 from ams.platform.backup import (
     BackupConfig,
@@ -527,6 +528,13 @@ def test_run_continues_past_a_failing_target_and_exits_1(
     assert kinds == ["BackupFailed", "BackupSucceeded", "BackupRunFinished"]
     assert records[0]["action"] == "escalate"
     assert records[-1]["event"]["failed"] == 1
+    # failures (and only failures) also land in the escalation journal
+    journaled = read_records(journal_path(state))
+    assert {r["source"] for r in journaled} == {"backup"}
+    assert [r["kind"] for r in journaled] == [
+        r["kind"] for r in records if r["action"] == "escalate"
+    ]
+    assert "BackupSucceeded" not in [r["kind"] for r in journaled]
 
 
 def test_run_reports_a_prune_failure_as_a_failure(state: StateDir, store: SecretStore) -> None:

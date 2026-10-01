@@ -62,6 +62,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Protocol
 
+from ams.escalations import EscalationJournal, journal_path
 from ams.platform import core as core_mod
 from ams.platform.core import CORE_ID, CoreConfig, CoreLayout
 from ams.platform.corectl import CoreControl, CoreControlError, Runner
@@ -693,6 +694,7 @@ class _Tick:
         self.cfg = cfg
         self.isolation = isolation
         self.stream = stream
+        self.journal = EscalationJournal(journal_path(state), source="core-sync")
         self.now = now
         self.sleep = sleep
         self.hooks = hooks
@@ -783,6 +785,7 @@ class _Tick:
         self.escalations.append(record)
         self.stream.write(json.dumps(record, default=str) + "\n")
         self.stream.flush()
+        self.journal.append(record)
         log.error("escalating %s%s %s: %s", CORE_ID, f"/{plugin}" if plugin else "", kind, cause)
 
     def forget_unobserved(self) -> None:

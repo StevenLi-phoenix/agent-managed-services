@@ -117,6 +117,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("check-host", help="report host prerequisites")
 
+    p_esc = sub.add_parser(
+        "escalations", help="read the escalation journal (<state>/logs/escalations.jsonl)"
+    )
+    p_esc.add_argument("--state-dir", type=Path, default=None, help="overrides $AMS_STATE_DIR")
+    p_esc.add_argument("-n", type=int, default=50, help="newest N records (0 = all)")
+    p_esc.add_argument("--service", default=None, help="only this service id")
+    p_esc.add_argument("--since", default=None, help="only records at or after this UTC ISO time")
+    p_esc.add_argument("--json", action="store_true", help="raw JSON lines (untrusted content)")
+
     # `ams secret set|rm|list|check`. Argument wiring and handlers live in
     # ams.secrets so that every line that can touch a value sits in one module.
     from ams.secrets import add_subparser as _add_secret_subparser
@@ -152,7 +161,35 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_platform(args)
     if args.command == "check-host":
         return cmd_check_host()
+    if args.command == "escalations":
+        return cmd_escalations(args)
     return EXIT_ERROR  # pragma: no cover - argparse enforces the choices
+
+
+# ------------------------------------------------------------------ escalations
+
+
+def cmd_escalations(args: argparse.Namespace) -> int:
+    """Print the escalation journal, oldest first, newest ``-n`` records."""
+    import json
+
+    from ams.escalations import format_record, journal_path, read_records
+
+    path = journal_path(_state_dir(args.state_dir))
+    records = read_records(path)
+    if args.service:
+        records = [r for r in records if r.get("service_id") == args.service]
+    if args.since:
+        since = args.since if args.since.endswith("Z") else args.since + "Z"
+        records = [r for r in records if str(r.get("ts", "")) >= since]
+    if args.n > 0:
+        records = records[-args.n :]
+    if not records:
+        print(f"no escalations in {path}", file=sys.stderr)
+        return EXIT_OK
+    for rec in records:
+        print(json.dumps(rec, default=str) if args.json else format_record(rec))
+    return EXIT_OK
 
 
 # --------------------------------------------------------------------- validate
@@ -610,7 +647,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"ams run needs ams.state/ams.decision: {e}", file=sys.stderr)
         return EXIT_UNAVAILABLE
 
-    escalation = JsonLinesEscalation() if args.escalate == "jsonl" else NullEscalation()
+    from ams.escalations import EscalationJournal, journal_path
+
+    escalation = (
+        JsonLinesEscalation(journal=EscalationJournal(journal_path(state), source="harness"))
+        if args.escalate == "jsonl"
+        else NullEscalation()
+    )
     # Lazy, like every other optional layer here: `ams run` on a host without the
     # platform package must still supervise.
     platform_policy = None

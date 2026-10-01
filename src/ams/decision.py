@@ -19,8 +19,9 @@ import re
 import sys
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import IO, Protocol, runtime_checkable
+from typing import IO, Any, Protocol, runtime_checkable
 
+from ams.escalations import EscalationJournal
 from ams.events import Event, LogLine, ServiceExited, Severity, severity_of
 from ams.schema import ServiceDecl
 
@@ -151,28 +152,39 @@ class DefaultPolicy:
         return Decision(Action.RESTART, "restart.policy=" + policy.policy)
 
 
+def escalation_record(event: Event, decision: Decision, ctx: ServiceContext) -> dict[str, Any]:
+    """The JSON shape of one escalation (stdout and the journal share it)."""
+    return {
+        "kind": type(event).__name__,
+        "service_id": getattr(event, "service_id", None),
+        "action": decision.action.value,
+        "reason": decision.reason,
+        "event": asdict(event),
+        "attempt": ctx.attempt,
+        "consecutive_failures": ctx.consecutive_failures,
+    }
+
+
 @dataclass
 class JsonLinesEscalation:
-    """Stub sink: one JSON object per escalated event on a stream (default stdout).
+    """One JSON object per escalated event on a stream (default stdout), and,
+    with ``journal``, the same record appended to the escalation journal
+    (``ams.escalations``) that ``ams escalations`` reads.
 
-    The agent loop reads these lines. Intended for ``ams run`` until the agent
-    provides a real implementation.
+    The agent is not inside this process: it is an operator session that
+    reads these records and acts through ``ams ctl`` / declarations
+    (``docs/agent-loop.md``).
     """
 
     stream: IO[str] = field(default_factory=lambda: sys.stdout)
+    journal: EscalationJournal | None = None
 
     def escalate(self, event: Event, decision: Decision, ctx: ServiceContext) -> None:
-        record = {
-            "kind": type(event).__name__,
-            "service_id": getattr(event, "service_id", None),
-            "action": decision.action.value,
-            "reason": decision.reason,
-            "event": asdict(event),
-            "attempt": ctx.attempt,
-            "consecutive_failures": ctx.consecutive_failures,
-        }
+        record = escalation_record(event, decision, ctx)
         self.stream.write(json.dumps(record, default=str) + "\n")
         self.stream.flush()
+        if self.journal is not None:
+            self.journal.append(record)
 
 
 class NullEscalation:

@@ -96,6 +96,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
+from ams.escalations import EscalationJournal, journal_path
 from ams.runtime import RuntimeStore
 from ams.secrets import MissingSecret, SecretStore
 from ams.state import StateDir
@@ -1031,6 +1032,7 @@ def run(
     loop reads backup outcomes through the same channel as everything else.
     """
     out = stream if stream is not None else sys.stdout
+    journal = EscalationJournal(journal_path(state), source="backup")
     stamp = stamp or utc_stamp()
     started_at = datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -1058,7 +1060,7 @@ def run(
                 python=python,
             )
             results.append(result)
-            _emit(out, _record_for(result, cfg, dry_run=dry_run))
+            _emit(out, journal, _record_for(result, cfg, dry_run=dry_run))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -1068,12 +1070,13 @@ def run(
     for byte_store in discover_byte_stores(state, allocator, only=only, run_admin_fn=run_admin_fn):
         byte_result = _copy_one(byte_store, cfg, creds, dry_run=dry_run, run_admin_fn=run_admin_fn)
         byte_results.append(byte_result)
-        _emit(out, _byte_record_for(byte_result, byte_store, cfg, dry_run=dry_run))
+        _emit(out, journal, _byte_record_for(byte_result, byte_store, cfg, dry_run=dry_run))
 
     prune_error: str | None = None
     if dry_run:
         _emit(
             out,
+            journal,
             _record(
                 "BackupPrunePlanned",
                 None,
@@ -1089,6 +1092,7 @@ def run(
             prune_error = str(e)
             _emit(
                 out,
+                journal,
                 _record(
                     "BackupPruneFailed",
                     None,
@@ -1108,6 +1112,7 @@ def run(
     )
     _emit(
         out,
+        journal,
         _record(
             "BackupRunFinished",
             None,
@@ -1269,9 +1274,12 @@ def _record(
     }
 
 
-def _emit(stream: IO[str], record: Mapping[str, Any]) -> None:
+def _emit(stream: IO[str], journal: EscalationJournal | None, record: Mapping[str, Any]) -> None:
+    """Every record to ``stream``; failures also to the escalation journal."""
     stream.write(json.dumps(record, default=str) + "\n")
     stream.flush()
+    if journal is not None and record.get("action") == "escalate":
+        journal.append(record)
 
 
 # --------------------------------------------------------------------- cli

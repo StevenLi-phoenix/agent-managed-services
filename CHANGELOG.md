@@ -10,6 +10,13 @@
 ### Added
 
 - `LICENSE`（MIT），`pyproject.toml` 声明 `license = "MIT"`。
+- **escalation 日志**（`ams.escalations`）：每条 escalation 除了写 stdout，还追加到
+  `<state>/logs/escalations.jsonl`（0600，单次 `O_APPEND` 写，超 8 MiB 轮转一代），
+  带 `ts` 与 `source`（`harness` / `core-sync` / `backup`，备份只记失败）。
+- `ams escalations [-n N] [--service ID] [--since ISO] [--json]`：读取该日志；默认的
+  人类可读格式会剥掉终端控制字符（记录里是服务原样输出，不可信）。
+- `docs/agent-loop.md`：决策层是确定性规则，agent 是由人启动、消费 escalation 的操作者
+  会话；为什么不让 LLM 进 suppress-or-fix 循环（日志文本是攻击者可控输入等）；操作流程。
 - `scripts/linux-test.sh`：在宿主本地以 `harness` 身份、`systemd-run -p Delegate=yes`
   跑 Linux 测试；CI 与 `scripts/remote-test.sh` 共用。
 - `deploy/install-host.sh` 新增开关：`AMS_STORE_FS=xfs|plain`（plain 不建 XFS loop
