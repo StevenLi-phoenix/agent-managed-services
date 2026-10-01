@@ -3,6 +3,8 @@ name = "ams"
 version = "1.1.0"
 description = "Agent managed services: rootless supervisor core (userns + cgroup v2)"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = []
 
 [project.optional-dependencies]
@@ -12,7 +14,7 @@ dev = ["pytest>=8", "pytest-timeout>=2", "ruff>=0.5"]
 ams = "ams.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

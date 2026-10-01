@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `LICENSE`（MIT），`pyproject.toml` 声明 `license = "MIT"`。
+
 ## [1.1.0] - 2026-09-29
 
 托管 api v3.x 的 Cordis core（一个 Node 进程 + 插件），即 **core mode**；1.0.0 的
