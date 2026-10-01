@@ -24,6 +24,10 @@
   期间所有服务的日志读取、重启和探测都被推迟。探测超时的 detail 为
   `timed out after Ns (<阶段>)`。`check_tcp` / `check_http` 保留给循环外的一次性调用者，
   复用同一状态机。
+- **XFS reflink 存储变为可选。** pnpm 的 import method 统一为 `clone-or-copy`
+  （`ams.runtime.PNPM_IMPORT_METHOD`）：XFS `reflink=1` 上照样 clone，ext4 等文件系统上
+  复制。此前隔离路径用硬 `clone`，在非 reflink 文件系统上 `pnpm install` 直接失败——
+  这是"必须 XFS"的唯一来源。uv 的 `clone` 本来就会回退到复制。
 - `scripts/remote-test.sh` 不再写死 racknerd：`AMS_HOST=<ssh 主机>`，远端以有免密 sudo
   的登录用户运行 `scripts/linux-test.sh`。
 

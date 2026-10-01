@@ -211,9 +211,10 @@ def test_provisioning_env_pins_clone_link_modes() -> None:
     env = provisioning_env(STORE)
     assert env["UV_CACHE_DIR"] == "/srv/store/uv-cache"
     assert env["UV_PYTHON_INSTALL_DIR"] == "/srv/store/python"
-    # Without these three the store's reflink sharing silently becomes copying.
+    # Reflink where the store can (XFS reflink=1), a plain copy where it cannot:
+    # uv's `clone` falls back by itself; pnpm's hard `clone` would fail on ext4.
     assert env["UV_LINK_MODE"] == "clone"
-    assert env["npm_config_package_import_method"] == "clone"
+    assert env["npm_config_package_import_method"] == "clone-or-copy"
     assert env["npm_config_store_dir"] == "/srv/store/pnpm-store"
     assert env["UV_PYTHON_PREFERENCE"] == "only-managed"
     assert env["PNPM_HOME"] == "/srv/store/pnpm-home"
