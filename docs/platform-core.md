@@ -9,7 +9,7 @@ security model work, and what has not been verified yet.
 
 > **Status (2026-10-01, ams 2.0.0).** Implemented and tested. On an Ubuntu
 > 24.04 host (kernel 7.0, cgroup v2, AppArmor userns restriction on) the whole
-> suite passes as `harness` in a delegated cgroup (996 passed, 10 skipped), and
+> suite passes as `harness` in a delegated cgroup (998 passed, 10 skipped), and
 > an **isolated** end-to-end run against the real api (v3.1.0) passed seven
 > scenarios: bootstrap, idle tick, single-plugin ship, rejected plugin, core
 > release, rollback, harness restart

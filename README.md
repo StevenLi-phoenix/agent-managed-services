@@ -42,8 +42,8 @@ systemd  (只负责让 harness 活着，Delegate=yes)
 
 | | |
 | --- | --- |
-| 可移植测试（macOS，无隔离） | 917 passed / 90 skipped（`.venv/bin/python -m pytest -q`，~40 s） |
-| Linux 实机，全部测试 | **996 passed / 10 skipped**：Ubuntu 24.04.5，kernel 7.0，cgroup v2，`apparmor_restrict_unprivileged_userns=1`，以 `harness` 身份在委托 cgroup 里跑（`scripts/linux-test.sh`）。10 个 skip 是"该宿主没有 XFS reflink / 系统 node / `../api` 检出 / PATH 上的 caddy"这类环境条件 |
+| 可移植测试（macOS，无隔离） | 918 passed / 90 skipped（`.venv/bin/python -m pytest -q`，~40 s） |
+| Linux 实机，全部测试 | **998 passed / 10 skipped**：Ubuntu 24.04.5，kernel 7.0，cgroup v2，`apparmor_restrict_unprivileged_userns=1`，以 `harness` 身份在委托 cgroup 里跑（`scripts/linux-test.sh`）。10 个 skip 是"该宿主没有 XFS reflink / 系统 node / `../api` 检出 / PATH 上的 caddy"这类环境条件 |
 | Linux 实机，core mode 端到端（隔离模式） | 7 个场景全过：首次发布 71 s、空闲 tick 0.15 s 不写文件、单插件内容变更只 ship 它、坏插件被拒只升级一次且不重试、core release（`/health` 断约 2 s）、回滚 3 s、harness 重启后 1 s 恢复。core 以 uid 166560 运行、CapEff 0、NoNewPrivs 1、harness uid 不在映射里、`memory.max`/`swap.max=0` 生效、读不到 harness 的 secret store。证据：`docs/design/evidence/core-e2e-linux-2026-10-01.txt` |
 | CI | `.github/workflows/ci.yml`：可移植测试（Linux + macOS）+ 在 `ubuntu-24.04` runner 上用同样两步装宿主、跑全部测试。**尚未在 GitHub 上跑过**（这个分支还没 push） |
 | 外部安全审计 | 没有。隔离层（~1.6k 行 fork/unshare/newuidmap/cgroup 代码）只有自己的测试和实机验证 |

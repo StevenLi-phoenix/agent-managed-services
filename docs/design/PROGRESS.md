@@ -1197,7 +1197,7 @@ Done:
   `165536:65536` → now `tests/linux/linuxhost.py`; one ownership assertion was wrong
   by design (harness cannot stat into a 0750 `data/`); the reflink measurement was
   fused with staging correctness; a portable test misread a zombie (pytest had become
-  a subreaper) as a survivor. After fixes: **996 passed / 10 skipped** (everything).
+  a subreaper) as a survivor. After fixes: **998 passed / 10 skipped** (everything).
   Isolated core-mode e2e against api v3.1.0, 7 scenarios, all pass
   (`docs/design/evidence/core-e2e-linux-2026-10-01.txt`); it found one real bug
   (gateway: unknown Host got Caddy's empty 200 → entry site is now `http://:<port>`).
@@ -1223,7 +1223,7 @@ Done:
   verified (no production use, no external audit), required vs optional host
   pieces, why not rootless podman / `systemd --user`.
 
-Baselines: macOS 917 passed / 90 skipped (~40 s); Linux host 996 / 10.
+Baselines: macOS 918 passed / 90 skipped (~40 s); Linux host 998 / 10 (996 before the last two tests landed).
 
 Next (user decisions):
 - Push the branch / open a PR so CI runs for real.

@@ -39,12 +39,12 @@ in `docs/design/PROGRESS.md`; releases in `CHANGELOG.md`.
 ```bash
 # Dev env (uv-managed):
 uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install pytest pytest-timeout ruff
-.venv/bin/python -m pytest -q        # portable tests (baseline 2.0.0: 917 passed / 90 skipped on macOS)
+.venv/bin/python -m pytest -q        # portable tests (baseline 2.0.0: 918 passed / 90 skipped on macOS)
 .venv/bin/python -m ruff check . && .venv/bin/python -m ruff format --check src tests
 sudo scripts/linux-test.sh [subdir] [pytest args]      # on a prepared Linux host
 AMS_HOST=<ssh host> scripts/remote-test.sh [subdir]   # same, from a laptop
 ```
-- Host prep for tests, once, as root: `AMS_STORE_FS=plain AMS_WITH_TOOLS=1 AMS_TEST_DEPS=1 AMS_INSTALL_UNIT=0 deploy/install-host.sh`. A prepared Ubuntu 24.04 host runs everything: **996 passed / 10 skipped**. CI runs the same two steps on `ubuntu-24.04`.
+- Host prep for tests, once, as root: `AMS_STORE_FS=plain AMS_WITH_TOOLS=1 AMS_TEST_DEPS=1 AMS_INSTALL_UNIT=0 deploy/install-host.sh`. A prepared Ubuntu 24.04 host runs everything: **998 passed / 10 skipped**. CI runs the same two steps on `ubuntu-24.04`.
 - Linux-marked tests derive uid blocks from the harness's real `/etc/subuid` (`tests/linux/linuxhost.py`); never pin `100000`. Use a **distinct subdir per parallel agent**.
 - **No two test modules may share a basename** (pytest `prepend` import mode, no `__init__.py` in `tests/` — a duplicate aborts the whole suite). Convention: `tests/linux/test_<x>_live.py` or `_linux.py`.
 - Never modify `../api`; e2e runs use a scratch clone and a bare mirror pushed to `<store>/upstream/api.git`.
