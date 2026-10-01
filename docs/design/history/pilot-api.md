@@ -259,7 +259,7 @@ This is a **real gap, not noise** — see §6 item 6.
 
 ## 6. What a full Layer-1 migration would need
 
-Grounded in `.claude/state/api-architecture.md` §2–§6 and in what this pilot hit.
+Grounded in `docs/design/history/api-architecture.md` §2–§6 and in what this pilot hit.
 
 1. **Deployer writes a `service.toml`, not a systemd unit.** The mapping is
    mostly mechanical: `process.exec` → `start.argv` (already a `--factory`

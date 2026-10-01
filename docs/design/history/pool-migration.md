@@ -73,12 +73,12 @@ pages, resume, secretsservice, turingtest) still flow through as
 
 ## Step 1b — "before" measurement, re-taken with a reproducible script
 
-The script that produced `.claude/state/evidence/pool-before-2026-09-03.txt`
+The script that produced `docs/design/history/evidence/pool-before-2026-09-03.txt`
 was not archived, so its exact definitions of `python_processes` and the two
 memory sums cannot be reproduced. Rather than compare an "after" number to a
 method I cannot restate, a fresh **before-recheck** was taken with a script
 that is archived: `/tmp/ams-measure.sh` on the box, copied to
-`.claude/state/evidence/ams-measure.sh`. Definitions:
+`docs/design/history/evidence/ams-measure.sh`. Definitions:
 
 - `layer1_sum_MiB` — sum of `memory.current` over
   `/sys/fs/cgroup/system.slice/ams-harness.service/svc-*` **excluding**
@@ -198,7 +198,7 @@ is `scripts/platform-bootstrap.sh`'s: `git clone --mirror` to a temp dir, then
 `rsync -az --delete` into `<store>/upstream/api.git`. That was reused verbatim.
 
 ```
-git clone --mirror /Users/lishuyu/Codes/AgentManangedServices/api $MIRROR/api.git
+git clone --mirror ~/Codes/api $MIRROR/api.git
 rsync -az --delete "$MIRROR/api.git/" racknerd:/home/harness/store/upstream/api.git/
 ssh racknerd "chown -R harness:harness /home/harness/store/upstream/api.git"
 ```
@@ -349,7 +349,7 @@ probe one line above is unguarded, and `pathlib` re-raises `EACCES` from
 Reproduced directly on the box with the deployed interpreter.
 
 Full analysis, the reproduction, the hypothesised fix and the rejected
-`chmod o+x` workaround are in **`.claude/state/diagnosis-pool-cutover.md`**.
+`chmod o+x` workaround are in **`docs/design/history/diagnosis-pool-cutover.md`**.
 Per T10's scope rules, nothing under `src/` was touched and nothing was patched
 on the box.
 
@@ -458,7 +458,7 @@ stopped) held none. Deterministic, not a race — all 10 members with a database
 will fail their own `mv`, one per invocation.
 
 Full analysis, three ranked fix candidates, and the rejected operator
-workaround are in **`.claude/state/diagnosis-pool-cutover.md`**. Nothing under
+workaround are in **`docs/design/history/diagnosis-pool-cutover.md`**. Nothing under
 `src/` touched, nothing patched on the box.
 
 ### Blast radius: one service, recovered, no data lost

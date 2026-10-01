@@ -64,12 +64,12 @@ unit 设了 `Conflicts=`）。
 | | |
 | --- | --- |
 | 可移植测试 | 1608 passed / 167 skipped（`.venv/bin/python -m pytest -q`） |
-| core mode 本地端到端 | macOS、`--no-isolation`、真实 api（v3.1.0 的 scratch clone）：6 个场景全过——bootstrap 74 s、无变化 tick 0.17 s 且不写任何文件、单插件内容变更只 ship 该插件、坏插件被拒且只升级一次、core release（`/health` 断约 2 s）、`release --rollback` 3 s。证据：`.claude/state/evidence/core-e2e-local-2026-09-29.txt` |
+| core mode 本地端到端 | macOS、`--no-isolation`、真实 api（v3.1.0 的 scratch clone）：6 个场景全过——bootstrap 74 s、无变化 tick 0.17 s 且不写任何文件、单插件内容变更只 ship 该插件、坏插件被拒且只升级一次、core release（`/health` 断约 2 s）、`release --rollback` 3 s。证据：`docs/design/history/evidence/core-e2e-local-2026-09-29.txt` |
 | Linux 隔离路径 | **从未在真机上跑过。** racknerd 复刻环境已拆除，重建它是下一步（由用户决定） |
 | 生产 | 仍是 phm 上的 systemd（不在 ams 范围内，ams 从不连接 phm） |
 
 1.0.0 legacy 模式在 racknerd 上的实测数字（Layer 0、20 个服务的舰队、pools）
-保留在 `.claude/state/platform-layer0.md`、`platform-fleet.md`、
+保留在 `docs/design/history/platform-layer0.md`、`platform-fleet.md`、
 `pool-migration.md`，它们是历史观察值，不是规划常量。
 
 ## 布局
@@ -144,6 +144,6 @@ uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install pytes
 scripts/remote-test.sh              # linux 标记的测试，在目标宿主上跑
 ```
 
-设计决策及其被否决的备选方案在 `.claude/state/DECISIONS.md`（core mode 是
-D31/D32）；进度在 `.claude/state/PROGRESS.md`；core mode 的计划在
-`.claude/state/PLAN-core.md`；变更记录在 `CHANGELOG.md`。
+设计决策及其被否决的备选方案在 `docs/design/DECISIONS.md`（core mode 是
+D31/D32）；进度在 `docs/design/PROGRESS.md`；core mode 的计划在
+`docs/design/PLAN-core.md`；变更记录在 `CHANGELOG.md`。

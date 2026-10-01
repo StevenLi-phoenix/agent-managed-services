@@ -24,7 +24,7 @@ high port and that is one flag, not an architecture.
   `http://<host>:<port>` labels; setting it False emits bare hostnames and
   nothing else changes, pinned by the golden scenario `tls` (DECISIONS D21).
   Subdomain mounts are already real site blocks reachable by Host header, so
-  the flip needs no re-architecture. Live: `.claude/state/platform-layer0.md`
+  the flip needs no re-architecture. Live: `docs/design/history/platform-layer0.md`
   §2, gateway answering on `127.0.0.1:20180` [verified, n=1].
 - **Still required.** Pick one of: `CAP_NET_BIND_SERVICE` on
   `<store>/bin/caddy` (a file capability the harness cannot set itself); a
@@ -42,7 +42,7 @@ high port and that is one flag, not an architecture.
 - **Evidence.** The replica's registry rows carry the **production** URL
   (`https://api.lishuyu.app/kv`) because it comes from the manifest's `mount`
   and the translator copies it verbatim; the replica has no public hostname so
-  nothing consumes it (`.claude/state/platform-layer0.md` §3) [verified].
+  nothing consumes it (`docs/design/history/platform-layer0.md` §3) [verified].
 - **Still required.** Decide whether `endpoint` is derived from the gateway
   config or stays manifest-verbatim. A client that discovers a service and
   follows `endpoint` in a replica would leave the replica — harmless there,
@@ -59,7 +59,7 @@ high port and that is one flag, not an architecture.
 
 - **Evidence.** The translator rewrites any env value under `/var/lib/<n>/` to
   `<root>/data/` with no hand-editing — confirmed live for
-  `KV_DB_PATH` (`.claude/state/platform-layer0.md` §5) [verified, n=1].
+  `KV_DB_PATH` (`docs/design/history/platform-layer0.md` §5) [verified, n=1].
   `<root>/data` is created 0750 by `ensure_service_root` and exported as
   `AMS_DATA_DIR` (D19/T1.3).
 - **Still required.** For each stateful service: stop it, copy the production
@@ -116,7 +116,7 @@ high port and that is one flag, not an architecture.
 - **Evidence.** The one M2M policy row in the replica
   (`timeservice → kvservice`) was **inserted by hand** through the admin
   namespace. `service_policies` has no write API upstream by design; production
-  seeds it through migrations (D24/T3.2, `.claude/state/platform-layer0.md` §4).
+  seeds it through migrations (D24/T3.2, `docs/design/history/platform-layer0.md` §4).
 - **Still required.** A real answer for the fleet. It is arguably not ams's job
   — a policy is a statement about who may call whom, which is registry data,
   not supervisor data (D7). Options: keep it in registry migrations, or add a
@@ -129,7 +129,7 @@ high port and that is one flag, not an architecture.
 
 - **Evidence.** Both are live in the replica. The SDK heartbeats every 30 s
   (`last_seen` 11 s old, proving the thread runs against the replica, not just
-  that registration succeeded — `.claude/state/platform-layer0.md` §3
+  that registration succeeded — `docs/design/history/platform-layer0.md` §3
   [verified]); ams probes independently and drives restarts. `auth` has **no**
   `/health` route and is TCP-probed only (D22).
 - **Still required.** Decide which one an operator and a dashboard believe.
@@ -166,7 +166,7 @@ high port and that is one flag, not an architecture.
 
 - **Evidence.** `StevenLi-phoenix/api` is private: from racknerd anonymous
   HTTPS gets a 404 and `git ls-remote` asks for a username
-  (`.claude/state/platform-layer0.md` §6) [verified]. The harness holds no
+  (`docs/design/history/platform-layer0.md` §6) [verified]. The harness holds no
   credential and none was created — `sources.validate_url` refuses a
   credential-bearing URL. Phase A pushes a bare mirror to
   `<store>/upstream/api.git` and points `SourceMirror` at that local path, a
@@ -186,7 +186,7 @@ high port and that is one flag, not an architecture.
   carry the T1.4 root-logger `basicConfig` patch — that lives on the local
   `ams-platform` branch and was never pushed. Consequence, observed: SDK
   `logger.warning` lines arrive with no level token and are classified INFO
-  (`.claude/state/platform-layer0.md` §6, and the pilot's finding, D15 gap 1)
+  (`docs/design/history/platform-layer0.md` §6, and the pilot's finding, D15 gap 1)
   [verified].
 - **Still required.** Push the branch (user-gated: PLAN "what stays manual") or
   accept that a genuine service warning is invisible to the escalation channel.
@@ -221,7 +221,7 @@ high port and that is one flag, not an architecture.
   blocks carved by a second process were re-carved differently on reload, and
   `ensure_service_root`'s recursive chown then ran in a namespace with no
   authority over the staged files — EPERM on every one
-  (`.claude/state/diagnosis-layer0.md`, with the before/after block table)
+  (`docs/design/history/diagnosis-layer0.md`, with the before/after block table)
   [verified]. `allocate()` now re-reads on a cache miss.
 - **Still required.** An allocation op on the control socket so the harness
   stays the single writer. The re-read **narrows** the window; two processes
@@ -249,14 +249,14 @@ high port and that is one flag, not an architecture.
 
 - **Evidence.** Replica, 1 vCPU / 2 GB: 7 services at 378.9 MiB total harness
   cgroup, registry 92.8 MiB and auth 94.8 MiB **cold** against a 200 M cap;
-  host used 553 → 710 MiB (`.claude/state/platform-layer0.md` §1)
+  host used 553 → 710 MiB (`docs/design/history/platform-layer0.md` §1)
   [verified, n=1]. The pilot showed cold `memory.current` runs ~35 MiB above
   steady because page cache is charged to whoever faults a page in first
-  (`.claude/state/pilot-api.md` §7). PLAN Q8 budgeted 14 processes at ~900 MB
+  (`docs/design/history/pilot-api.md` §7). PLAN Q8 budgeted 14 processes at ~900 MB
   from an n=1 60 MB-per-uvicorn figure, explicitly **not** a planning constant.
   Phase A's own `--only` list in `deploy/ams-platform-sync.service` is the
   measured verdict that 2 GB and one vCPU cannot hold all 21.
-- **Still required.** Fleet numbers from `.claude/state/platform-fleet.md`
+- **Still required.** Fleet numbers from `docs/design/history/platform-fleet.md`
   (T4.1) applied to the production droplet's actual size, plus a decision on
   staggered start — `Assembly.start_all()` starts everything at once and 20
   simultaneous uvicorn imports on one core will blow past `start_period_s`.
@@ -297,7 +297,7 @@ high port and that is one flag, not an architecture.
   Caddy uid, which the harness uid cannot connect to (Q3, D21). Restart is
   <1 s. Note that **Caddy has never reloaded a changed config in the replica** —
   the second bring-up run reported no changes, so only the initial start
-  exercised the path (`.claude/state/platform-layer0.md` §9) [n=0].
+  exercised the path (`docs/design/history/platform-layer0.md` §9) [n=0].
 - **Still required.** Either accept a sub-second gateway blip per config
   change, or implement the admin-socket refinement Q3 names as Phase B work.
 - **Risk.** In production a restart drops in-flight connections.
@@ -348,7 +348,7 @@ give `harness` a dedicated uid there.
 
 - **Auth's user-JWT path is untested, n=0.** No `/health` route, no OAuth in the
   replica (no public callback), so no account can be created
-  (`.claude/state/platform-layer0.md` §9, D22).
+  (`docs/design/history/platform-layer0.md` §9, D22).
 - **`registry-runtime.db`** exists and heartbeats land in it, but nothing has
   verified the runtime/catalog split beyond `last_seen` moving.
 - **The gateway is loopback-only** in Phase A: no TLS, no 80/443, no subdomain

@@ -283,7 +283,7 @@ def ship(state, store, cfg, plugin_ids, *, force=False, isolation=True)     # fo
    the foundation plugins + timeservice live; a second tick with no change writes nothing; a content
    change to one plugin ships only that plugin and it goes live; a deliberately broken plugin build is
    rejected/auto-reverted, escalated once, and not retried on the next tick. Evidence in
-   `.claude/state/evidence/core-e2e-local-2026-09-29.txt`.
+   `docs/design/history/evidence/core-e2e-local-2026-09-29.txt`.
 3. Linux live (racknerd) is **not** part of this run: the host was torn down; re-provisioning it is a user decision.
 4. Docs: `docs/platform-core.md` (new, the end-to-end story), `docs/platform.md` (legacy banner +
    pointer), `README.md`, project `CLAUDE.md`, `CHANGELOG.md` (new, Keep a Changelog, 1.0.0 + 1.1.0),
@@ -295,7 +295,7 @@ def ship(state, store, cfg, plugin_ids, *, force=False, isolation=True)     # fo
 - [x] 2. Merge `origin/security-audit-fixes` (8 commits, 2026-09-05: issues #1 #2 #4 #5 + docs #6–#12); core-mode admin-ns `pnpm install` gets `provisioning_mask` (1c0460e; superseded in step 3: core-mode installs and builds now run as the service, D32)
 - [x] 3. Adversarial review of the full diff → fix (25 findings, 24 applied test-first; D32, CHANGELOG [1.1.0])
 - [x] 4. Local e2e against the real `../api` (`--no-isolation`, node 24.20.0) → evidence file
-  `.claude/state/evidence/core-e2e-local-2026-09-29.txt` (2026-09-30: all six scenarios pass;
+  `docs/design/history/evidence/core-e2e-local-2026-09-29.txt` (2026-09-30: all six scenarios pass;
   two fixes — gate fails fast on a harness-`failed` core; Node trace-warnings hint is INFO)
 - [x] 5. Docs: `docs/platform-core.md`, `docs/platform.md` legacy banner, README, CLAUDE.md, CHANGELOG (merge the branch's), D31, PROGRESS; version 1.1.0 (2026-09-30; suite 1608 passed / 167 skipped)
 - [x] 6. Commit on main

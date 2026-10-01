@@ -200,11 +200,30 @@ def test_run_as_service_timeout_kills_the_whole_group(fake_fork: FakeFork, tmp_p
     grandchild = int(pidfile.read_text())
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        try:
-            os.kill(grandchild, 0)
-        except ProcessLookupError:
+        if _gone(grandchild):
             break
         time.sleep(0.05)
     else:
         os.kill(grandchild, signal.SIGKILL)
         pytest.fail("grandchild survived the timeout")
+
+
+def _gone(pid: int) -> bool:
+    """Dead, or dead and not yet reaped. An earlier test in this process may have
+    made it a child subreaper (``build_supervisor`` does, on Linux): the killed
+    grandchild is then *our* zombie, and ``kill(pid, 0)`` succeeds on a zombie."""
+    try:
+        reaped, _status = os.waitpid(pid, os.WNOHANG)
+        if reaped == pid:
+            return True
+    except ChildProcessError:
+        pass  # not our child; the zombie check below still applies
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] == "Z"

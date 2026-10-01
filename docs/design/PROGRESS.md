@@ -75,7 +75,7 @@ Done:
   tests/linux` 43 passed (includes the iso/alloc/runtime agents' tests).
 - Live on racknerd: `ams-harness.service` **enabled and active** with a `hello`
   http.server on port 20000, uid 100000, memory.max=64M + swap.max=0.
-  Full transcript in `.claude/state/e2e-systemd.md`.
+  Full transcript in `docs/design/history/e2e-systemd.md`.
 
 Two bugs the live run caught (neither reachable from a unit test):
 - `cmd_check_host` called `hostcheck.main()` with no argv; it falls back to
@@ -217,7 +217,7 @@ policy layer rather than special-cased in `DefaultPolicy`: the general rule is
   `timeservice` :20003 uid 103072, both from the `api` monorepo, both healthy,
   ports and uids stable across `systemctl restart ams-harness`. Declarations in
   `examples/api-pilot/`, installer `scripts/pilot-api.sh` (idempotent, 24.7 s
-  cold / 14.2 s warm), full transcript and numbers in `.claude/state/pilot-api.md`.
+  cold / 14.2 s warm), full transcript and numbers in `docs/design/history/pilot-api.md`.
 - Reflink holds for uv projects too: a third replica's venv cost 2.6 MiB of new
   blocks for a 47.3 MiB environment (94.6 % shared, n=1). The *source* copy does
   not share — 31.4 MiB of blocks per service for a 17.4 MiB tree — and is now the
@@ -262,7 +262,7 @@ with `PermissionError`/EACCES — the D4 argument, executed. Suite 280 passed /
 
 Live: pilot rerun with both api replicas taking `SVC_SECRET` from the store,
 values generated on the box and never printed. Details and the leak audit in
-`.claude/state/pilot-api.md`.
+`docs/design/history/pilot-api.md`.
 
 Open / not done: `ams secret` has no `--state-dir`-less discovery of *which*
 services declare secrets (there is no `ams secret check --all`); rotation is
@@ -277,7 +277,7 @@ New: `src/ams/control.py` (unix-socket control channel) and `src/ams/reload.py`
 (declaration reconciliation). `ams ctl <op> [id]` client and the `reload` wiring
 live in `cli.py`; `deploy/ams-harness.service` gained `ExecReload=/bin/kill -HUP
 $MAINPID`. Live verification with real pids, cgroups and ports is in
-`.claude/state/e2e-systemd.md` (session 2).
+`docs/design/history/e2e-systemd.md` (session 2).
 
 Supervisor extension points added rather than letting control.py reach into
 private state: `register_fd(fd, cb, events=, name=)` / `unregister_fd(fd)`
@@ -720,7 +720,7 @@ beside hello/pyhello/kvservice/timeservice — **7 services, all `running`/healt
 The two pilot services were re-pointed at the replica: translated from their
 manifests (no `SVC_DEV`), staged at upstream `main` `5ea3572`, registered in the
 replica registry, heartbeating (`last_seen` 11 s), gateway-routed at `/kv` and
-`/time`. Full transcript with every number: `.claude/state/platform-layer0.md`.
+`/time`. Full transcript with every number: `docs/design/history/platform-layer0.md`.
 
 `src/ams/platform/layer0.py` — `bring_up(state, store, repo_url=..., ref="main")`
 orchestrates 17 named stages (fetch → materialize → bootstrap → allocate →
@@ -741,7 +741,7 @@ credential and none was made. The script pushes a bare mirror to
 the T1.4 SDK root-logger patch, so SDK `logger.warning` is still classified INFO.
 
 **The live gate found two real defects, both outside T3.2's nominal scope, both
-fixed** (diagnosis: `.claude/state/diagnosis-layer0.md`, DECISIONS D24):
+fixed** (diagnosis: `docs/design/history/diagnosis-layer0.md`, DECISIONS D24):
 `UidAllocator.allocate` was not idempotent across processes (the harness never
 re-read `uidmap.json`, so a reload re-carved blocks another process had already
 staged files under — this would have broken T3.1's `ams provision` + `ams ctl
@@ -900,7 +900,7 @@ commands, known gaps), plus rewritten `README.md` and `CLAUDE.md`. Every path an
 command named in them was spot-checked with `ls` or `--help`; the only correction
 that surfaced was `make_extra_env_for` living in `secrets.py`, not `runtime.py`.
 
-`.claude/state/phase-b-prereqs.md`: 21 checklist items across edge/TLS, data
+`docs/design/history/phase-b-prereqs.md`: 21 checklist items across edge/TLS, data
 migration, trust root, secrets and source, lifecycle gaps, capacity, and the
 three decisions the user must sign off (D18 scope, D22 fixed ports, D26 shared
 prefixes), each with the Phase-A evidence cited by state doc, what is still
@@ -909,14 +909,14 @@ required, the risk and the rollback.
 Verified: local suite **993 passed / 110 skipped** (one more landed from a
 concurrent task while this ran), ruff check + format clean on
 `platform/cli.py`, `platform/sync.py` and the new test file. Fleet numbers were
-**not** available — `.claude/state/platform-fleet.md` existed as a skeleton with
+**not** available — `docs/design/history/platform-fleet.md` existed as a skeleton with
 `<!-- TABLE:FLEET -->` placeholders when this task finished, so README carries
 the Layer-0 numbers (n=1, `platform-layer0.md`) and points at the fleet doc for
 the rest.
 
 ## T4.1 (live) — fleet bring-up + resource report (2026-09-02/03)
 
-Full transcript with every table: `.claude/state/platform-fleet.md`. Decisions
+Full transcript with every table: `docs/design/history/platform-fleet.md`. Decisions
 and rejected alternatives: `DECISIONS.md` **D28**.
 
 **20 ams services and 2 static sites run on racknerd** under the live harness,
@@ -1013,7 +1013,7 @@ stay per logical service.
 
 All of T1–T8 are landed and verified by reading the tree, not by report:
 
-- **T0** spike PASSED — `.claude/state/spike-pool.md` (6 members, one loop, RSS
+- **T0** spike PASSED — `docs/design/history/spike-pool.md` (6 members, one loop, RSS
   66 MiB n=3).
 - **T1** `schema.PORT_NAME_RE` widened to 32 chars — `tests/test_schema_portnames.py`.
 - **T2** the pool runner asset — `src/ams/platform/assets/pool_runner.py` (no
@@ -1042,7 +1042,7 @@ All of T1–T8 are landed and verified by reading the tree, not by report:
   derived from the request instead of falling back to `""`.
 - **T9** (this entry): `docs/platform-pools.md` (new), edits to
   `docs/platform.md`, `docs/manifest-translation.md`,
-  `docs/platform-sidecars.md`, `CLAUDE.md`; `.claude/state/DECISIONS.md` D29
+  `docs/platform-sidecars.md`, `CLAUDE.md`; `docs/design/DECISIONS.md` D29
   appended.
 
 Local suite **1193 passed / 122 skipped** (`.venv/bin/python -m pytest -q`,
@@ -1111,7 +1111,7 @@ passthrough; `sync._phase_finish` registers every identity before any health
 gate. Fresh re-run on wiped state: Layer 0 up in 19 s, `pool-core` healthy in
 23 s on one attempt, 13/15 members + llmgateway healthy (resume/secretsservice
 dead as on racknerd), 15/15 routes 200 via Caddy, second tick 1 s. Record:
-`.claude/state/mock-deploy-do.md`, evidence `evidence/mock-do-1gb-2026-09-03.txt`.
+`docs/design/history/mock-deploy-do.md`, evidence `evidence/mock-do-1gb-2026-09-03.txt`.
 Open (D30): standalone services still start before they are registered (one
 crash + 20 s backoff each on a fresh host); node 22 and the timer units are
 hand steps.

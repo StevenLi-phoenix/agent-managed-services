@@ -95,7 +95,7 @@ escalating on failure through the existing JSONL channel. Ends with `ams ctl rel
 Done: a run against a fake repo + fake registry drives every state; a failure injected at each transition
 leaves the state file at the right stage and emits exactly one escalation; a second run is a no-op.
 
-**T3.2 (live) Layer-0 bring-up** — M. Owns: `scripts/platform-bootstrap.sh`, `.claude/state/platform-layer0.md`, and on racknerd only `<state>/services/{registry,auth,caddy}`. Done: registry, auth and Caddy healthy under `ams-harness.service` beside the four existing services; a real
+**T3.2 (live) Layer-0 bring-up** — M. Owns: `scripts/platform-bootstrap.sh`, `docs/design/history/platform-layer0.md`, and on racknerd only `<state>/services/{registry,auth,caddy}`. Done: registry, auth and Caddy healthy under `ams-harness.service` beside the four existing services; a real
 M2M token minted by registry and verified by a service against its own `jwt-rs256.pub`; `curl` through the
 Caddy port reaches a pilot service; transcript with pids, uids, ports and `memory.current`.
 
@@ -111,18 +111,18 @@ Done: `files-web` and `llm-web` render and serve; a service declaring an unset e
 
 ### Wave 4 — full fleet, soak, hardening (4 parallel)
 
-**T4.1 (live) fleet bring-up + resource report** — L. Owns racknerd's state dir for all Layer-1 ids and `.claude/state/platform-fleet.md`. Done: the 10 `services/*` + timeservice up, registered, gateway-routed, `GET /health` 200 through Caddy for
+**T4.1 (live) fleet bring-up + resource report** — L. Owns racknerd's state dir for all Layer-1 ids and `docs/design/history/platform-fleet.md`. Done: the 10 `services/*` + timeservice up, registered, gateway-routed, `GET /health` 200 through Caddy for
 each; a table of per-service `memory.current` and steady-state RSS; then the 7 remaining apps attempted, with
 the outcome reported honestly (n=1 per service).
 
-**T4.2 (live, read-only on services) backup drill** — M. Owns `<state>/platform/backup/` and `.claude/state/platform-backup-drill.md`. Done: a real R2 round trip for every service with a data dir, then a restore of one db into a scratch path
+**T4.2 (live, read-only on services) backup drill** — M. Owns `<state>/platform/backup/` and `docs/design/history/platform-backup-drill.md`. Done: a real R2 round trip for every service with a data dir, then a restore of one db into a scratch path
 with a row-count comparison. Never writes a live service's data dir.
 
 **T4.3 failure injection + rollback** — M. Owns `tests/linux/test_platform_e2e.py` (subdir `ams-e2e`) and `src/ams/platform/rollback.py`. Done: kill a service mid-sync, corrupt a manifest, point at a bad sha, exhaust a memory cap — each produces
 one escalation and touches no other service; `rollback(id)` re-points one service at the previous sha and the
 health gate goes green.
 
-**T4.4 docs + Phase-B audit** — S. Owns `README.md`, `CLAUDE.md`, `docs/platform.md`, `.claude/state/phase-b-prereqs.md`. Done: `docs/platform.md` explains the loop end to end; the Phase-B list below becomes a checklist carrying
+**T4.4 docs + Phase-B audit** — S. Owns `README.md`, `CLAUDE.md`, `docs/platform.md`, `docs/design/history/phase-b-prereqs.md`. Done: `docs/platform.md` explains the loop end to end; the Phase-B list below becomes a checklist carrying
 the evidence Phase A produced for each item.
 
 ---

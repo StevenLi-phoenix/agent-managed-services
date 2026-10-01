@@ -32,6 +32,8 @@ log_cli_level = "DEBUG"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# one-off probe scripts kept as evidence, not maintained code
+extend-exclude = ["docs/design/history"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

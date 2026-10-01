@@ -205,7 +205,7 @@ assumptions / when it breaks. Two sections: **Facts** (verified) and
   no fake heartbeats reach the real registry). Goal: validate rootless userns +
   reflink uv envs + ams port allocation against real FastAPI/SQLite services
   before deciding on replacing the Layer-1 runtime layer (deployer + per-service
-  systemd units + sudo whitelist). Findings go to `.claude/state/pilot-api.md`.
+  systemd units + sudo whitelist). Findings go to `docs/design/history/pilot-api.md`.
 - Rejected for now: full Layer-1 replacement (too much at once); dropping the
   deployer entirely (product thesis, but needs the pilot first); doc-only.
 - Needed a schema/runtime extension: `runtime.sync = true` (uv project mode:
@@ -296,7 +296,7 @@ assumptions / when it breaks. Two sections: **Facts** (verified) and
   them skipped.
 
 ### D18. "All in" accepted (user: 2026-09-02): ams becomes the platform runtime, Phase A = full replica on racknerd
-- Plan of record: `.claude/state/PLAN-allin.md` (4 waves, 16 tasks, Q1–Q9 with
+- Plan of record: `docs/design/history/PLAN-allin.md` (4 waves, 16 tasks, Q1–Q9 with
   rejected alternatives). Key choices carried from it: bare mirror + canonical
   checkout per sha + reflink copy per service, polled `git fetch` from a one-shot
   60 s timer process (no webhook, no inbound port in Phase A); `service.yaml`
@@ -1398,7 +1398,7 @@ real http/tcp check.
 ### D28 (T4.1). Live fleet: a registry burst cap, two Caddy suppressions, and a throttled timer (2026-09-03)
 
 The tier-1 bring-up on racknerd. Every claim below is from a live run; the
-transcript with the tables is `.claude/state/platform-fleet.md`.
+transcript with the tables is `docs/design/history/platform-fleet.md`.
 
 - **`--ref ams-platform`, not `main`, and `--repo` is the local bare mirror.**
   `StevenLi-phoenix/api` is private and the harness holds no credential for it
@@ -1608,7 +1608,7 @@ distinguishes members is the service id it already has** — `SVC_NAME`, the
 registry id, the mount id. Nothing new was invented to tell members apart;
 the only new key says which process a manifest runs in. Full contract:
 `docs/platform-pools.md`. Full design and rejected alternatives:
-`.claude/state/PLAN-pool.md`.
+`docs/design/history/PLAN-pool.md`.
 
 - **The grouping key is `pool = "<name>"` in `service.ams.toml`
   (`static.Overlay.pool`, `static.overlay_pool`), not in `service.yaml`.** The
@@ -1886,7 +1886,7 @@ run: pool members 5.4 ms vs standalone control 5.8 ms via Caddy, n=20).
 **Context.** The user asked for a mock deploy of the api platform "to phm with
 a new DO machine", 1 GB RAM. Everything Phase A knew was learned on racknerd,
 a box hand-configured over two days; the point of the rehearsal is to find
-what only the scripts know. Full record: `.claude/state/mock-deploy-do.md`.
+what only the scripts know. Full record: `docs/design/history/mock-deploy-do.md`.
 
 **Decisions.**
 
@@ -1933,7 +1933,7 @@ safety itself: isolated apply, health check, atomic facade swap, drain,
 60 s probation, auto-revert. Registry, auth, gateway, store, secrets and
 health are plugins inside it. Production runs on phm under systemd
 (`core.service`, `core-ship`, `core-release`, `core-daily-backup`),
-which is out of scope. Plan and interfaces: `.claude/state/PLAN-core.md`.
+which is out of scope. Plan and interfaces: `docs/design/PLAN-core.md`.
 End-to-end story: `docs/platform-core.md`.
 
 **Decision.** A second platform mode, **core mode** (ams 1.1.0):

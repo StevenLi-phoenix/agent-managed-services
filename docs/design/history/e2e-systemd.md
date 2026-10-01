@@ -226,7 +226,7 @@ scripts/remote-test.sh ams-integ tests/linux    # 43 passed
 
 # Round 2 — review fixes + live `ams provision` (2026-09-02, later)
 
-Four items from `.claude/state/review-1.md` folded in, redeployed, and the
+Four items from `docs/design/history/review-1.md` folded in, redeployed, and the
 provisioning path verified live (it was the one thing my first report listed as
 unverified).
 

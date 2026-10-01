@@ -5,7 +5,7 @@ Verdict: **the shape works**, with two corrections to the plan's runner contract
 ## Setup
 Scratch venv `/home/harness/store/scratch-pool` (uv, reflink cache, python 3.12.14,
 uvicorn 0.52.4), 15 Layer-1 projects + sdk installed editable together
-(resolved, no conflicts). Scripts archived in `.claude/state/evidence/`:
+(resolved, no conflicts). Scripts archived in `docs/design/history/evidence/`:
 `pool_probe.py` (Mount variant, alternative A), `pool_spike2.py` (N-ports
 variant, alternative B), `envsurvey.py` (AST survey of env reads).
 

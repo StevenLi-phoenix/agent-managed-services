@@ -10,7 +10,7 @@ Confidence marks: **[verified]** = observed directly, with n. **[weak]** = one
 observation, plausible alternatives remain.
 
 Artefacts: `src/ams/platform/layer0.py`, `scripts/platform-bootstrap.sh`,
-`tests/test_platform_layer0.py`, `.claude/state/diagnosis-layer0.md`.
+`tests/test_platform_layer0.py`, `docs/design/history/diagnosis-layer0.md`.
 
 ---
 
@@ -301,7 +301,7 @@ returns 200 now.
 
 This is **not** PLAN-allin risk 4. Registry and auth start rootless with their
 data outside `/var/lib` on the first attempt, once the harness would let them be
-registered. Full analysis in `.claude/state/diagnosis-layer0.md`; summary:
+registered. Full analysis in `docs/design/history/diagnosis-layer0.md`; summary:
 
 1. **`UidAllocator` was not idempotent across processes.** The harness holds one
    allocator for its lifetime and never re-reads `uidmap.json`, so blocks carved

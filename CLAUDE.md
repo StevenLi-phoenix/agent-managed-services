@@ -17,11 +17,11 @@ in one of two modes (never both on one state dir):
   plus pools and Layer-0 registry/auth. `docs/platform.md`. Kept untouched;
   removal is a 2.0.0 decision.
 
-Read first: `.claude/state/DECISIONS.md` (the why, D1–D32 + open items; core
-mode is D31, its review fixes D32), `.claude/state/PROGRESS.md` (done / next),
-`.claude/state/PLAN-core.md` (core mode's plan and interfaces),
+Read first: `docs/design/DECISIONS.md` (the why, D1–D32 + open items; core
+mode is D31, its review fixes D32), `docs/design/PROGRESS.md` (done / next),
+`docs/design/PLAN-core.md` (core mode's plan and interfaces),
 `docs/platform-core.md` (core mode end to end), `docs/service-declaration.md`.
-Legacy: `.claude/state/PLAN-allin.md`, `.claude/state/PLAN-pool.md`,
+Legacy: `docs/design/history/PLAN-allin.md`, `docs/design/history/PLAN-pool.md`,
 `docs/platform.md`, `docs/platform-sidecars.md`, `docs/manifest-translation.md`,
 `docs/platform-pools.md`. `CHANGELOG.md` (zh, Keep a Changelog) per release.
 
@@ -79,7 +79,7 @@ Legacy: `.claude/state/PLAN-allin.md`, `.claude/state/PLAN-pool.md`,
 - Core-mode modules (portable): `test_platform_core_config.py`, `test_platform_core_cli.py`, `test_platform_core_integration.py`, `test_platform_core_hardening.py`, `test_platform_core_pins.py`, `test_platform_corectl.py`, `test_platform_coresync.py`, `test_platform_coresync_retry.py`, `test_core_plan_asset.py`, `test_core_plan_isolation.py`, `test_platform_gateway_core.py`, `test_platform_backup_core.py`, `test_platform_sources_dest.py`, `test_runtime_node_toolchain.py`, `test_schema_runtime_pins.py`, `test_userns_run_as_service.py`, `test_provisioning_mask_store.py`; Linux-only: `tests/linux/test_run_as_service_live.py`, `tests/linux/test_run_admin_mask_live.py`.
 - Pools modules (portable): `test_schema_portnames.py`, `test_pool_runner_static.py`, `test_platform_pool_translate.py`, `test_platform_overlay_pool.py`, `test_platform_gateway_pool.py`, `test_platform_sync_pool.py`, `test_platform_backup_pool.py`, `test_platform_policy_pool.py`, `test_platform_pool_adopt.py`; Linux-only: `tests/linux/test_pool_runner_live.py`, `tests/linux/test_pool_adopt_live.py`.
 - Baseline: **1608 passed / 167 skipped** locally (2026-09-30, `.venv/bin/python -m pytest -q`, ~160 s), core mode + review fixes + e2e fixes landed.
-- Local core e2e recipe (plain mode, macOS): scratch clone of `../api` (never the real checkout), `AMS_STATE_DIR`/`AMS_STORE_DIR` under a short `/tmp` path (socket limit), `ams run --no-isolation --policy platform` + `ams platform core bootstrap --no-isolation`. Evidence: `.claude/state/evidence/core-e2e-local-2026-09-29.txt`.
+- Local core e2e recipe (plain mode, macOS): scratch clone of `../api` (never the real checkout), `AMS_STATE_DIR`/`AMS_STORE_DIR` under a short `/tmp` path (socket limit), `ams run --no-isolation --policy platform` + `ams platform core bootstrap --no-isolation`. Evidence: `docs/design/history/evidence/core-e2e-local-2026-09-29.txt`.
 
 ## Target host (racknerd, Ubuntu 24.04 — torn down since 2026-09; facts for a rebuild)
 - Harness user `harness` uid 1000, subuid/subgid `100000:65536`; `/home/harness`

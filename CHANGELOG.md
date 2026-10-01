@@ -58,6 +58,11 @@ mode**；core mode 成为唯一的 platform 模式，通用 supervisor 核心与
 
 ### Removed
 
+- `.claude/state/` 不再进版本库：设计记录移到 `docs/design/`（`DECISIONS.md`、
+  `PLAN-core.md`、`PROGRESS.md`），1.0.0 时期的工作笔记与证据移到
+  `docs/design/history/`，加 `docs/design/README.md` 索引；所有引用同步更新，个人
+  绝对路径脱敏。`.gitignore` 改为整体忽略 `.claude/`（`CLAUDE.md` 除外）。
+
 - **legacy manifest mode**（api v2.0.0）整体删除：`ams.platform.{yamlsubset, translate,
   sync, bootstrap, layer0, registryclient, rollback, pool, static}`、`assets/pool_runner.py`；
   CLI `ams platform {sync, status, bootstrap, rollback, pool}`；
@@ -88,7 +93,7 @@ mode**；core mode 成为唯一的 platform 模式，通用 supervisor 核心与
 
 托管 api v3.x 的 Cordis core（一个 Node 进程 + 插件），即 **core mode**；1.0.0 的
 manifest 模式原样保留并标记为 deprecated。端到端说明见 `docs/platform-core.md`，
-设计取舍见 `.claude/state/DECISIONS.md` D31/D32。Linux 隔离路径尚未在真机上跑过
+设计取舍见 `docs/design/DECISIONS.md` D31/D32。Linux 隔离路径尚未在真机上跑过
 （racknerd 已拆除），本地 macOS `--no-isolation` 端到端 6 个场景全部通过。
 
 ### Added

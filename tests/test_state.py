@@ -131,7 +131,7 @@ def test_ensure_preserves_a_deliberate_o_x_on_services(tmp_path: Path):
     point -- including `ams.platform.bootstrap` while services are running --
     and must not take it back: the next spawn of every running service then
     fails with PermissionError on its own interpreter. Observed live on
-    racknerd; see `.claude/state/diagnosis-layer0.md`.
+    racknerd; see `docs/design/history/diagnosis-layer0.md`.
     """
     import stat as _stat
 

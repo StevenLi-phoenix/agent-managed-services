@@ -15,14 +15,14 @@ The platform layer has two modes, never both on one state dir:
   translation, pools, Layer-0 registry/auth. Untouched; removal is a 2.0.0 decision.
 
 `CLAUDE.md` is the fuller companion file (per-module map); keep the two in sync.
-Design decisions + rejected alternatives live in `.claude/state/DECISIONS.md`
-(D1–D32 + open items; core mode is D31/D32); done/next in `.claude/state/PROGRESS.md`;
+Design decisions + rejected alternatives live in `docs/design/DECISIONS.md`
+(D1–D32 + open items; core mode is D31/D32); done/next in `docs/design/PROGRESS.md`;
 releases in `CHANGELOG.md`.
 
 ## Read first (sensitive areas)
-- `.claude/state/DECISIONS.md` — the *why* behind every invariant below.
+- `docs/design/DECISIONS.md` — the *why* behind every invariant below.
 - `docs/platform-core.md` — core mode end to end (layout, `core.toml`, the tick, release gate, content keys, security model, open items).
-- `.claude/state/PLAN-core.md` — core mode's interfaces.
+- `docs/design/PLAN-core.md` — core mode's interfaces.
 - `docs/service-declaration.md` — the `service.toml` schema (incl. `runtime.node/pnpm/build`).
 - Legacy: `docs/platform.md`, `docs/platform-pools.md`, `docs/manifest-translation.md`, `docs/platform-sidecars.md`.
 

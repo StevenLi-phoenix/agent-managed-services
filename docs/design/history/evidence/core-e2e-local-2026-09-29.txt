@@ -1,10 +1,10 @@
 ams core mode — local end-to-end against the real api (PLAN-core §6.2)
 =====================================================================
 Run: 2026-09-29 23:51 → 2026-09-30 00:05 (local, EDT). macOS 26.5 arm64, --no-isolation.
-ams: /Users/lishuyu/Codes/agent-managed-services, main @ 1c0460e + uncommitted working tree
+ams: ~/Codes/agent-managed-services, main @ 1c0460e + uncommitted working tree
      (the review-fix pass), plus the two fixes recorded at the end of this file.
-api: scratch clone `git clone --no-local /Users/lishuyu/Codes/api /tmp/amse2e/work/api-src`
-     at f99fb863 (api v3.1.0). The real /Users/lishuyu/Codes/api was never modified.
+api: scratch clone `git clone --no-local ~/Codes/api /tmp/amse2e/work/api-src`
+     at f99fb863 (api v3.1.0). The real ~/Codes/api was never modified.
      All test commits went to the clone only.
 No secrets in this file: plugins.json and the keys are never printed; `config import` prints names.
 

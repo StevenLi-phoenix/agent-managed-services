@@ -8,8 +8,6 @@ dist/
 build/
 api/
 
-# design records must be tracked despite the global .claude ignore rule
-!.claude/
-.claude/*
-!.claude/state/
+# agent tool state stays local; design records live in docs/design/
+.claude/
 !CLAUDE.md

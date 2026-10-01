@@ -112,7 +112,7 @@ class StateDir:
         platform commands, which run *while services are running*.
         Re-imposing exactly 0750 there took the bit away again, and the next
         spawn of every running service died with ``PermissionError`` on its own
-        interpreter. See `.claude/state/diagnosis-layer0.md` and DECISIONS D24.
+        interpreter. See `docs/design/history/diagnosis-layer0.md` and DECISIONS D24.
         Only ``o+x`` survives; ``o+r`` is never granted or preserved, so these
         directories stay unlistable.
         """

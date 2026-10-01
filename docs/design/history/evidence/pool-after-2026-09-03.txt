@@ -1,4 +1,4 @@
-# Taken with .claude/state/evidence/ams-measure.sh, racknerd, 2026-09-03
+# Taken with docs/design/history/evidence/ams-measure.sh, racknerd, 2026-09-03
 # 08:53-08:55 UTC, fleet idle. pool-core running 15 members (13 ok, 2 failed:
 # resume, secretsservice). n=3, 60 s apart.
 #

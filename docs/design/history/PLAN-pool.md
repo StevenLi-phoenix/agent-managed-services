@@ -6,7 +6,7 @@ Target: cut fleet RSS by running most Layer-1 FastAPI services of the `api`
 monorepo inside **one** ams-declared process, with each logical service still
 distinguishable, routable, registrable and separately health-gated.
 
-Ground truth used: `.claude/state/pool-facts-ams.md`, `.claude/state/pool-facts-api.md`,
+Ground truth used: `docs/design/history/pool-facts-ams.md`, `docs/design/history/pool-facts-api.md`,
 `CLAUDE.md`, `DECISIONS.md` D26/D27, `docs/platform.md`,
 `docs/manifest-translation.md`, `docs/platform-sidecars.md`, plus the targeted
 source reads cited inline. Every claim below is either a file:line read or is
@@ -14,8 +14,8 @@ marked as an inference with its confidence.
 
 ## Live evidence, racknerd, 2026-09-03 — what is settled
 
-**T0 is DONE and PASSED.** Full report: `.claude/state/spike-pool.md`; scripts
-archived at `.claude/state/evidence/{pool_spike2.py, pool_probe.py, envsurvey.py}`.
+**T0 is DONE and PASSED.** Full report: `docs/design/history/spike-pool.md`; scripts
+archived at `docs/design/history/evidence/{pool_spike2.py, pool_probe.py, envsurvey.py}`.
 Setup: one scratch venv (`/home/harness/store/scratch-pool`, uv, reflink cache,
 python 3.12.14, **uvicorn 0.52.4**) with all 15 Layer-1 projects + `sdk`
 installed editable together, resolved with no conflicts.
@@ -959,7 +959,7 @@ Run with `ams platform sync --dry-run` before each state-changing step.
 
 1. **Confirm the roster and the four failures.** `ams platform status` +
    `ams ctl status` on the box; write the actual member list into
-   `.claude/state/pool-migration.md`. The 24/16 counts already reconcile (§7.1);
+   `docs/design/history/pool-migration.md`. The 24/16 counts already reconcile (§7.1);
    what still needs confirming is that `secretsservice` starts **standalone**
    before it is pooled — a member that cannot start alone cannot start in a pool.
 2. **Back up first.** Run the backup unit by hand
@@ -1047,7 +1047,7 @@ T9 wants T1–T8 landed; T10 is last.
 
 | task | state |
 |---|---|
-| T0 | ✅ done, passed (`.claude/state/spike-pool.md`) |
+| T0 | ✅ done, passed (`docs/design/history/spike-pool.md`) |
 | T1 `schema.py` | ✅ landed — `PORT_NAME_RE` widened, `tests/test_schema_portnames.py` |
 | T4 `static.py` | ✅ landed — `pool` in `_OVERLAY_TOP_KEYS`, `_RESERVED_POOL_NAMES`, `tests/test_platform_overlay_pool.py` |
 | T5 `gateway.py` | ✅ landed — `port_owner` in `resolve_ports`, `tests/test_platform_gateway_pool.py` |
@@ -1061,8 +1061,8 @@ contract for the rest.
 
 ### T0 — Spike: does B's serving topology work? ✅ **DONE, PASSED (2026-09-03)**
 
-Report `.claude/state/spike-pool.md`; scripts
-`.claude/state/evidence/{pool_spike2.py, pool_probe.py, envsurvey.py}`.
+Report `docs/design/history/spike-pool.md`; scripts
+`docs/design/history/evidence/{pool_spike2.py, pool_probe.py, envsurvey.py}`.
 6 members on 6 ports in one event loop, n=3 identical runs: every `/health` 200,
 RSS 66 MiB, 3–4 threads, SIGTERM → all stopped in 0.63–0.73 s. Produced the
 three contract changes now folded into §4.2/§4.4/§4.5 and the T11 task below.
@@ -1230,7 +1230,7 @@ return-to.
 
 - **Files**: `docs/platform-pools.md` (new); edits to `docs/platform.md`,
   `docs/manifest-translation.md`, `docs/platform-sidecars.md`, `CLAUDE.md`,
-  `.claude/state/DECISIONS.md` (append D29 from §9), `.claude/state/PROGRESS.md`.
+  `docs/design/DECISIONS.md` (append D29 from §9), `docs/design/PROGRESS.md`.
 - **DoD**: the five losses in §5.9 are stated in `docs/platform-pools.md`; the
   sidecar doc documents `port_owner` as optional-and-version-1; `CLAUDE.md`'s
   layout section names `pool.py` and the assets directory; D29 carries the n=1
@@ -1239,7 +1239,7 @@ return-to.
 
 ### T10 — Live verification on racknerd (last)
 
-- **Files**: `.claude/state/pool-migration.md` (new). No source edits.
+- **Files**: `docs/design/history/pool-migration.md` (new). No source edits.
 - **Do**: (a) the **blocking-I/O audit** of §10 risk 7 — grep every prospective
   member for `urlopen`, `requests.`, sync `httpx.Client`, `sqlite3` outside a
   thread, and `time.sleep` in an `async def`, and report before the cutover;

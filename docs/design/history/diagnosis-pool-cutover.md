@@ -2,7 +2,7 @@
 
 Written 2026-09-03 during T10's live cutover on racknerd. The live cutover is
 **blocked**. The fleet is undamaged: nothing was stopped, moved, copied or
-unlinked. Full session log in `.claude/state/pool-migration.md`.
+unlinked. Full session log in `docs/design/history/pool-migration.md`.
 
 ## The failure signal
 

@@ -2,7 +2,7 @@
 
 Read-only fact-finding for the "run many FastAPI services in one Python
 process" design decision. No proposal here, only verified facts (with
-method/confidence noted). Repo: `/Users/lishuyu/Codes/AgentManangedServices/api`,
+method/confidence noted). Repo: `~/Codes/api`,
 branch `ams-platform`, HEAD `93709211bf37` (2026-09-02 22:16:42 -0400),
 working tree clean at time of survey.
 

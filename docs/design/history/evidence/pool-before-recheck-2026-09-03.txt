@@ -1,4 +1,4 @@
-# Re-taken with .claude/state/evidence/ams-measure.sh (this script IS archived).
+# Re-taken with docs/design/history/evidence/ams-measure.sh (this script IS archived).
 # racknerd, 2026-09-03 07:57-07:59 UTC, fleet idle, 20 services running,
 # 4 failed (displayservice, oss, resume, secretsservice). n=3, 60 s apart.
 == sample 1 07:57:45

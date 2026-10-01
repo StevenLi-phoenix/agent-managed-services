@@ -309,7 +309,7 @@ _TLS_MSG_RE = re.compile(r"\b(tls|certificates?|acme)\b", re.IGNORECASE)
 # configuration the operator chose. Added at T4.1 after the live run: with only
 # `_TLS_MSG_RE` in place, `admin off` (D21/Q3) escalated on every Caddy start
 # and the SIGTERM line on every stop — 2 of the 4 warnings
-# `.claude/state/platform-layer0.md` §7 classified as noise. Matched on the
+# `docs/design/history/platform-layer0.md` §7 classified as noise. Matched on the
 # message, not the logger, because `admin` is also the logger of real admin-API
 # errors we do want to hear about.
 _DELIBERATE_MSG_RE = re.compile(

@@ -10,7 +10,7 @@ security model work, and what has not been verified yet.
 > **Status (2026-09-30).** Implemented and tested: 1608 portable tests pass,
 > and a local end-to-end run against the real api on macOS in plain mode
 > (`--no-isolation`) passed all six scenarios
-> (`.claude/state/evidence/core-e2e-local-2026-09-29.txt`). **The Linux
+> (`docs/design/history/evidence/core-e2e-local-2026-09-29.txt`). **The Linux
 > isolation path (user namespaces, `run_as_service`, uid blocks) has never
 > run live.** The racknerd host was torn down, and re-provisioning it is the
 > next step. Read the security section with that in mind.
@@ -596,7 +596,7 @@ and store need not share a filesystem), and corectl runs through
 `plain_runner`. Pair it with `ams run --no-isolation --policy platform`,
 which since 1.1.0 loads the runtime layer, so a managed-Node service finds
 its `node` on PATH. The local end-to-end run used exactly this, with a
-scratch clone of api; `/Users/lishuyu/Codes/api` itself was never touched.
+scratch clone of api; `~/Codes/api` itself was never touched.
 
 ## Deploying on a host
 

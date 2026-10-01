@@ -371,7 +371,7 @@ def test_allocate_sees_a_block_another_process_carved_after_load(tmp_path: Path)
     startup, carved a *different* block for an id the other process had already
     staged files under, and `ensure_service_root`'s recursive chown then ran in a
     namespace with no authority over those files. See
-    `.claude/state/diagnosis-layer0.md`.
+    `docs/design/history/diagnosis-layer0.md`.
     """
     state_path = tmp_path / "uidmap.json"
     harness = _allocator_from_state(tmp_path, state_path)
