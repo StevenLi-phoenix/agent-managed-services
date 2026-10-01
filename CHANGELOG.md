@@ -17,6 +17,13 @@
 
 ### Changed
 
+- **tcp/http 健康探测不再阻塞 supervisor 循环。** 每次探测是一个 `ams.health.Probe`：
+  非阻塞 socket + 小状态机（connect → send → 读状态行），注册进 supervisor 自己的
+  selector，`deadline` 并入计时器；一个永不应答的 `/health` 只占一个 fd 和一个计时器。
+  此前 http 探测内联调用 `http.client`，每次最多阻塞整个循环 `health.timeout_s`，
+  期间所有服务的日志读取、重启和探测都被推迟。探测超时的 detail 为
+  `timed out after Ns (<阶段>)`。`check_tcp` / `check_http` 保留给循环外的一次性调用者，
+  复用同一状态机。
 - `scripts/remote-test.sh` 不再写死 racknerd：`AMS_HOST=<ssh 主机>`，远端以有免密 sudo
   的登录用户运行 `scripts/linux-test.sh`。
 
