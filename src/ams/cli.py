@@ -97,8 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--policy",
         choices=("default", "platform"),
         default="default",
-        help="decision policy: 'platform' adds cause dedupe, the post-sync health "
-        "gate and the Caddy/registry rules (ams.platform.policy)",
+        help="decision policy: 'platform' adds cause dedupe and the Caddy rules "
+        "(ams.platform.policy)",
     )
     p_run.add_argument("--log-level", default="INFO")
 
@@ -676,8 +676,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             return EXIT_UNAVAILABLE
         from ams.platform.policy import make_policy
 
-        platform_policy = make_policy(state, escalation=escalation)
-        log.info("platform policy: cause dedupe, post-sync health gate, caddy/registry rules")
+        platform_policy = make_policy(escalation=escalation)
+        log.info("platform policy: cause dedupe, caddy rules")
     try:
         asm = build_supervisor(
             state,

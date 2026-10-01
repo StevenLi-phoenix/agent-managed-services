@@ -147,10 +147,6 @@ EXCLUDED_DB_NAMES = frozenset({"registry-runtime.db"})
 #: `<root>/data` -- must stay in step with `ams.userns.DATA_DIRNAME`.
 DATA_DIRNAME = "data"
 
-#: `<root>/pool.json` -- written by the translator for a pool service
-#: (PLAN-pool §3.3). Only the member ids matter here.
-POOL_MANIFEST_FILENAME = "pool.json"
-
 #: Directory names under `<root>/data/**` holding immutable, content-named
 #: files (core's store, oss and pages plugins). Copied, never archived.
 BYTE_STORE_NAMES = ("blobs", "oss-bytes", "pages-content")
@@ -287,15 +283,13 @@ class BackupConfig:
         return f"{self.remote}:{self.bucket}/{self.prefix}/"
 
     def byte_store_remote(self, store: ByteStore) -> str:
-        """`<remote>:<bucket>/<bytes_prefix>/<label-or-id>/<path under data>`.
+        """`<remote>:<bucket>/<bytes_prefix>/<service-id>/<path under data>`.
 
         The path under the data dir, not just the store's name: it is what a
         restore copies back to, 1:1, and two stores of one service can never
         merge into one key space.
         """
-        return (
-            f"{self.remote}:{self.bucket}/{self.bytes_prefix}/{store.effective_label}/{store.rel}"
-        )
+        return f"{self.remote}:{self.bucket}/{self.bytes_prefix}/{store.service_id}/{store.rel}"
 
 
 def default_rclone_path(store: RuntimeStore | None = None) -> Path:
@@ -311,40 +305,24 @@ def default_rclone_path(store: RuntimeStore | None = None) -> Path:
 
 @dataclass(frozen=True)
 class Target:
-    """One database to back up, plus the uid block needed to read it.
-
-    ``label`` is the pool member id when this db was found under a pooled
-    service's `data/<member>/` (PLAN-pool §5.6); empty for every non-pooled
-    service, and for a db under a pool root that is not in any member's data
-    dir (it keeps the pool's own id). ``service_id`` always stays the id the
-    harness actually supervises -- the one with the allocated uid block -- so
-    a pooled member's `Target` still carries the pool's process id there.
-    """
+    """One database to back up, plus the uid block needed to read it."""
 
     service_id: str
     db_path: Path
     block: UidBlock
-    label: str = ""
 
     @property
     def stem(self) -> str:
         """`app.sqlite3` -> `app`. One suffix only; a dotted db name keeps its dots."""
         return self.db_path.name.rsplit(".", 1)[0]
 
-    @property
-    def effective_label(self) -> str:
-        """The id used in the archive name and remote key: ``label`` or ``service_id``."""
-        return self.label or self.service_id
-
     def archive_name(self, stamp: str) -> str:
-        """`<label-or-id>-<db-stem>-YYYYMMDD.db.gz`.
+        """`<service-id>-<db-stem>-YYYYMMDD.db.gz`.
 
-        The label (or, unpooled, the service id) is in the object name as well
-        as the key prefix so a downloaded file is still self-identifying on an
-        operator's laptop, and so a pool member's key stays exactly what it was
-        before pooling (PLAN-pool §5.6).
+        The service id is in the object name as well as the key prefix so a
+        downloaded file is still self-identifying on an operator's laptop.
         """
-        return f"{self.effective_label}-{self.stem}-{stamp}.db.gz"
+        return f"{self.service_id}-{self.stem}-{stamp}.db.gz"
 
 
 def discover(
@@ -380,7 +358,6 @@ def discover(
         if block is None:
             log.warning("%s: no uid block allocated; cannot read %s", service_id, data_dir)
             continue
-        members = _pool_members(service_root)
         result = run_admin_fn(_find_argv(data_dir), block, timeout_s=timeout_s)
         if not result.ok:
             log.warning(
@@ -392,57 +369,13 @@ def discover(
             )
             continue
         for path in _parse_find_output(result.stdout, data_dir, service_id):
-            label = _label_for(path, data_dir, members)
-            targets.append(Target(service_id=service_id, db_path=path, block=block, label=label))
+            targets.append(Target(service_id=service_id, db_path=path, block=block))
     targets.sort(key=lambda t: (t.service_id, str(t.db_path)))
     if wanted:
         found = {t.service_id for t in targets}
         for service_id in sorted(wanted - found):
             log.warning("%s: no database found (requested with --only)", service_id)
     return targets
-
-
-def _pool_members(service_root: Path) -> set[str] | None:
-    """The member ids named in `<service_root>/pool.json`, or None if absent,
-    unreadable or malformed (PLAN-pool §5.6 -- non-pooled services must be
-    byte-identical to today, so anything but a well-formed manifest is treated
-    as "not a pool" rather than raised).
-    """
-    try:
-        data = json.loads((service_root / POOL_MANIFEST_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    members = data.get("members")
-    if not isinstance(members, list):
-        return None
-    ids = {
-        member.get("id")
-        for member in members
-        if isinstance(member, dict) and isinstance(member.get("id"), str)
-    }
-    return ids or None
-
-
-def _label_for(path: Path, data_dir: Path, members: set[str] | None) -> str:
-    """The pool member id owning ``path``, or "" (= keep the pool's own id).
-
-    A db two levels under `data_dir` (`data/<member>/x.db`) whose first
-    component names a known member gets that member as its label. Anything
-    else -- a bare `data/x.db`, or a subdir that is not in the member list --
-    keeps the pool id, exactly like an unpooled service.
-    """
-    if not members:
-        return ""
-    try:
-        rel_parts = path.relative_to(data_dir).parts
-    except ValueError:
-        return ""
-    if len(rel_parts) < 2:
-        return ""
-    member = rel_parts[0]
-    return member if member in members else ""
 
 
 def _find_argv(data_dir: Path) -> list[str]:
@@ -485,20 +418,14 @@ def _parse_find_output(stdout: bytes, data_dir: Path, service_id: str) -> list[P
 class ByteStore:
     """One immutable byte-store directory to copy, plus the block to read it.
 
-    ``rel`` is the directory's path under the data dir -- or under
-    `data/<member>/` when ``label`` names a pool member, mirroring `Target` --
-    and becomes the tail of its remote key (`BackupConfig.byte_store_remote`).
+    ``rel`` is the directory's path under the data dir and becomes the tail of
+    its remote key (`BackupConfig.byte_store_remote`).
     """
 
     service_id: str
     path: Path
     block: UidBlock
     rel: str
-    label: str = ""
-
-    @property
-    def effective_label(self) -> str:
-        return self.label or self.service_id
 
 
 def discover_byte_stores(
@@ -541,12 +468,9 @@ def discover_byte_stores(
                 result.stderr.decode(errors="replace").strip() or "(no stderr)",
             )
             continue
-        members = _pool_members(service_root)
         for path in _parse_byte_store_output(result.stdout, data_dir, service_id, extra):
-            label = _label_for(path, data_dir, members)
-            base = data_dir / label if label else data_dir
-            rel = path.relative_to(base).as_posix()
-            stores.append(ByteStore(service_id, path, block, rel, label))
+            rel = path.relative_to(data_dir).as_posix()
+            stores.append(ByteStore(service_id, path, block, rel))
     stores.sort(key=lambda s: (s.service_id, str(s.path)))
     log.info("found %d byte store(s)", len(stores))
     return stores
@@ -1176,9 +1100,9 @@ def _run_one(
     try:
         gz = snapshot(target, workdir, stamp=stamp, run_admin_fn=run_admin_fn, python=python)
         size = gz.stat().st_size
-        remote_object = cfg.remote_object(target.effective_label, gz.name)
+        remote_object = cfg.remote_object(target.service_id, gz.name)
         if not dry_run:
-            upload(gz, target.effective_label, cfg, creds, runner=runner)
+            upload(gz, target.service_id, cfg, creds, runner=runner)
         return TargetResult(
             service_id=target.service_id,
             db=str(target.db_path),

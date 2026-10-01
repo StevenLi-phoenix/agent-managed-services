@@ -1,8 +1,5 @@
-"""PORT_NAME_RE widening: pool member ids can be up to 32 chars (SERVICE_ID_RE),
-so a port name derived from a member id must also allow up to 32 chars.
-
-See .claude/state/PLAN-pool.md §3.3 and §5.1.
-"""
+"""PORT_NAME_RE: a port name may be as long as a service id (32 chars), so a
+port named after a service always validates. Every shipped example loads."""
 
 from pathlib import Path
 
@@ -10,8 +7,7 @@ import pytest
 
 from ams.schema import DeclError, expand_ports, loads
 
-GOLDEN_DIR = Path(__file__).parent / "golden" / "platform"
-GOLDEN_TOMLS = sorted(GOLDEN_DIR.glob("*.toml"))
+EXAMPLES = sorted((Path(__file__).parents[1] / "examples").rglob("service.toml"))
 
 
 def _decl(port_name: str) -> str:
@@ -45,6 +41,10 @@ def test_32_char_port_name_expands_in_argv():
     assert expanded == "8123"
 
 
-@pytest.mark.parametrize("path", GOLDEN_TOMLS, ids=lambda p: p.name)
-def test_golden_platform_declarations_still_load(path: Path):
+@pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.parent.name)
+def test_example_declarations_load(path: Path):
     loads(path.read_text())
+
+
+def test_there_are_examples_to_load():
+    assert EXAMPLES, "examples/**/service.toml went missing"

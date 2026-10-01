@@ -1,15 +1,14 @@
-"""Platform decision policy: dedupe by cause, gate on post-sync health, tame Caddy.
+"""Platform decision policy: dedupe by cause, tame Caddy.
 
 `DefaultPolicy` is deliberately memoryless -- it judges one event against one
 `ServiceContext` and never looks at what it said a second ago. That is the right
-core behaviour, and it is the wrong *fleet* behaviour: 21 services behind one
-gateway produce the same cause hundreds of times (a heartbeat against a registry
-that has not started, an access log line per request, a crash loop restarting on
-a 1 s backoff), and an escalation channel that repeats one cause 300 times is
-indistinguishable from no escalation channel at all.
+core behaviour, and the wrong behaviour for a long-running platform: one cause
+(a crash loop restarting on a 1 s backoff, an upstream that is down for every
+request) repeats hundreds of times, and an escalation channel that repeats one
+cause 300 times is indistinguishable from no escalation channel at all.
 
 `PlatformPolicy` wraps `DefaultPolicy` -- it always delegates first and then
-refines -- and adds four things the platform needs:
+refines -- and adds two things:
 
 1. **Dedupe by cause.** A *cause key* is ``(service_id, kind, normalized text)``
    where the normalizer strips timestamps, pids, ports, hex ids and numbers of
@@ -17,20 +16,10 @@ refines -- and adds four things the platform needs:
    "which pid" collapse to one cause. A cause escalates once per ``window_s``;
    later occurrences become ``LOG`` with ``reason="deduped (n=k)"``, and when the
    window closes a single summary escalation says "repeated k times in window".
-2. **A post-sync health gate.** `<state>/platform/state.json`
-   (`docs/platform-sidecars.md`, written by `ams.platform.sync`, T3.1) says which
-   sha each service is being driven to and when it entered its current stage. A
-   service that has not reached ``healthy`` within ``health_grace_s`` of that
-   stage escalates once, carrying **both** ``sha`` and ``prev_sha`` and the
-   suggested action "rollback to prev_sha". The rollback itself is T4.3; this
-   module only recommends, it never acts.
-3. **Caddy.** Caddy is not an SDK service: it writes one JSON object per line
-   (`[logging] format = "json"`, D21/D19). Access lines below 500 are noise,
-   500s are the interesting ones (deduped per path+status), and TLS warnings are
-   expected in Phase A, which is plain HTTP by decision (D21).
-4. **Registry heartbeat noise.** Every SDK service heartbeats to the registry.
-   Until the registry answers, every one of them logs a connection-refused error
-   per interval -- an accurate report of a condition nobody needs told 20 times.
+2. **Caddy.** Caddy writes one JSON object per line (`[logging] format =
+   "json"`). Access lines below 500 are noise, 500s are the interesting ones
+   (deduped per path+status), and TLS warnings are expected: the gateway is
+   plain HTTP by decision (TLS terminates at Cloudflare / the tunnel).
 
 Trust boundary, unchanged from `ams.decision`: log text comes from the supervised
 process. This module only *matches* and *counts* it. The single `json.loads` here
@@ -48,8 +37,6 @@ import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from ams.decision import (
@@ -62,18 +49,14 @@ from ams.decision import (
 )
 from ams.events import Event, HealthChanged, LogLine, ServiceExited, Severity
 from ams.schema import DeclError, ServiceDecl, StartSpec
-from ams.state import StateDir
 
 log = logging.getLogger("ams.platform.policy")
 
 __all__ = [
     "CADDY_SERVICE_ID",
-    "DEFAULT_HEALTH_GRACE_S",
     "DEFAULT_WINDOW_S",
-    "REGISTRY_SERVICE_ID",
     "DedupeSummary",
     "DedupeVerdict",
-    "DedupingEscalation",
     "EscalationDeduper",
     "EscalationRecord",
     "PlatformPolicy",
@@ -81,20 +64,13 @@ __all__ = [
     "cause_key_for_event",
     "make_policy",
     "normalize_cause_text",
-    "platform_state_path",
 ]
 
 # 10 minutes: long enough that a 10 s health probe or a 1 s restart backoff
 # cannot refill the channel, short enough that a condition still true after it
 # gets said again rather than going quiet forever. See DECISIONS D24.
 DEFAULT_WINDOW_S = 600.0
-# 5 minutes after a sync stage began. `start_period_s` for the fleet is 120 s
-# (PLAN-allin Q8), so this leaves room for a slow first start plus one restart
-# before the gate calls it a failure.
-DEFAULT_HEALTH_GRACE_S = 300.0
-
 CADDY_SERVICE_ID = "caddy"
-REGISTRY_SERVICE_ID = "registry"
 
 # Cause keys are compared as whole strings; a very long line (a traceback body,
 # a 4 KiB JSON blob) is truncated so the key stays bounded. Two causes sharing
@@ -233,12 +209,6 @@ class _Window:
 class EscalationDeduper:
     """Counts occurrences of a cause key inside a rolling window.
 
-    Standalone on purpose: `PlatformPolicy` uses it for supervisor events, and
-    `ams.platform.sync` (T3.1) can wrap it around its own JSONL sink with
-    `DedupingEscalation` -- its `PlatformSync` records never pass through the
-    supervisor, so its repeated translate/provision failures need the same
-    treatment from a different direction.
-
     Time is always passed in, never read: the policy owns the clock so tests can
     inject one.
     """
@@ -301,50 +271,6 @@ class EscalationRecord:
     ctx: ServiceContext
 
 
-@dataclass
-class DedupingEscalation:
-    """An `Escalation` that drops repeats of a cause and summarizes on `flush`.
-
-    For callers that produce escalations *outside* the supervisor loop -- the
-    sync loop's `PlatformSync` records, which arrive as JSONL on stdout and never
-    reach a `DecisionPolicy`. Wrap the real sink, keep escalating, call `flush`
-    once per tick.
-    """
-
-    inner: Escalation
-    deduper: EscalationDeduper = field(default_factory=EscalationDeduper)
-    clock: Callable[[], float] = time.time
-    kind: str | None = None  # override the event-class kind in the cause key
-
-    _seen: dict[str, EscalationRecord] = field(default_factory=dict, init=False, repr=False)
-
-    def escalate(self, event: Event, decision: Decision, ctx: ServiceContext) -> None:
-        now = self.clock()
-        key = cause_key_for_event(event, self.kind)
-        verdict = self.deduper.observe(key, now)
-        if verdict.first:
-            self._seen[key] = EscalationRecord(event, decision, ctx)
-            self.inner.escalate(event, decision, ctx)
-        else:
-            log.debug("deduped (n=%d) %s", verdict.count, key)
-
-    def flush(self, now: float | None = None) -> list[EscalationRecord]:
-        """Emit one summary per closed window. Returns what was emitted."""
-        moment = self.clock() if now is None else now
-        out: list[EscalationRecord] = []
-        for summary in self.deduper.expire(moment):
-            seed = self._seen.pop(summary.key, None)
-            ctx = seed.ctx if seed is not None else _placeholder_ctx(summary.service_id)
-            record = EscalationRecord(
-                LogLine(summary.service_id, "stderr", summary.text, Severity.WARNING, ts=moment),
-                Decision(Action.ESCALATE, f"{summary.count} occurrences in one window"),
-                ctx,
-            )
-            out.append(record)
-            _safe_escalate(self.inner, record)
-        return out
-
-
 def _safe_escalate(sink: Escalation, record: EscalationRecord) -> None:
     try:
         sink.escalate(record.event, record.decision, record.ctx)
@@ -361,17 +287,14 @@ _PLACEHOLDER_ARGV = ("<platform-policy>",)
 def _placeholder_ctx(service_id: str) -> ServiceContext:
     """A context for a service the policy has never seen an event from.
 
-    The health gate reads `state.json`, which can name a service that has not
-    started yet (or one whose declaration failed to load), and the `Escalation`
-    protocol wants a `ServiceContext` regardless. Same shape as the supervisor's
-    `_ORPHAN_CTX`.
+    A window summary can outlive the last context seen for its service, and the
+    `Escalation` protocol wants a `ServiceContext` regardless. Same shape as the
+    supervisor's `_ORPHAN_CTX`.
     """
     try:
         decl = ServiceDecl(id=service_id, start=StartSpec(argv=_PLACEHOLDER_ARGV))
     except DeclError:
-        # An id out of `SERVICE_ID_RE` cannot come from our own sync loop, but
-        # the file is on disk and could have been edited. Do not raise inside a
-        # decision path over it.
+        # Do not raise inside a decision path over an id that cannot be declared.
         decl = ServiceDecl(id="unknown", start=StartSpec(argv=_PLACEHOLDER_ARGV))
     return ServiceContext(decl)
 
@@ -424,90 +347,6 @@ def _caddy_path(obj: dict[str, Any]) -> str:
     return "-"
 
 
-# ------------------------------------------------------- registry heartbeat noise
-
-_HEARTBEAT_RE = re.compile(
-    r"\b(heartbeat|heartbeats|acl[-_ ]?refresh|refresh[-_ ]?acl|service[-_ ]?registration)\b",
-    re.IGNORECASE,
-)
-_REFUSED_RE = re.compile(
-    r"(connection\s+refused|econnrefused|errno\s+111|"
-    r"max\s+retries\s+exceeded|failed\s+to\s+establish\s+a\s+new\s+connection|"
-    r"connection\s+aborted|cannot\s+connect)",
-    re.IGNORECASE,
-)
-
-
-# --------------------------------------------------------------- platform state
-
-
-def platform_state_path(state: StateDir) -> Path:
-    """`<state>/platform/state.json` -- the sync loop's fleet record (T3.1)."""
-    return state.root / "platform" / "state.json"
-
-
-def _mount_sidecar_path(state: StateDir, service_id: str) -> Path:
-    """`<state>/platform/mounts/<id>.json` (`docs/platform-sidecars.md`)."""
-    return state.root / "platform" / "mounts" / f"{service_id}.json"
-
-
-def _is_static_mount(state: StateDir, service_id: str) -> bool:
-    """Whether the mount sidecar for ``service_id`` declares ``kind: static``.
-
-    A ``kind: static`` mount has no process and no registry record, so
-    ``declared`` is its terminal stage (`docs/platform-sidecars.md`,
-    `sync._phase_declare`) -- reaching it is success, not a sync stuck partway.
-    Absent or malformed sidecar -> False (fail-safe): the caller then falls back
-    to treating the record as an ordinary service, which is the behaviour that
-    existed before this check (DECISIONS D28 open item).
-    """
-    try:
-        data = json.loads(_mount_sidecar_path(state, service_id).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError):
-        return False
-    return isinstance(data, dict) and data.get("kind") == "static"
-
-
-def _pool_suffix(record: dict[str, Any]) -> str:
-    """`" (pool of N: a, b, c)"`, or `""` when the record names no pool members.
-
-    A pool's `ServiceRecord` carries `pool_members` (PLAN-pool §5.7, written by
-    `ams.platform.sync` -- not this module's job to write, only to read
-    defensively). Reading it here turns "one process crashed" into "N services
-    are down", which is the whole point of surfacing it in the crash-loop
-    escalation rather than leaving an operator to go look up the pool roster.
-    """
-    members = record.get("pool_members")
-    if not isinstance(members, list):
-        return ""
-    names = [m for m in members if isinstance(m, str)]
-    if not names:
-        return ""
-    return f" (pool of {len(names)}: {', '.join(names)})"
-
-
-def _parse_iso_z(value: Any) -> float | None:
-    """`2026-09-02T13:04:07Z` -> epoch seconds, or None for anything else.
-
-    The sidecar contract says UTC ISO-8601 with a `Z`, second precision. A value
-    that is not that is a corrupt record, and a corrupt record must not make the
-    gate fire (or not fire) on a guess -- it returns None and the service is
-    skipped, which the caller logs.
-    """
-    if not isinstance(value, str) or not value:
-        return None
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        moment = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
-    return moment.timestamp()
-
-
 # --------------------------------------------------------------------- policy
 
 
@@ -525,42 +364,30 @@ class PlatformPolicy:
     `DefaultPolicy` behaviour survives verbatim: self-probe suppression (D19),
     `expected` exits logged rather than restarted, exits following the
     declaration's restart policy. This class only ever turns an `ESCALATE` into a
-    `LOG` (dedupe, heartbeat noise) or a `SUPPRESS`/`ESCALATE` for Caddy's own
+    `LOG` (dedupe) or a `SUPPRESS`/`ESCALATE` for Caddy's own
     JSON, and it never changes a `RESTART` or a `STOP` -- those drive supervisor
     behaviour, and a policy that quietly stopped restarting a service to reduce
     log volume would be a much worse bug than the noise it fixed.
 
-    Escalations this class *adds* (a crash loop after a sync, a health-gate
-    failure, a window summary) cannot be returned as a `Decision`: one event
-    yields one decision, and the crash-loop case must still return the `RESTART`
-    the supervisor needs. They are queued and drained by `flush`.
+    The escalation this class *adds* (a window summary) cannot be returned as a
+    `Decision`: one event yields one decision. It is queued and drained by
+    `flush`.
 
-    `flush(now)` is the tick: it runs the health gate, closes expired dedupe
-    windows and emits everything queued. `ams run --policy platform` wires it
+    `flush(now)` is the tick: it closes expired dedupe windows and emits
+    everything queued. `ams run --policy platform` wires it
     into `Supervisor.run_forever(on_iteration=...)`, which runs after every
     select() iteration -- call it yourself if you drive the supervisor directly.
     """
 
-    state: StateDir | None = None
     base: DecisionPolicy = field(default_factory=DefaultPolicy)
     window_s: float = DEFAULT_WINDOW_S
-    health_grace_s: float = DEFAULT_HEALTH_GRACE_S
     caddy_service_id: str = CADDY_SERVICE_ID
-    registry_service_id: str = REGISTRY_SERVICE_ID
     clock: Callable[[], float] = time.time
     escalation: Escalation | None = None
 
     _deduper: EscalationDeduper = field(init=False, repr=False)
     _pending: list[EscalationRecord] = field(default_factory=list, init=False, repr=False)
     _last_ctx: dict[str, ServiceContext] = field(default_factory=dict, init=False, repr=False)
-    _registry_ready_at: float | None = field(default=None, init=False, repr=False)
-    # (service_id, sha, stage) already reported by the health gate. Not the
-    # deduper: the gate says "escalate ONCE", and a condition keyed on the sha
-    # re-arms when the sync loop moves the service, not when a clock runs out.
-    _gated: set[tuple[str, str, str]] = field(default_factory=set, init=False, repr=False)
-    _state_cache: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
-    _state_cache_key: tuple[int, int] | None = field(default=None, init=False, repr=False)
-    _state_warned: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._deduper = EscalationDeduper(self.window_s)
@@ -572,7 +399,6 @@ class PlatformPolicy:
         service_id = getattr(event, "service_id", "") or ""
         if service_id:
             self._last_ctx[service_id] = ctx
-        self._note_registry_ready(event, now)
 
         base = self.base.decide(event, ctx)
         refined = self._refine(event, ctx, base, now)
@@ -588,14 +414,13 @@ class PlatformPolicy:
     # ------------------------------------------------------------------- the tick
 
     def flush(self, now: float | None = None) -> list[EscalationRecord]:
-        """Run the health gate, close expired windows, emit everything queued.
+        """Close expired windows, emit everything queued.
 
         Returns the records emitted. When `escalation` is set they have already
         been handed to it; the return value is for callers that supervise the
         policy directly (and for tests, which is how every rule here is checked).
         """
         moment = self.clock() if now is None else now
-        self._health_gate(moment)
         for summary in self._deduper.expire(moment):
             self._queue(
                 summary.service_id,
@@ -614,9 +439,6 @@ class PlatformPolicy:
     # --------------------------------------------------------------------- rules
 
     def _refine(self, event: Event, ctx: ServiceContext, base: Decision, now: float) -> _Refined:
-        if isinstance(event, ServiceExited):
-            self._maybe_crash_loop(event, ctx, now)
-            return _Refined(base)
         if not isinstance(event, LogLine):
             return _Refined(base)
         if base.action is Action.SUPPRESS:
@@ -627,13 +449,6 @@ class PlatformPolicy:
             caddy = self._caddy(event)
             if caddy is not None:
                 return caddy
-        if base.action is Action.ESCALATE and self._is_early_heartbeat(event):
-            return _Refined(
-                Decision(
-                    Action.LOG,
-                    "registry has not reported healthy yet; heartbeat failure is expected",
-                )
-            )
         return _Refined(base)
 
     def _caddy(self, event: LogLine) -> _Refined | None:
@@ -670,181 +485,16 @@ class PlatformPolicy:
             part for part in (obj.get("logger"), obj.get("msg")) if isinstance(part, str)
         )
         if is_warn and _TLS_MSG_RE.search(subject):
-            # Phase A is plain HTTP by decision (D21): `auto_https off`, no
-            # certificates to get. Caddy still warns about what it is not doing.
+            # Plain HTTP by decision (D21): `auto_https off`, no certificates
+            # to get. Caddy still warns about what it is not doing.
             return _Refined(
-                Decision(Action.SUPPRESS, "TLS/certificate warning; Phase A is plain HTTP (D21)")
+                Decision(Action.SUPPRESS, "TLS/certificate warning; the gateway is plain HTTP")
             )
         if is_warn and _DELIBERATE_MSG_RE.search(subject):
             return _Refined(
                 Decision(Action.SUPPRESS, "caddy start/stop warning about a deliberate setting")
             )
         return None
-
-    def _is_early_heartbeat(self, event: LogLine) -> bool:
-        if self._registry_ready_at is not None:
-            return False
-        if event.service_id == self.registry_service_id:
-            return False
-        return bool(_HEARTBEAT_RE.search(event.text) and _REFUSED_RE.search(event.text))
-
-    def _note_registry_ready(self, event: Event, now: float) -> None:
-        """Learn when the registry came up, from the event stream itself.
-
-        A policy is handed the context of the service the event belongs to and
-        nothing else, so there is no way to ask "is the registry up?". The one
-        registry fact that passes through here is its own `HealthChanged`, so
-        that is what the heartbeat rule keys on. Latched: a registry that flaps
-        later does not re-open the suppression window, because by then the other
-        services' heartbeat failures are real news.
-        """
-        if self._registry_ready_at is not None:
-            return
-        if isinstance(event, HealthChanged) and event.healthy:
-            if event.service_id == self.registry_service_id:
-                self._registry_ready_at = now
-                log.info("registry reported healthy; heartbeat noise suppression off")
-
-    # ---------------------------------------------------------------- health gate
-
-    def _maybe_crash_loop(self, event: ServiceExited, ctx: ServiceContext, now: float) -> None:
-        """A service crash-looping right after we moved it to a new sha.
-
-        Extra escalation, never a returned decision: the delegated `RESTART` has
-        to survive. The value it adds over the supervisor's own retry-exhaustion
-        escalation is the sha pair -- "this started when you moved it from X to
-        Y" is the sentence that makes the fix obvious.
-        """
-        if event.expected or ctx.consecutive_failures < 2:
-            return
-        record = self._service_record(event.service_id)
-        if record is None:
-            return
-        synced_at = _parse_iso_z(record.get("updated_at"))
-        if synced_at is None or now - synced_at > self.health_grace_s:
-            return
-        sha, prev = record.get("sha"), record.get("prev_sha")
-        key = cause_key(event.service_id, "crash-loop-after-sync", f"{sha} -> {prev}")
-        if not self._deduper.observe(key, now).first:
-            return
-        self._queue(
-            event.service_id,
-            f"{event.service_id}: {ctx.consecutive_failures} consecutive failures within "
-            f"{int(self.health_grace_s)}s of a sync (sha={sha}, prev_sha={prev}); "
-            f"suggested action: rollback to prev_sha{_pool_suffix(record)}",
-            Severity.ERROR,
-            "crash loop after sync",
-            now,
-            ctx=ctx,
-        )
-
-    def _health_gate(self, now: float) -> None:
-        """Escalate once per service that a sync left short of `healthy`.
-
-        Measured from `stage_since`, not `updated_at`: `updated_at` is touched on
-        every write (`docs/platform-sidecars.md`), so a service the sync loop
-        retries every 60 s would have a fresh `updated_at` forever and never trip
-        a gate keyed on it. `updated_at` is the fallback for a record written
-        before `stage_since` existed.
-        """
-        services = self._state_document().get("services")
-        if not isinstance(services, dict):
-            return
-        for service_id, record in services.items():
-            if not isinstance(service_id, str) or not isinstance(record, dict):
-                continue
-            stage = record.get("stage")
-            if not isinstance(stage, str):
-                continue
-            sha = record.get("sha")
-            marker = (service_id, str(sha), stage)
-            if stage == "healthy":
-                # Reaching healthy re-arms the gate for the next sync of this sha.
-                self._gated.discard(marker)
-                continue
-            if (
-                stage == "declared"
-                and self.state is not None
-                and _is_static_mount(self.state, service_id)
-            ):
-                # A static mount's terminal stage is `declared`, not `healthy`
-                # (see `_is_static_mount`) -- it is done, not stuck.
-                self._gated.discard(marker)
-                continue
-            since = _parse_iso_z(record.get("stage_since")) or _parse_iso_z(
-                record.get("updated_at")
-            )
-            if since is None or now - since <= self.health_grace_s:
-                continue
-            if marker in self._gated:
-                continue
-            self._gated.add(marker)
-            prev = record.get("prev_sha")
-            error = record.get("error")
-            detail = f"; error: {error}" if isinstance(error, str) and error else ""
-            self._queue(
-                service_id,
-                f"{service_id}: stuck at stage={stage} for {int(now - since)}s after a sync "
-                f"(sha={sha}, prev_sha={prev}){detail}; "
-                f"suggested action: rollback to prev_sha",
-                Severity.ERROR,
-                f"post-sync health gate: {stage} > {int(self.health_grace_s)}s",
-                now,
-            )
-
-    def _service_record(self, service_id: str) -> dict[str, Any] | None:
-        services = self._state_document().get("services")
-        if not isinstance(services, dict):
-            return None
-        record = services.get(service_id)
-        return record if isinstance(record, dict) else None
-
-    def _state_document(self) -> dict[str, Any]:
-        """`state.json`, cached on (mtime, size). Absent or unreadable = empty.
-
-        Read on the supervisor's thread, so it must never raise and never block
-        on anything but one `stat` in the common case. Absence is the normal
-        state before the first sync (T3.1 writes this file), not an error.
-        """
-        if self.state is None:
-            return {}
-        path = platform_state_path(self.state)
-        try:
-            info = path.stat()
-        except OSError:
-            self._state_cache, self._state_cache_key = {}, None
-            return {}
-        key = (info.st_mtime_ns, info.st_size)
-        if key == self._state_cache_key:
-            return self._state_cache
-        try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            self._warn_state_once("cannot read %s: %s", path, e)
-            self._state_cache, self._state_cache_key = {}, key
-            return {}
-        if not isinstance(doc, dict):
-            self._warn_state_once("%s is not a JSON object; ignoring", path)
-            doc = {}
-        elif doc.get("version") != 1:
-            # The sidecar contract says a consumer that meets a version it does
-            # not know must fail loudly rather than guess. Loudly, here, is a log
-            # line and an empty document: raising out of a decision path would
-            # take down supervision of every service to complain about a file
-            # nothing had asked for yet.
-            self._warn_state_once(
-                "%s has unsupported version %r; ignoring", path, doc.get("version")
-            )
-            doc = {}
-        else:
-            self._state_warned = False
-        self._state_cache, self._state_cache_key = doc, key
-        return doc
-
-    def _warn_state_once(self, fmt: str, *args: Any) -> None:
-        if not self._state_warned:
-            self._state_warned = True
-            log.error(fmt, *args)
 
     # -------------------------------------------------------------------- queueing
 
@@ -869,14 +519,10 @@ class PlatformPolicy:
     # ------------------------------------------------------------------ inspection
 
     @property
-    def registry_ready_at(self) -> float | None:
-        return self._registry_ready_at
-
-    @property
     def pending(self) -> Iterable[EscalationRecord]:
         return tuple(self._pending)
 
 
-def make_policy(state: StateDir, **kwargs: Any) -> PlatformPolicy:
-    """Build the platform policy for a state dir. What `ams run --policy platform` calls."""
-    return PlatformPolicy(state=state, **kwargs)
+def make_policy(**kwargs: Any) -> PlatformPolicy:
+    """Build the platform policy. What `ams run --policy platform` calls."""
+    return PlatformPolicy(**kwargs)

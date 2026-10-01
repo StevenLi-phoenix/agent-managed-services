@@ -175,7 +175,7 @@ def test_core_database_keys_are_ordinary_daily_keys(state: StateDir) -> None:
 
     targets = discover(state, FakeAllocator({"core": CORE_BLOCK}), run_admin_fn=local_admin)
 
-    assert [cfg.remote_object(t.effective_label, t.archive_name(STAMP)) for t in targets] == [
+    assert [cfg.remote_object(t.service_id, t.archive_name(STAMP)) for t in targets] == [
         f"r2:{BUCKET}/daily/core/core-core-{STAMP}.db.gz",
         f"r2:{BUCKET}/daily/core/core-state-{STAMP}.db.gz",
     ]
@@ -289,19 +289,6 @@ def test_byte_store_discovery_survives_a_failing_listing(
         )
     assert stores == []
     assert "permission denied" in caplog.text
-
-
-def test_pool_member_byte_stores_get_the_member_label(state: StateDir) -> None:
-    data = make_service(state, "pool-x")
-    (state.service_root("pool-x") / "pool.json").write_text(
-        json.dumps({"members": [{"id": "files"}]}), encoding="utf-8"
-    )
-    (data / "files" / "blobs").mkdir(parents=True)
-
-    stores = discover_byte_stores(state, FakeAllocator({"pool-x": BLOCK}), run_admin_fn=local_admin)
-
-    assert [(s.service_id, s.label, s.rel) for s in stores] == [("pool-x", "files", "blobs")]
-    assert _cfg().byte_store_remote(stores[0]) == f"r2:{BUCKET}/bytes/files/blobs"
 
 
 # ----------------------------------------------------------------- config

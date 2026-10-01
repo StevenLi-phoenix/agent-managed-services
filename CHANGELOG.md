@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-01
+
+外部 review 的整改版本。**破坏性变更：删除了 1.1.0 起 deprecated 的 legacy manifest
+mode**；core mode 成为唯一的 platform 模式，通用 supervisor 核心与 platform 层的边界由
+测试锁定。Linux 隔离路径（含此前从未实机跑过的 core mode `run_as_service` /
+`run_admin` mask 路径）首次在一台 Ubuntu 24.04 宿主上跑通全部 Linux 测试。
+
 ### Added
 
 - `LICENSE`（MIT），`pyproject.toml` 声明 `license = "MIT"`。
@@ -28,6 +35,13 @@
 
 ### Changed
 
+- core mode 复用的小函数移到 `ams.platform.common`（`write_if_changed`、
+  `uid_allocator`、`ctl_reload`、`ctl_restart`）；`gateway.caddy_declaration(state, store,
+  port)` 直接生成固定端口的 Caddy 声明（取代 `layer0._caddy_declaration_text`）。
+  已部署宿主上 caddy 的 `service.toml` 注释会变，首次 tick 会重写它并重启 caddy 一次。
+- `scripts/deploy-racknerd.sh` → `scripts/deploy.sh`：`AMS_HOST` 必填，远端用 `sudo -n`。
+
+
 - **tcp/http 健康探测不再阻塞 supervisor 循环。** 每次探测是一个 `ams.health.Probe`：
   非阻塞 socket + 小状态机（connect → send → 读状态行），注册进 supervisor 自己的
   selector，`deadline` 并入计时器；一个永不应答的 `/health` 只占一个 fd 和一个计时器。
@@ -41,6 +55,24 @@
   这是"必须 XFS"的唯一来源。uv 的 `clone` 本来就会回退到复制。
 - `scripts/remote-test.sh` 不再写死 racknerd：`AMS_HOST=<ssh 主机>`，远端以有免密 sudo
   的登录用户运行 `scripts/linux-test.sh`。
+
+### Removed
+
+- **legacy manifest mode**（api v2.0.0）整体删除：`ams.platform.{yamlsubset, translate,
+  sync, bootstrap, layer0, registryclient, rollback, pool, static}`、`assets/pool_runner.py`；
+  CLI `ams platform {sync, status, bootstrap, rollback, pool}`；
+  `deploy/ams-platform-sync.{service,timer}` 及 `ams-core-sync.service` 上的 `Conflicts=`；
+  `scripts/platform-bootstrap.sh`、`scripts/pilot-api.sh`；`examples/api-pilot`、
+  `examples/platform`；`docs/platform.md`、`docs/platform-pools.md`、
+  `docs/manifest-translation.md`、`docs/platform-sidecars.md`；对应的测试、goldens
+  （`tests/golden/platform/`、`tests/golden/gateway/{path,subdomain,static,tls,logdir}`）
+  与 fixtures。约 9 千行源码、1.4 万行测试。
+- `gateway.render()`（按 mount sidecar 渲染）及其 CSP/CORS/static 数据；`GatewayConfig`
+  不再有 `static_root`。
+- `PlatformPolicy` 的 post-sync 健康门禁、sync 后崩溃循环提示与 registry 心跳降噪——它们
+  读的是 legacy 的 `<state>/platform/state.json`，core mode 下从不触发；
+  `DedupingEscalation`（只有 legacy sync 用）。`make_policy()` 不再接受 state。
+- backup 的 pool 成员标签（`Target.label`、`ByteStore.label`）。
 
 ### Fixed
 

@@ -108,8 +108,8 @@ class StateDir:
         exists keeps an ``o+x`` bit someone put there on purpose:
         ``ams.cli._ensure_traversable`` adds it to ``services/`` so a service
         uid can resolve its own workdir by path, and ``ensure()`` runs from
-        every entry point that touches the state dir -- including
-        ``ams.platform.bootstrap``, which runs *while services are running*.
+        every entry point that touches the state dir -- including one-shot
+        platform commands, which run *while services are running*.
         Re-imposing exactly 0750 there took the bit away again, and the next
         spawn of every running service died with ``PermissionError`` on its own
         interpreter. See `.claude/state/diagnosis-layer0.md` and DECISIONS D24.

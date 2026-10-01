@@ -73,9 +73,10 @@ def test_wiring_of_every_verb() -> None:
     assert s.ids == ["timeservice", "health"] and s.force is True
 
 
-def test_legacy_platform_verbs_still_parse() -> None:
-    assert build_parser().parse_args(["platform", "sync"]).platform_command == "sync"
-    assert build_parser().parse_args(["platform", "status"]).platform_command == "status"
+def test_the_legacy_platform_verbs_are_gone() -> None:
+    for verb in ("sync", "status", "bootstrap", "rollback", "pool"):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["platform", verb])
 
 
 def test_release_requires_rollback_flag(

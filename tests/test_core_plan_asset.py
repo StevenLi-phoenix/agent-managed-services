@@ -61,10 +61,9 @@ def _canonical(value: object) -> str:
 # ------------------------------------------------------------------ static
 
 
-def test_asset_ships_next_to_the_pool_runner() -> None:
+def test_asset_ships_as_package_data() -> None:
     assert ASSET.is_file()
     assert coresync.core_plan_source() == ASSET
-    assert (ASSET.parent / "pool_runner.py").is_file()
 
 
 def test_asset_formula_matches_compute_artifact_id_minus_build_info() -> None:

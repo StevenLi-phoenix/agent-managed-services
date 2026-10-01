@@ -15,22 +15,21 @@ security model work, and what has not been verified yet.
 > run live.** The racknerd host was torn down, and re-provisioning it is the
 > next step. Read the security section with that in mind.
 
-The legacy manifest mode (`docs/platform.md`: translate, pools, Layer-0
-registry/auth for api v2.0.0) is still shipped in 1.1.0 and marked
-**deprecated**. The two modes must never run against the same state
-directory; the core-sync unit has `Conflicts=` on the legacy sync unit.
+Core mode is the only platform mode since ams 2.0.0. The 1.0.0 manifest mode
+(api v2.0.0: `service.yaml` translation, pools, Layer-0 registry/auth) was
+deprecated in 1.1.0 and removed in 2.0.0; `CHANGELOG.md` lists what went.
 
 Source: `src/ams/platform/core.py` (config, layout, bundle, declaration),
 `coresync.py` (the tick), `corectl.py` (the control plane),
 `assets/core_plan.mjs` (the planner), and the `ams platform core` group in
-`platform/cli.py`. Decision record: `.claude/state/DECISIONS.md` D31 (core
+`platform/cli.py`. Decision record: `docs/design/DECISIONS.md` D31 (core
 mode) and D32 (review fixes).
 
 ---
 
-## Why a second mode
+## Why core mode
 
-api `main` replaced the platform that ams 1.0.0 was built for:
+api `main` replaced the platform that ams 1.0.0 (manifest mode) was built for:
 
 | ams 1.0.0 (api `ams-platform`, v2.0.0) | api `main` (v3.x) |
 |---|---|
@@ -233,10 +232,11 @@ run failed something.
 ## First run
 
 On a host prepared by `deploy/install-host.sh` (harness user, AppArmor
-profile, XFS reflink store, `<store>/bin/caddy`):
+profile, the store -- XFS reflink or a plain directory -- and `<store>/bin/caddy`):
 
-1. Push a bare mirror of api to `<store>/upstream/api.git` (the same rsync
-   of `git clone --mirror` that `scripts/platform-bootstrap.sh` does).
+1. Push a bare mirror of api to `<store>/upstream/api.git`: api is private and
+   the harness holds no credential, so `git clone --mirror` it where you have
+   access and rsync the result there (owned by `harness`).
 2. Write `<state>/platform/core.toml`.
 3. `ams platform core config import …` as above.
 4. Start the harness: `systemctl start ams-harness`
@@ -371,7 +371,7 @@ artifactId on every commit. `core_plan.mjs` computes the same formula
 `git archive` tree has no `.git`, so every build step gets
 `CORE_SOURCE_COMMIT=<sha>`.
 
-`core_plan.mjs` is package **data** (like the pool runner); `src/ams` never
+`core_plan.mjs` is package **data**; `src/ams` never
 imports it. It is copied into `R/build/` as the service and run with the
 tree's own Node:
 `node core_plan.mjs <tree> <outDir> <pluginId>…`. It prints one JSON line per
@@ -472,9 +472,8 @@ them is an open design question (D31).
 ## Gateway
 
 `gateway.render_core()` writes `<state>/gateway/Caddyfile` plus one
-`sites/<host>.caddy` per `[[site]]`, with the same file shape and the same
-`gateway.write()` as the legacy renderer. Its first write removes the
-legacy per-mount snippets.
+`sites/<host>.caddy` per `[[site]]`; `gateway.write()` rewrites only what
+changed and removes the snippet of a site that is gone.
 
 - Plain HTTP only. TLS terminates at Cloudflare or the tunnel, and a
   non-plain config is refused.
@@ -565,11 +564,11 @@ The rules that follow from it:
   and `status` print names. The master copy is 0700/0600 harness-owned; the
   placed copy is 0700/0600 service-owned. `env` passed to build steps never
   carries a secret.
-- **Legacy mode keeps the masks.** `run_admin(mask=…)` overmounts
+- **Generic provisioning keeps the mask.** `run_admin(mask=…)` overmounts
   harness-private paths in a private mount namespace (issue #1):
-  `provisioning_mask` for uv/pnpm/bun installs, `_build_mask` for static
-  builds. Since 1.1.0 the masks also cover `<store>/{platform,upstream,repos,src}`
-  and the harness HOME's credential dotfiles (security-5).
+  `provisioning_mask` for `ams provision`'s uv/pnpm/bun installs. Since 1.1.0
+  it also covers `<store>/{platform,upstream,repos,src}` and the harness
+  HOME's credential dotfiles (security-5).
 
 **Known gaps** (DECISIONS D31/D32, Open):
 
@@ -582,10 +581,11 @@ The rules that follow from it:
   as inner root inside the service root. `ensure_layout`'s symlink refusal
   covers the non-racing case; a service that wins a race could still
   redirect them.
-- Legacy installs and static builds still run untrusted code as inner root.
+- Generic `ams provision` (a `service.toml` with `runtime.kind` uv/venv/pnpm/bun,
+  not core) still runs package installs as inner root under the admin map.
   The mask can be removed from inside (`umount`) or bypassed through
-  `/proc/<harness pid>/root`, and legacy provisioning's HOME is still the
-  harness HOME.
+  `/proc/<harness pid>/root`, and that provisioning's HOME is still the
+  harness HOME. Core mode does not use it.
 
 ## Plain mode (`--no-isolation`)
 
@@ -605,7 +605,7 @@ scratch clone of api; `/Users/lishuyu/Codes/api` itself was never touched.
   as `ams-harness.service`. There is no `flock(1)` wrapper, because the tick
   takes `core.lock` itself and a second flock on that file would deadlock.
   `TimeoutStartSec=1800` backs up the tighter per-step timeouts. There is no
-  `Restart=`. `Conflicts=` on the legacy `ams-platform-sync.*`.
+  `Restart=`.
 - The harness's shutdown budget is 45 s (`SHUTDOWN_BUDGET_S`) and the unit's
   `TimeoutStopSec` is 50, so core's 40 s drain fits. The budget is computed
   **at shutdown** from the declarations of that moment, so a core added by
@@ -630,5 +630,6 @@ scratch clone of api; `/Users/lishuyu/Codes/api` itself was never touched.
   deploys a new artifactId with a fresh 60 s probation, even though core
   already served identical bytes. Harmless.
 - **Two escalation streams** for one failure (see Escalations).
-- **Legacy mode** (manifest translation, pools, Layer-0 registry/auth) is
-  deprecated in 1.1.0. Removing it is a 2.0.0 decision.
+- **No production use yet.** Production of the api core is still a separate
+  host's systemd units (out of ams's scope); ams has run core end to end
+  locally only.

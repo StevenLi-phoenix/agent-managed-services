@@ -1,7 +1,0 @@
-# timeservice — service on api.lishuyu.app/time
-handle_path /time/* {
-	header X-Frame-Options "DENY"
-	header Content-Security-Policy "frame-ancestors 'none'"
-	header X-Content-Type-Options "nosniff"
-	reverse_proxy 127.0.0.1:9203
-}
