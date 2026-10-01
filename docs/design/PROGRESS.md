@@ -1180,3 +1180,53 @@ Next:
   on Linux yet.
 - Open follow-ups (D31/D32 Open): the two escalation streams, `SourceMirror.stage`
   and gc as inner root inside the root, legacy provisioning's mask bypass.
+
+## 2026-10-01 — ams 2.0.0: fix every point of an external review
+
+An outside review (from the README alone) listed ten weaknesses; the user said
+"fix all" and allowed a workstation (Ubuntu 24.04.5, kernel 7.0, cgroup v2,
+`apparmor_restrict_unprivileged_userns=1`) as the Linux test host. Branch
+`fix/review-2026-10-01`, one commit per point.
+
+Done:
+- (1, 8) **Linux live run.** `deploy/install-host.sh` gained `AMS_STORE_FS=plain`,
+  `AMS_WITH_TOOLS`, `AMS_TEST_DEPS`, `AMS_INSTALL_UNIT` and a first-free subuid range;
+  `scripts/linux-test.sh` runs the suite on the host as `harness` under
+  `systemd-run -p Delegate=yes`; `remote-test.sh` wraps it over ssh. First run: the
+  Linux tests had pinned `UidBlock(100000, …)` while the host gave harness
+  `165536:65536` → now `tests/linux/linuxhost.py`; one ownership assertion was wrong
+  by design (harness cannot stat into a 0750 `data/`); the reflink measurement was
+  fused with staging correctness; a portable test misread a zombie (pytest had become
+  a subreaper) as a survivor. After fixes: **996 passed / 10 skipped** (everything).
+  Isolated core-mode e2e against api v3.1.0, 7 scenarios, all pass
+  (`docs/design/evidence/core-e2e-linux-2026-10-01.txt`); it found one real bug
+  (gateway: unknown Host got Caddy's empty 200 → entry site is now `http://:<port>`).
+- (1) **CI**: `.github/workflows/ci.yml` (portable on Linux+macOS; isolation job on
+  `ubuntu-24.04` with the same two host steps). Validated against the GitHub workflow
+  schema; not yet run (branch not pushed).
+- (9) **Health probes never block the loop**: `ams.health.Probe` in the selector
+  (D33). Regression test: a silent `/health` used to stall `run_once` 2.00 s.
+  `docs/event-loop.md`.
+- (5) **Escalation journal** `<state>/logs/escalations.jsonl` + `ams escalations`;
+  `docs/agent-loop.md`: deterministic rules in the loop, the agent is a
+  human-started operator outside it; no LLM in the loop (D34).
+- (3) **Core/platform boundary** pinned by `tests/test_core_boundary.py`; CLI loads
+  the platform only if importable; `examples/hello` (D36).
+- (4) **Legacy manifest mode removed** → 2.0.0 (−29k lines; D35).
+- (7) **XFS optional**: pnpm `clone-or-copy` everywhere (D37).
+- (10) **Hygiene**: MIT `LICENSE`; `.claude/state` → `docs/design/` (+ `history/`),
+  personal paths scrubbed, `.claude/` ignored; history scanned for credentials
+  and real IPs (none). Packaging: `core_plan.mjs` was missing from the wheel →
+  declared as package data.
+- (2, 6) README rewritten: who it is for (an operator willing to run a Linux box,
+  not fire-and-forget), status table with exactly what has and has not been
+  verified (no production use, no external audit), required vs optional host
+  pieces, why not rootless podman / `systemd --user`.
+
+Baselines: macOS 917 passed / 90 skipped (~40 s); Linux host 996 / 10.
+
+Next (user decisions):
+- Push the branch / open a PR so CI runs for real.
+- A 1–2 GB VPS run with an XFS store and R2 credentials (backup path on Linux).
+- The test host keeps: user `harness`, its subuid line, the `ams-harness` AppArmor
+  profile, packages `uidmap python3.12-venv libatomic1 unzip`, `/home/harness/{venv,store}`.

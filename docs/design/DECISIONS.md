@@ -2162,3 +2162,107 @@ run as inner root under the admin map with the (now wider, security-5) mask;
 issue-#1-style bypasses via `umount` or `/proc/<harness>/root` remain there.
 Fixing them needs per-service caches for uv/python/bun -- a legacy-mode
 redesign, deferred with the rest of legacy mode to 2.0.0.
+*(2.0.0: static builds are gone with legacy mode; generic `ams provision`
+still runs installs as inner root under the mask. Still open.)*
+
+### D33. Health probes are selector-driven state machines, never a blocking call (2026-10-01)
+- Symptom (external review, point 9; confirmed by a test before the fix): the
+  http probe called `http.client` inline, so one endpoint that accepts and
+  never answers blocked `run_once` for `health.timeout_s` (2.00 s measured) per
+  check, starving every other service's pipes, restarts and probes.
+- Chosen: `ams.health.Probe`, a non-blocking socket (connect → send `GET` →
+  read the status line, then drain to EOF/64 KiB) registered in the
+  supervisor's selector; its deadline is a timer. One probe in flight per
+  service; cancelled (unregister, then close -- never the other way round, or
+  a reused fd number is unregistered) on stop/exit/restart/replace_decl.
+  `_poll_timeout` skips `monitor.next_due` while a probe is in flight,
+  mirroring the `_run_timers` guard (the busy-loop invariant; a mutation test
+  without the guard spins 34k iterations in 0.5 s).
+- Rejected: a thread pool (nothing may add a thread to a process that forks
+  into a user namespace -- the hangs of D9's era); a subprocess per probe (a
+  fork per check, and still an fd to wait on); a separate prober process
+  (IPC and a second lifecycle for something the selector already does);
+  "keep it blocking, timeouts are small" (the review's point: small times
+  N services is not small, and the loop also serves restarts).
+- `check_tcp` / `check_http` remain for one-shot callers, driving the same
+  state machine on a private selector.
+
+### D34. Escalations get a durable journal; the agent is an operator, not a loop component (2026-10-01)
+- Review point 5: "agent decisions" were only an interface plus rules. The
+  boundary was real but undocumented, and escalations were stdout-only
+  (journald under systemd, interleaved with everything, readable by `adm`).
+- Chosen: every escalation is also appended to `<state>/logs/escalations.jsonl`
+  (0600, one `write(2)` per record on `O_APPEND`, one rotated generation) by
+  the harness, core-sync and backup (failures only); `ams escalations` reads
+  it, filters by service/time and strips terminal control characters in the
+  human format. `docs/agent-loop.md` states the split: deterministic
+  `DecisionPolicy` in the loop; the agent is a human-started operator session
+  that reads records and acts through the CLI.
+- Rejected: an LLM deciding suppress-or-fix in the loop -- log text is
+  attacker-controlled input to the process holding the harness uid, the
+  secret store and the uid map (prompt injection from any dependency); a model
+  call blocks and fails where a supervisor must not; and "suppress" is the one
+  verdict a model could add over the rules, and the dangerous one. Also the
+  author's standing rule that agents are never part of automation. SQLite for
+  the journal -- a query engine for a list an operator reads top to bottom;
+  journald only -- needs `adm` and has no stable schema per record.
+
+### D35. Legacy manifest mode removed in 2.0.0 (2026-10-01)
+- Deprecated in 1.1.0 ("removal is a 2.0.0 decision"); the review asked for it
+  and the user said "fix all". ~9k lines of source, ~14k of tests, the
+  `Conflicts=` between the two sync units and the "never share a state dir"
+  rule all go with it.
+- Kept by moving: `platform/common.py` (`write_if_changed`, `uid_allocator`,
+  `ctl_reload`, `ctl_restart`), `gateway.caddy_declaration(port=)`. Dropped
+  rather than kept: `PlatformPolicy`'s health gate, crash-loop-after-sync and
+  registry-heartbeat rules (they read legacy `state.json` and never fired in
+  core mode), backup pool labels, `DedupingEscalation`.
+- Rejected: keep it deprecated for another release (no user of it remains;
+  api v2.0.0 is gone from production); split it into its own package (code
+  with no caller is not worth packaging). A host still on manifest mode stays
+  on ams 1.1.0.
+
+### D36. The supervisor core is reusable without the platform; the boundary is a test, not a package split (2026-10-01)
+- Review point 3: core and the api-specific platform layer live in one
+  package. Chosen: one distribution, with `tests/test_core_boundary.py`
+  asserting that no core module imports `ams.platform` at module level, that
+  only `cli` touches it at all, and that with `ams.platform` made unimportable
+  the CLI validates and runs (the `platform` subcommand disappears;
+  `--policy platform` is a clear error). `examples/hello` is an api-free
+  service.
+- Rejected: two distributions (`ams-core`, `ams-platform`) -- doubles the
+  packaging and release work for a stdlib-only project whose only consumer
+  is its author, while the import boundary (the part that makes reuse
+  possible) is the same either way. Revisit when a second consumer appears.
+
+### D37. Any Ubuntu 24.04 host is a test host: derived uid blocks, optional XFS, CI (2026-10-01)
+- Review points 1, 7, 8: the isolation path had no live run since racknerd was
+  torn down, and core mode's Linux path (`run_as_service`, the mount mask)
+  had never run. On a fresh host (kernel 7.0, cgroup v2,
+  `apparmor_restrict_unprivileged_userns=1`, harness subuid **165536** because
+  the login user owns 100000) these broke and were fixed: Linux tests pinned
+  `UidBlock(100000, ...)` (now derived from the harness's real `/etc/subuid`,
+  `tests/linux/linuxhost.py`); `install-host.sh` wrote a fixed `100000:65536`
+  when useradd assigned none (now the first free range); one test asserted
+  ownership of a file inside the service's 0750 `data/` that the harness by
+  design cannot stat (now checked from the admin map); the reflink-cost
+  measurement was fused with staging correctness (now split). A portable test
+  also failed only on Linux: an earlier test made pytest a child subreaper, so
+  a killed grandchild stayed a zombie that `kill(pid, 0)` still finds.
+- XFS reflink is an optimisation, not a requirement: pnpm's import method is
+  `clone-or-copy` everywhere (a hard `clone` failed on ext4 -- the only thing
+  that made XFS mandatory); `AMS_STORE_FS=plain` skips the loop volume; the
+  reflink-cost measurement skips on a store that cannot reflink.
+- `scripts/linux-test.sh` runs the suite on the host itself (as `harness`, in
+  `systemd-run -p Delegate=yes`); `remote-test.sh` wraps it over ssh; CI runs
+  the same two steps on an `ubuntu-24.04` runner. Result on the test host:
+  996 passed / 10 skipped (portable + Linux).
+- Why not rootless podman or `systemd --user` units instead of this layer:
+  D2 (one subuid block per service: neither `unshare --map-auto` nor podman's
+  default map gives that), D4 (the harness uid is *unmapped* at runtime;
+  podman maps the invoking user as inner root, so an inner-root escape is the
+  harness), D5/D7 (services are direct children whose fds the harness reads,
+  so every line passes the decision interface without journald; a unit or
+  container per service moves logs and lifecycle out of the loop). The cost is
+  owning ~1k lines of fork/unshare/newuidmap code -- now exercised on a real
+  host and in CI, but not externally audited.

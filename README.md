@@ -2,148 +2,205 @@
 
 # ams — agent managed services
 
-一个面向**智能体托管运行时**的 rootless 监管器（supervisor）核心：智能体启动
-它自己声明的服务，把这些服务当作直接子进程持有，内联读取它们的 stdout/stderr，
-并对每条 warning/error 做出明确的**抑制（suppress）或修复（fix）**决策。
-不用 Docker，没有 per-service systemd unit，不需要 root。
+一个 **rootless 的 Linux 服务监管器**：把你声明的服务当作自己的直接子进程拉起来，
+每个服务一个独立的 user namespace（独占一段 subuid）和一个委托的 cgroup v2 子树；
+它们的 stdout/stderr 由监管器直接持有和逐行读取，每条 warning/error 都要经过一个显式
+的**抑制（suppress）或修复（fix）**决策点，规则处理不了的写进一个 escalation 日志，
+交给操作者——人，或者一个由人启动的 agent 会话（比如 Claude Code）——去处理。
+
+不用 Docker，没有 per-service systemd unit，监管器本身不需要 root。
 
 ```
-systemd (keeps the harness alive, Delegate=yes)
-├── harness  (unprivileged user, PR_SET_CHILD_SUBREAPER, the agent loop lives here)
-│   ├── caddy   :20180   (host → loopback port, an ams service like any other)
-│   └── core    :18080   (one Node 24 process; the api plugins live inside it)
-└── ams-core-sync.timer  (60 s: fetch → stage → release core → ship changed plugins)
+systemd  (只负责让 harness 活着，Delegate=yes)
+└── harness  (非特权用户；单线程 selector 循环；child subreaper)
+    ├── 服务 A   user namespace，uid 166560..，cgroup svc-a（memory.max / pids.max / cpu.max）
+    ├── 服务 B   user namespace，uid 167584..，cgroup svc-b
+    └── ...      stdout/stderr → 决策点 → 日志 / 重启 / escalation
+                                                     │
+                     <state>/logs/escalations.jsonl ◄┘  ← `ams escalations`（agent / 人读这里）
 ```
 
-在这套核心之上是 **platform 层**（`src/ams/platform/`），1.1.0 起有两种模式：
+## 这是给谁用的
 
-- **core mode（1.1.0，当前）**——托管 api v3.x 的 Cordis core：一个 Node 进程，
-  插件由 core 自己热安装、探活、试用期、自动回滚。ams 负责让它活着、在 core 代码
-  变化时发布 core（stage → 构建 → 停 → 翻转 `current` → 起 → 健康门禁，失败则
-  翻回）、通过 core 自己的控制 socket ship **内容**变了的插件、渲染 Caddy 前端、
-  备份到 R2、把每个失败升级成一行 JSON。端到端故事：`docs/platform-core.md`。
-- **legacy manifest mode（1.0.0，1.1.0 起 deprecated）**——api v2.0.0 的
-  `service.yaml` 清单翻译、pools、Layer-0 registry/auth。原样保留，
-  `docs/platform.md`。移除与否是 2.0.0 的决定。
+给**愿意自己管一台 Linux 机器的操作者**，以及替他干活的 agent。它不是给不懂技术的人
+"一键托管"的产品：装好之后日常确实只需要写 `service.toml`、看 `ams escalations`、
+敲 `ams ctl`，但第一次装宿主需要 root、需要理解 subuid 和 AppArmor 在做什么。
+`deploy/install-host.sh` 把这一步收敛成一条命令。
 
-两种模式绝不能跑在同一个 state 目录上（`ams-core-sync.service` 对 legacy sync
-unit 设了 `Conflicts=`）。
+仓库里有两层，可以只用第一层：
 
-## 你能得到什么
+| 层 | 是什么 | 依赖 |
+|---|---|---|
+| **supervisor 核心**（`src/ams/*.py`，~8.6k 行，纯标准库） | 通用的 rootless 监管器：声明、隔离、日志决策、健康检查、重启策略、依赖顺序、只写 secrets、控制 socket、escalation 日志 | Python 3.12；Linux 隔离需要下面的宿主条件 |
+| **platform 层**（`src/ams/platform/`，~6.8k 行） | **core mode**：把作者的 `api` 项目（一个 Cordis/Node 进程 + 热安装插件）作为一个服务托管——按 commit 发布 core、按内容键 ship 插件、Caddy 前端、R2 备份 | 绑定 `api` 仓库的约定；对其他项目没有用 |
 
-- **无需特权的隔离。** 每个服务运行在自己的 user namespace 里，通过
-  `newuidmap`/`newgidmap` 映射进 harness 的 `/etc/subuid` 块，零 capability 且
-  `no_new_privs`。限额（`memory.max`、`memory.swap.max=0`、`cpu.max`、
-  `pids.max`）写入委托的 cgroup v2 子树；`cgroup.kill` 原子性地杀掉整棵树。
-- **日志是 fd，不是 journald。** 每一行被打上 `[svc:stream]` 标签，按严重度
-  分类，经过显式的 `DecisionPolicy` → `Escalation` 接口路由。`--policy platform`
-  在默认策略之上叠加按原因去重、sync 后健康门禁和 Caddy 专用规则。
-- **不可信代码不以 harness 身份运行。** core mode 下 `pnpm install`（含依赖的
-  lifecycle 脚本）、`scripts/build.mjs`、插件构建和每次 `corectl` 调用都以
-  **服务自己的身份**运行（`run_as_service`：runtime map 里根本没有 harness uid），
-  pnpm store/缓存/HOME 在服务自己的 `<root>/.cache`。
-- **托管工具链。** `runtime.node = "24.20.0"` 这种精确版本会从 nodejs.org 下载
-  并按 `SHASUMS256.txt` 校验 sha256，装进 store；`runtime.pnpm` 用托管的 npm 安装
-  （`ignore-scripts`）。树里的 `engines.node` / `packageManager` 必须与之一致。
-- **按内容 ship，失败不重试。** 插件以内容键（artifactId 去掉 buildInfo）判断是否
-  变化；core 拒收或自动回滚过的内容键在相同条件下永不重发（没有重试风暴），core
-  release、config bundle 或（对 `blocked`）core 已装插件变了才再试一次。
-- **用声明，不用 unit 文件。** 每个服务一个 `service.toml`（启动 argv、
-  workdir、env、secret *名字*、端口、runtime、健康检查、优雅停止、限额、
-  重启策略、`depends_on`）——由智能体、core mode 或清单翻译器生成。见
-  `docs/service-declaration.md`。
-- **只写不读的 secrets。** `ams secret set <id> NAME` 从 stdin 读入值，以 0600
-  harness 属主存储，并在 spawn 时注入；core 的 config bundle（`plugins.json`、
-  JWT 密钥、字体）同理，`config import` 与 `status` 只打印名字。
-- **每服务独立控制。** 一个 0600 unix socket，直接由 supervisor 自己的
-  selector 循环服务：`ams ctl reload|start|stop|restart|kill <id>`。声明变更
-  不再需要重启 unit。
+核心不依赖 platform：没有任何核心模块在 import 时引入 `ams.platform`；把
+`src/ams/platform/` 整个删掉，`ams` 仍是完整的监管器，只是少了 `ams platform` 子命令。
+这条边界由 `tests/test_core_boundary.py` 锁住。
 
-## 当前状态（2026-09-30，ams 1.1.0）
+## 当前状态（2026-10-01，ams 2.0.0）
 
 | | |
 | --- | --- |
-| 可移植测试 | 1608 passed / 167 skipped（`.venv/bin/python -m pytest -q`） |
-| core mode 本地端到端 | macOS、`--no-isolation`、真实 api（v3.1.0 的 scratch clone）：6 个场景全过——bootstrap 74 s、无变化 tick 0.17 s 且不写任何文件、单插件内容变更只 ship 该插件、坏插件被拒且只升级一次、core release（`/health` 断约 2 s）、`release --rollback` 3 s。证据：`docs/design/history/evidence/core-e2e-local-2026-09-29.txt` |
-| Linux 隔离路径 | **从未在真机上跑过。** racknerd 复刻环境已拆除，重建它是下一步（由用户决定） |
-| 生产 | 仍是 phm 上的 systemd（不在 ams 范围内，ams 从不连接 phm） |
+| 可移植测试（macOS，无隔离） | 917 passed / 90 skipped（`.venv/bin/python -m pytest -q`，~40 s） |
+| Linux 实机，全部测试 | **996 passed / 10 skipped**：Ubuntu 24.04.5，kernel 7.0，cgroup v2，`apparmor_restrict_unprivileged_userns=1`，以 `harness` 身份在委托 cgroup 里跑（`scripts/linux-test.sh`）。10 个 skip 是"该宿主没有 XFS reflink / 系统 node / `../api` 检出 / PATH 上的 caddy"这类环境条件 |
+| Linux 实机，core mode 端到端（隔离模式） | 7 个场景全过：首次发布 71 s、空闲 tick 0.15 s 不写文件、单插件内容变更只 ship 它、坏插件被拒只升级一次且不重试、core release（`/health` 断约 2 s）、回滚 3 s、harness 重启后 1 s 恢复。core 以 uid 166560 运行、CapEff 0、NoNewPrivs 1、harness uid 不在映射里、`memory.max`/`swap.max=0` 生效、读不到 harness 的 secret store。证据：`docs/design/evidence/core-e2e-linux-2026-10-01.txt` |
+| CI | `.github/workflows/ci.yml`：可移植测试（Linux + macOS）+ 在 `ubuntu-24.04` runner 上用同样两步装宿主、跑全部测试。**尚未在 GitHub 上跑过**（这个分支还没 push） |
+| 外部安全审计 | 没有。隔离层（~1.6k 行 fork/unshare/newuidmap/cgroup 代码）只有自己的测试和实机验证 |
+| 生产 | 没有。作者的 api 生产环境仍是另一台机器上的 systemd unit，不在 ams 范围内，ams 从不连接它 |
 
-1.0.0 legacy 模式在 racknerd 上的实测数字（Layer 0、20 个服务的舰队、pools）
-保留在 `docs/design/history/platform-layer0.md`、`platform-fleet.md`、
-`pool-migration.md`，它们是历史观察值，不是规划常量。
+1.0.0（已删除的 manifest mode）在 2026-09 的 racknerd 实测数字保留在
+`docs/design/history/`，是历史观察值，不是规划常量。
+
+## 你能得到什么
+
+- **无需特权的隔离。** 每个服务一个 user namespace，通过 setuid 的
+  `newuidmap`/`newgidmap` 映射进 harness 的 `/etc/subuid` 里一段独占的 1024 个 uid；
+  **harness 自己的 uid 不在映射里**，所以服务里的 root 逃逸也碰不到 harness 的文件。
+  零 capability、`no_new_privs`。限额（`memory.max`，同时 `memory.swap.max=0`；
+  `cpu.max`；`pids.max`）写进委托的 cgroup v2 子树，`cgroup.kill` 原子地杀整棵树。
+- **日志是 fd，不是 journald。** 每一行带 `[svc:stream]` 标签、按严重度分类，经过
+  `DecisionPolicy` → `Escalation`：自探测访问日志、已知噪音被抑制，退出按重启策略处理，
+  规则拿不准的升级。`--policy platform` 再叠加按原因去重和 Caddy 规则。
+- **escalation 日志。** 升级的事件写 stdout，同时追加到
+  `<state>/logs/escalations.jsonl`；`ams escalations` 按服务、时间过滤，默认格式会剥掉
+  终端控制字符（记录里是服务的原样输出，不可信）。
+- **健康检查不阻塞循环。** tcp/http 探测是挂在 selector 上的非阻塞状态机，一个永不应答的
+  `/health` 只占一个 fd 和一个计时器，不会拖住其他服务（见下文"事件循环"）。
+- **声明，不是 unit 文件。** 每个服务一个 `service.toml`：argv、workdir、env、secret
+  *名字*、端口（`0` = 自动分配）、runtime（venv/uv/pnpm/bun，或精确版本的托管 Node）、
+  健康检查、优雅停止、限额、重启策略、`depends_on`。见 `docs/service-declaration.md`。
+- **只写不读的 secrets。** `ams secret set <id> NAME` 从 stdin 读值，0600 存储，spawn 时
+  注入环境变量；从不出现在 argv、日志或 `status` 里。
+- **每服务控制。** 0600 unix socket，由监管循环自己服务：
+  `ams ctl status|reload|start|stop|restart|kill <id>`；改声明不需要重启 harness。
+
+## agent 在哪里
+
+决策层是**确定性的规则**，跑在监管循环里，微秒级，不联网、不调用模型。它只决定"这件事
+需不需要一个判断"，不决定怎么修。
+
+agent 不在 harness 进程里：它是一个**由人启动的操作者会话**，读 `ams escalations`、
+`ams ctl status`、服务日志，然后用和人一样的 CLI 去修——改声明再 `ams ctl reload`、
+`ams secret set`、修上游代码等下一个 tick、`ams platform core release --rollback`。
+
+为什么不让一个 LLM 在循环里自动判断 suppress/fix：服务打印的每一行都是该服务及其依赖
+写的，也就是**攻击者可控的输入**；把它喂给一个运行在持有 harness uid、secret store 和
+uid 映射的进程里的模型，就是给任意一个被投毒的依赖开了 prompt injection 通道。而且模型
+相对规则唯一能"多做"的判断是**抑制**——恰恰是最危险的那个。完整说明和操作流程：
+`docs/agent-loop.md`。
+
+## 事件循环与慢操作
+
+harness 是单进程、单线程、一个 `selectors` 循环。单线程是硬约束：harness 会裸
+`os.fork()` 进 user namespace，fork 时别的线程持有的锁在子进程里永远不会释放（真实踩过：
+`rm`、`mv`、`uv python install` 挂到被 SIGKILL）。所以：
+
+- 健康探测是非阻塞 socket 状态机，不是线程池；
+- `git fetch`、`pnpm install`、构建、插件发布、备份全部在**独立的一次性进程**里跑
+  （定时器触发的 `ams platform core sync`、`ams provision`、备份 timer），通过控制 socket
+  和 harness 说话，从不在循环里；
+- 剩下仍可能在循环里停顿的都有上界：服务冷启动时一次 `chown -R`、退出后最多 2 s 等
+  cgroup 清空、关机时 45 s 预算。
+
+完整清单：`docs/event-loop.md`。
+
+## 宿主要求
+
+| | 必需？ | 说明 |
+|---|---|---|
+| Linux + systemd（委托 cgroup v2，`Delegate=yes`） | 必需 | 只在 Ubuntu 24.04 上验证过；systemd ≥ 255 有 `DelegateSubgroup=`，更老的版本 harness 会自己移进叶子 cgroup |
+| shadow `uidmap`（setuid `newuidmap`/`newgidmap`）+ harness 的 `/etc/subuid` 区段 | 必需 | `install-host.sh` 安装并分配（取第一段空闲区段，不硬编码 100000） |
+| AppArmor profile `ams-harness` | Ubuntu ≥ 23.10 必需 | 这些版本默认限制非特权 user namespace；profile 只对 harness 的私有解释器放行 `userns`，不放宽整机 |
+| XFS `reflink=1` 存储 | **可选** | 有它时每个服务的 venv / `node_modules` 与共享缓存共享数据块，几乎不占额外空间；没有时（`AMS_STORE_FS=plain`）退化为普通复制，功能完全一样 |
+| Caddy、R2（rclone 凭据） | 只有 platform 层要 | Caddy 是 core mode 的前端；R2 只用于备份 |
+| macOS | 仅开发 | `--no-isolation`：不建 namespace，全部以当前用户运行 |
+
+一台新的 Ubuntu 24.04 机器（root 执行一次）：
+
+```bash
+sudo deploy/install-host.sh                       # 默认：XFS loop 存储 + caddy 等工具
+sudo AMS_STORE_FS=plain AMS_WITH_TOOLS=0 deploy/install-host.sh   # 最小：只要隔离
+```
+
+## 为什么不直接用 rootless podman / systemd --user
+
+都考虑过（`docs/design/DECISIONS.md` D2、D4、D5、D7、D37）：
+
+- **每个服务一段独立的 subuid。** `unshare --map-auto` 和 podman 的默认映射都是"一个用户
+  一整段"，不是每服务一段；ams 自己做 `unshare` → 父进程 `newuidmap` 的握手。
+- **harness 的 uid 在运行时不被映射。** podman 默认把调用者映射成容器里的 root，容器里
+  root 逃逸出来就是那个用户；ams 的运行时映射里根本没有 harness uid。
+- **服务是直接子进程，日志是 fd。** 每行输出都在同一个进程里过决策点；换成每服务一个
+  unit 或容器，日志和生命周期就搬到了 journald / 容器运行时，决策点只能事后去读。
+
+代价是自己维护约 1.6k 行 fork/unshare/newuidmap/cgroup 代码。它现在在真机和 CI 里跑，
+但没有经过外部审计——这一点见上面的状态表。
+
+## 快速上手：只用 supervisor 核心
+
+```bash
+uv pip install -e .                                # 提供 `ams` 命令（或者用 python -m ams）
+export AMS_STATE_DIR=/tmp/ams-demo                 # macOS 上保持路径短（unix socket 104 字节上限）
+mkdir -p $AMS_STATE_DIR/services/hello
+cp examples/hello/service.toml $AMS_STATE_DIR/services/hello/
+ams run --no-isolation &                           # Linux 宿主上去掉 --no-isolation
+ams ctl status                                     # hello: running, healthy
+ams escalations                                    # 规则处理不了的事
+```
+
+在装好的 Linux 宿主上，`deploy/ams-harness.service` 以 `harness` 身份跑 `ams run`；
+`systemctl reload ams-harness`（或 `ams ctl reload`）重新读取声明，只增删改变化了的服务。
+
+## platform 层：core mode
+
+托管作者的 `api` v3.x（Cordis core：一个 Node 进程，插件由 core 自己热安装、探活、试用、
+自动回滚）。ams 负责：让 core 活着；core 代码变化时发布（stage → 构建 → 停 → 翻转
+`current` → 起 → 健康门禁，失败翻回）；通过 core 自己的控制 socket ship **内容**变了的
+插件（同样条件下失败过的内容键永不重试）；渲染 Caddy；备份到 R2；把每个失败写成一条
+escalation。不可信的步骤（`pnpm install` 的 lifecycle 脚本、构建、每次 `corectl`）都以
+**服务自己的身份**运行。
+
+```bash
+ams platform core config import plugins.json --rebase /var/lib/core=@data --rebase /etc/core=@etc --jwt-dir ./keys
+systemctl start ams-harness                  # ams run --policy platform
+ams platform core bootstrap                  # 声明 caddy，首次发布，装好整个 roster
+systemctl enable --now ams-core-sync.timer   # 之后每 60 s 一个 tick
+ams platform core status                     # release / previous / held，每个插件的状态
+ams platform core release --rollback
+```
+
+端到端说明：`docs/platform-core.md`。
 
 ## 布局
 
 | 路径 | 职责 |
 |---|---|
-| `src/ams/schema.py` | 声明 → frozen dataclass，校验，`depends_on`，`runtime.node/pnpm/build` 钉版本 |
-| `src/ams/supervisor.py`、`health.py` | 单线程事件循环、生命周期、健康探测、`waiting` |
-| `src/ams/decision.py`、`events.py` | 抑制或修复的决策边界 |
-| `src/ams/isolated.py`、`userns.py`、`cgroup.py` | Linux 隔离层；`run_admin`（admin map，可带 mount mask）、`run_as_service`（以服务身份一次性运行） |
-| `src/ams/uidmap.py`、`ports.py`、`state.py` | subuid 块、端口分配、状态目录 |
-| `src/ams/runtime.py`、`secrets.py`、`control.py` | 供应、托管 Node 工具链、`provision_tree`、只写 secrets、控制 socket |
-| `src/ams/cli.py` | `ams run/provision/validate/ctl/check-host/secret/platform` |
-| `src/ams/platform/core.py` | core mode：`core.toml`、布局、config bundle、`service.toml` 生成、`current` 翻转、树钉版本检查 |
-| `src/ams/platform/coresync.py` | core mode 的一次 tick、release/rollback/ship、`core.json` 记录 |
-| `src/ams/platform/corectl.py`、`assets/core_plan.mjs` | 经上游 `scripts/corectl.mjs` 的控制面；内容键 planner（包数据，不被 import） |
-| `src/ams/platform/sources.py` | 裸镜像、每 sha 规范检出、staging（`dest=`、`stage_plain`） |
-| `src/ams/platform/gateway.py`、`static.py` | Caddyfile 渲染器（`render_core` 与 legacy `render`）、`kind: static` 发布 |
-| `src/ams/platform/backup.py` | 每日 SQLite 快照 + 不可变 byte store（`bytes/` 前缀）到 R2 |
-| `src/ams/platform/policy.py` | platform 决策策略、按原因去重 |
-| `src/ams/platform/{yamlsubset,translate,sync,bootstrap,layer0,registryclient,rollback,pool}.py` | legacy manifest mode（deprecated） |
-| `deploy/` | systemd unit（harness、`ams-core-sync` 定时器、legacy sync、backup）、AppArmor profile、`install-host.sh` |
-| `scripts/` | `deploy-racknerd.sh`、`remote-test.sh`、`platform-bootstrap.sh`、`install-rclone.sh` |
-
-## 宿主要求
-
-Ubuntu 24.04（或任何具备 cgroup v2 + shadow `uidmap` 的 Linux）。
-`deploy/install-host.sh` 创建 `harness` 用户，安装只对 harness 解释器授予
-`userns` 的 AppArmor profile（24.04 限制非特权 user namespace），挂载 XFS
-reflink 存储，并安装钉死版本的静态 Caddy 二进制。
-
-## core mode 快速上手
-
-以 `harness` 身份，在装好的宿主上：
-
-```bash
-# 1. 把 api 的裸镜像推到 <store>/upstream/api.git（api 是私有仓库，harness 没有凭据）
-# 2. 写 <state>/platform/core.toml（完整参考：docs/platform-core.md）
-ams platform core config import plugins.json \
-    --rebase /var/lib/core=@data --rebase /etc/core=@etc \
-    --jwt-dir ./keys --fonts ./fonts         # 只打印文件名，绝不打印值
-systemctl start ams-harness                  # ams run --policy platform
-ams platform core bootstrap                  # 声明 caddy，首次 release，装好整个 roster
-systemctl enable --now ams-core-sync.timer   # 之后每 60 s 一个 tick
-```
-
-日常运维：
-
-```bash
-ams platform core status                     # release / previous / held，每个插件的 phase、artifact、ams 的上次尝试、drift
-ams platform core sync                       # 手动跑一个 tick；定时器跑的是同一套代码
-ams platform core release --rollback         # 翻回上一个 release，并 hold 住回滚前的 sha
-ams platform core ship timeservice --force   # 立即从已 stage 的树 ship（--force 无视内容键记录）
-ams ctl status                               # harness 视角：什么在跑、是否健康
-```
-
-本地开发（macOS 也行）：`ams run --no-isolation --policy platform` 加上各命令的
-`--no-isolation`，全部以当前用户身份运行，没有 user namespace。
-
-## legacy manifest mode
-
-api v2.0.0 的路径（`ams platform sync|status|bootstrap|rollback|pool`、
-`scripts/platform-bootstrap.sh`、`ams-platform-sync.timer`）在 1.1.0 中原样保留，
-标记为 deprecated。文档：`docs/platform.md`、`docs/platform-pools.md`、
-`docs/manifest-translation.md`、`docs/platform-sidecars.md`。
+| `src/ams/schema.py` | `service.toml` → frozen dataclass，校验，`depends_on`，runtime 钉版本 |
+| `src/ams/supervisor.py`、`health.py` | 单线程事件循环、生命周期、非阻塞健康探测、`waiting` |
+| `src/ams/decision.py`、`events.py`、`escalations.py` | 抑制或修复的决策边界；escalation 日志 |
+| `src/ams/isolated.py`、`userns.py`、`cgroup.py`、`uidmap.py` | Linux 隔离层：`run_admin`（admin map + mount mask）、`run_as_service`、subuid 分块 |
+| `src/ams/ports.py`、`state.py`、`secrets.py`、`control.py` | 端口分配、状态目录、只写 secrets、控制 socket |
+| `src/ams/runtime.py` | 供应（uv/venv/pnpm/bun）、托管 Node 工具链、`provision_tree` |
+| `src/ams/cli.py` | `ams run/provision/validate/ctl/check-host/secret/escalations/platform` |
+| `src/ams/platform/` | core mode：`core.py` 配置与布局、`coresync.py` tick、`corectl.py` 控制面、`gateway.py` Caddy、`backup.py`、`policy.py`、`sources.py` |
+| `deploy/` | `install-host.sh`、systemd unit（harness、`ams-core-sync`、备份）、AppArmor profile |
+| `scripts/` | `linux-test.sh`（在宿主上跑 Linux 测试）、`remote-test.sh`（经 ssh）、`deploy.sh`、`install-rclone.sh` |
+| `docs/` | `service-declaration.md`、`agent-loop.md`、`event-loop.md`、`platform-core.md`、`design/`（决策记录、计划、进度、历史与证据） |
 
 ## 开发
 
 ```bash
 uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install pytest pytest-timeout ruff
-.venv/bin/python -m pytest -q       # 可移植测试
-scripts/remote-test.sh              # linux 标记的测试，在目标宿主上跑
+.venv/bin/python -m pytest -q                         # 可移植测试
+ruff check . && ruff format --check src tests
+sudo scripts/linux-test.sh                            # Linux 宿主上（install-host.sh 时带 AMS_TEST_DEPS=1）
+AMS_HOST=<ssh 主机> scripts/remote-test.sh            # 同上，从本机经 ssh
 ```
 
-设计决策及其被否决的备选方案在 `docs/design/DECISIONS.md`（core mode 是
-D31/D32）；进度在 `docs/design/PROGRESS.md`；core mode 的计划在
-`docs/design/PLAN-core.md`；变更记录在 `CHANGELOG.md`。
+设计决策及被否决的备选方案：`docs/design/DECISIONS.md`；进度：`docs/design/PROGRESS.md`；
+变更记录：`CHANGELOG.md`。
+
+## 许可证
+
+MIT，见 `LICENSE`。

@@ -16,6 +16,9 @@ mode**；core mode 成为唯一的 platform 模式，通用 supervisor 核心与
 
 ### Added
 
+- **Linux 隔离模式 core e2e 证据**：`docs/design/evidence/core-e2e-linux-2026-10-01.txt`
+  （7 个场景：bootstrap、空闲 tick、单插件 ship、坏插件被拒、core release、回滚、harness
+  重启；core 以独立 subuid 运行、CapEff 0、NoNewPrivs 1、harness uid 不在映射内）。
 - **CI**（`.github/workflows/ci.yml`）：`portable`（ubuntu-24.04 + macOS，ruff + pytest）与
   `linux-isolation`（ubuntu-24.04 runner 上 `deploy/install-host.sh` 建 harness 用户、
   subuid、AppArmor profile，再 `scripts/linux-test.sh` 以 harness 身份在委托 cgroup 里跑
@@ -39,6 +42,13 @@ mode**；core mode 成为唯一的 platform 模式，通用 supervisor 核心与
 
 ### Changed
 
+- **README 重写**：写清这是给愿意自己管 Linux 机器的操作者及其 agent 的，不是"一键托管"；
+  状态表逐项列出验证过什么、没验证什么（无生产使用、无外部审计、CI 尚未在 GitHub 跑过）；
+  supervisor 核心与 platform 层分开介绍；"agent 在哪里"、"事件循环与慢操作"、宿主要求
+  （必需 vs 可选）、"为什么不用 rootless podman / systemd --user"。
+- 新增 `docs/event-loop.md`（循环里跑什么、什么绝不能进循环、仍可能停顿的有界操作）。
+- `docs/platform-core.md` 状态更新为 Linux 隔离模式实测结果；`docs/design/DECISIONS.md`
+  新增 D33–D37。
 - core mode 复用的小函数移到 `ams.platform.common`（`write_if_changed`、
   `uid_allocator`、`ctl_reload`、`ctl_restart`）；`gateway.caddy_declaration(state, store,
   port)` 直接生成固定端口的 Caddy 声明（取代 `layer0._caddy_declaration_text`）。
@@ -85,6 +95,8 @@ mode**；core mode 成为唯一的 platform 模式，通用 supervisor 核心与
 
 ### Fixed
 
+- **wheel 缺少 `assets/core_plan.mjs`**：`pyproject.toml` 未声明 package data，pip 安装
+  的 ams 跑 core mode 会找不到 planner（rsync 源码树部署不受影响，所以一直没暴露）。
 - **gateway：未知 Host 不再得到 Caddy 默认的空 200。** 入口站点原为
   `http://127.0.0.1:<port>`，只匹配 Host 127.0.0.1；任何没有 `[[site]]` 的 Host 都拿到
   空 200，与正常路由无法区分。入口改为同端口 catch-all `http://:<port>`（具体 host 的

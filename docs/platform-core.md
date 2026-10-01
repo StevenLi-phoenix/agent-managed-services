@@ -7,13 +7,17 @@ the whole thing: what ams does and what it leaves to core, where every file
 lives, what one tick does, how releases, shipping, escalations, backup and the
 security model work, and what has not been verified yet.
 
-> **Status (2026-09-30).** Implemented and tested: 1608 portable tests pass,
-> and a local end-to-end run against the real api on macOS in plain mode
-> (`--no-isolation`) passed all six scenarios
-> (`docs/design/history/evidence/core-e2e-local-2026-09-29.txt`). **The Linux
-> isolation path (user namespaces, `run_as_service`, uid blocks) has never
-> run live.** The racknerd host was torn down, and re-provisioning it is the
-> next step. Read the security section with that in mind.
+> **Status (2026-10-01, ams 2.0.0).** Implemented and tested. On an Ubuntu
+> 24.04 host (kernel 7.0, cgroup v2, AppArmor userns restriction on) the whole
+> suite passes as `harness` in a delegated cgroup (996 passed, 10 skipped), and
+> an **isolated** end-to-end run against the real api (v3.1.0) passed seven
+> scenarios: bootstrap, idle tick, single-plugin ship, rejected plugin, core
+> release, rollback, harness restart
+> (`docs/design/evidence/core-e2e-linux-2026-10-01.txt`). Core ran as its own
+> subordinate uid with no capabilities, `no_new_privs`, the harness uid unmapped
+> and the cgroup limits applied. The earlier macOS plain-mode run is in
+> `docs/design/history/evidence/core-e2e-local-2026-09-29.txt`. Not yet: R2
+> backups on Linux, production traffic, an external security review.
 
 Core mode is the only platform mode since ams 2.0.0. The 1.0.0 manifest mode
 (api v2.0.0: `service.yaml` translation, pools, Layer-0 registry/auth) was
@@ -572,10 +576,10 @@ The rules that follow from it:
 
 **Known gaps** (DECISIONS D31/D32, Open):
 
-- None of the isolation above has run on Linux. Only the argv and paths are
-  checked by portable tests, plus two Linux-marked tests
-  (`tests/linux/test_run_as_service_live.py`, `test_run_admin_mask_live.py`)
-  that have not run on a host since they were written.
+- The isolation above has run on one Linux host (2026-10-01): the Linux-marked
+  tests (`tests/linux/test_run_as_service_live.py`, `test_run_admin_mask_live.py`
+  among them) and the isolated end-to-end run. It has not been externally
+  reviewed.
 - `SourceMirror.stage` (`mkdir -p` / `cp -a` / `chown -R` on
   `R/releases/<sha>.new`) and the release gc (`find` / `rm -rf`) still run
   as inner root inside the service root. `ensure_layout`'s symlink refusal
@@ -616,9 +620,10 @@ scratch clone of api; `~/Codes/api` itself was never touched.
 
 ## Limits and open items
 
-- **Linux live run outstanding.** It needs racknerd, or another host,
-  re-provisioned (a user decision). Then run `scripts/remote-test.sh` and a
-  live core end-to-end run.
+- **One Linux host so far.** The isolated run used a workstation with a plain
+  ext4 store; an XFS reflink store and a 1 vCPU / 1-2 GB VPS (the intended
+  target) have not been re-verified since 1.0.0. CI repeats the test suite on
+  every push once the branch is pushed.
 - **Deploy cost.** `corectl deploy` reads and hashes every stored artifact.
   `gc` after each ship keeps the store small, but avoiding the hash would
   mean re-implementing corectl's protocol, which is ruled out.
