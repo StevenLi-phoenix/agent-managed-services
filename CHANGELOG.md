@@ -20,6 +20,9 @@
 - 非阻塞探测的回归测试不再依赖子进程的打印速度：从 talker 打出第一行才开始计时，断言
   "行到达的最大间隔 < 1 s" 而不是"行数 ≥ 20"（macOS runner 上 talker 每秒只有约 9 行）；
   对旧的阻塞实现仍然失败（2.01 s）。
+- Linux 对照测试 `test_memory_max_alone_does_not_bound_a_greedy_process`（演示有 swap 时
+  `memory.max` 不是硬上限）在宿主来不及换出、直接 OOM 时改为 skip 并说明原因；它是宿主
+  状态相关的观察，产品依赖的保证由 `set_swap_max(0)` 的测试覆盖。
 - `test_lines_are_tagged_assembled_and_flushed_at_eof` 在慢 runner 上偶发失败：它等到进程
   被回收就返回，而管道按设计还要排空；改为等到 finalize。
 
