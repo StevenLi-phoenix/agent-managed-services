@@ -622,8 +622,8 @@ scratch clone of api; `~/Codes/api` itself was never touched.
 
 - **One Linux host so far.** The isolated run used a workstation with a plain
   ext4 store; an XFS reflink store and a 1 vCPU / 1-2 GB VPS (the intended
-  target) have not been re-verified since 1.0.0. CI repeats the test suite on
-  every push once the branch is pushed.
+  target) have not been re-verified since 1.0.0. CI (green since 2026-10-02) repeats the test suite on
+  every push.
 - **Deploy cost.** `corectl deploy` reads and hashes every stored artifact.
   `gc` after each ship keeps the store small, but avoiding the hash would
   mean re-implementing corectl's protocol, which is ruled out.

@@ -1203,7 +1203,10 @@ Done:
   (gateway: unknown Host got Caddy's empty 200 → entry site is now `http://:<port>`).
 - (1) **CI**: `.github/workflows/ci.yml` (portable on Linux+macOS; isolation job on
   `ubuntu-24.04` with the same two host steps). Validated against the GitHub workflow
-  schema; not yet run (branch not pushed).
+  schema. *Pushed 2026-10-02; green on the sixth run* -- the first runs found
+  a pam_env `XDG_*` leak in install-host, a real staging bug (`cp -a` copying a
+  POSIX ACL that names an unmapped user → EINVAL), a formatting slip and three
+  timing-dependent tests; all fixed (see CHANGELOG Unreleased).
 - (9) **Health probes never block the loop**: `ams.health.Probe` in the selector
   (D33). Regression test: a silent `/health` used to stall `run_once` 2.00 s.
   `docs/event-loop.md`.
