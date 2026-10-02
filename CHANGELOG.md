@@ -17,8 +17,9 @@
   argument`，core 根本无法 stage。改为 `cp -dR --preserve=timestamps,links`
   （`sources.STAGE_CP_FLAGS`），不再复制 ACL/xattr；权限位仍来自源文件，属主由随后的
   chown 设置。GitHub runner 上发现，在测试宿主上加一条默认 ACL 复现并验证。
-- 非阻塞探测的回归测试从 talker 打出第一行才开始计时（macOS runner 上解释器启动就超过
-  1 秒）；对旧的阻塞实现仍然失败（2.01 s）。
+- 非阻塞探测的回归测试不再依赖子进程的打印速度：从 talker 打出第一行才开始计时，断言
+  "行到达的最大间隔 < 1 s" 而不是"行数 ≥ 20"（macOS runner 上 talker 每秒只有约 9 行）；
+  对旧的阻塞实现仍然失败（2.01 s）。
 - `test_lines_are_tagged_assembled_and_flushed_at_eof` 在慢 runner 上偶发失败：它等到进程
   被回收就返回，而管道按设计还要排空；改为等到 finalize。
 

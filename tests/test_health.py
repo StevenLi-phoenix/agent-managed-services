@@ -289,21 +289,35 @@ def test_a_silent_http_health_endpoint_never_stalls_the_loop(tmp_path):
         )
         worst = 0.0
         ticks = 0
-        end = time.monotonic() + 1.5
+        last_line = start = time.monotonic()
+        widest_gap = 0.0
+        seen: list[Event] = []
+        end = start + 2.5  # longer than the probe's 2 s timeout
         while time.monotonic() < end:
             t0 = time.monotonic()
             events = sup.run_once(0.02)
             worst = max(worst, time.monotonic() - t0)
-            ticks += sum(1 for e in events if isinstance(e, LogLine) and e.service_id == "talker")
+            seen += events
+            got = sum(1 for e in events if isinstance(e, LogLine) and e.service_id == "talker")
+            if got:
+                widest_gap = max(widest_gap, time.monotonic() - last_line)
+                last_line = time.monotonic()
+                ticks += got
         assert worst < 0.5, f"run_once blocked for {worst:.2f}s behind a silent probe"
-        assert ticks >= 20, f"talker's lines were starved: {ticks}"
-        # ... and the probe still concludes: unhealthy once its own timeout passes.
-        events = pump(
-            sup,
-            lambda ev: any(isinstance(e, HealthChanged) and e.service_id == "silent" for e in ev),
-            seconds=4.0,
-        )
-        change = next(e for e in events if isinstance(e, HealthChanged))
+        # How fast the talker prints depends on the host (a macOS CI runner
+        # managed ~9 lines/s); what must not happen is a gap the size of the
+        # probe timeout, which is what the blocking probe produced.
+        assert ticks >= 3, f"talker's lines stopped arriving: {ticks}"
+        assert widest_gap < 1.0, f"talker's lines stalled for {widest_gap:.2f}s"
+
+        # ... and the probe still concludes: unhealthy once its own timeout passes
+        # (usually inside the window above, which outlasts that timeout).
+        def concluded(ev: list[Event]) -> bool:
+            return any(isinstance(e, HealthChanged) and e.service_id == "silent" for e in ev)
+
+        if not concluded(seen):
+            seen += pump(sup, concluded, seconds=4.0)
+        change = next(e for e in seen if isinstance(e, HealthChanged) and e.service_id == "silent")
         assert change.healthy is False and "timed out" in change.detail
     finally:
         sup.shutdown(1.0)
