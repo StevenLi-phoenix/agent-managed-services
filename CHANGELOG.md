@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `deploy/install-host.sh` 在 GitHub runner 上失败：runner 的 `/etc/environment` 设了
+  `XDG_CONFIG_HOME=/home/runner/.config`，`su -l` 经 pam_env 带进 harness 会话，uv 安装器
+  往别人的家目录写。以 harness 身份执行的命令现在先清掉 `XDG_*`（`as_harness`）。
+- `test_lines_are_tagged_assembled_and_flushed_at_eof` 在慢 runner 上偶发失败：它等到进程
+  被回收就返回，而管道按设计还要排空；改为等到 finalize。
+
 ## [2.0.0] - 2026-10-01
 
 外部 review 的整改版本。**破坏性变更：删除了 1.1.0 起 deprecated 的 legacy manifest

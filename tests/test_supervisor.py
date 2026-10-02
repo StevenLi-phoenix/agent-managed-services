@@ -172,7 +172,10 @@ def test_lines_are_tagged_assembled_and_flushed_at_eof(tmp_path):
     )
     sup, st = make(tmp_path, decl(code))
     sup.start("svc")
-    events = pump(sup, until=lambda ev: st.status in ("stopped", "failed"))
+    # Until finalized, not merely reaped: the exit is seen before the pipes are
+    # drained (by design, see EOF_GRACE_S), and a slow host still has the
+    # stderr tail in flight at that moment.
+    events = pump(sup, until=lambda ev: st.status in ("stopped", "failed") and st.spawned is None)
     assert lines(events, "stdout") == ["partial", "second"]
     assert lines(events, "stderr") == ["tail-without-newline"]
     assert all(e.service_id == "svc" for e in of_type(events, LogLine))

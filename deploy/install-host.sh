@@ -32,6 +32,14 @@ esac
 
 log() { echo "install-host: $*"; }
 
+# Run a command as the harness user in a login shell. pam_env copies
+# /etc/environment into that shell, and some images (GitHub's runners) set
+# XDG_* there to the *image user's* home: installers then write to a directory
+# harness does not own. Drop them so every tool falls back to $HOME.
+as_harness() {
+  su -l "$HARNESS_USER" -c "unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME; $1"
+}
+
 export DEBIAN_FRONTEND=noninteractive
 # libatomic1: the standalone pnpm binary dlopens libatomic.so.1 and a minimal
 # 24.04 cloud image does not ship it (found on the DO mock host, 2026-09-03).
@@ -67,13 +75,13 @@ chmod 711 "$HARNESS_HOME"
 
 # 2. Private interpreter copy so the AppArmor userns grant applies only to the harness.
 if [ ! -x "$HARNESS_HOME/venv/bin/python3" ]; then
-  su -l "$HARNESS_USER" -c "python3 -m venv --copies $HARNESS_HOME/venv"
+  as_harness "python3 -m venv --copies $HARNESS_HOME/venv"
 fi
 if [ "$TEST_DEPS" = 1 ]; then
-  su -l "$HARNESS_USER" -c "$HARNESS_HOME/venv/bin/python3 -m pip install -q 'pytest>=8' 'pytest-timeout>=2'"
+  as_harness "$HARNESS_HOME/venv/bin/python3 -m pip install -q 'pytest>=8' 'pytest-timeout>=2'"
 fi
 if [ "$WITH_TOOLS" = 1 ]; then
-  su -l "$HARNESS_USER" -c 'command -v ~/.local/bin/uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null'
+  as_harness 'command -v ~/.local/bin/uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null'
 fi
 
 # 3. AppArmor: kernel.apparmor_restrict_unprivileged_userns=1 on 24.04.
@@ -96,13 +104,13 @@ if [ "$STORE_FS" = xfs ]; then
 fi
 log "store: $STORE_MNT ($STORE_FS)"
 chown "$HARNESS_USER:$HARNESS_USER" "$STORE_MNT"; chmod 755 "$STORE_MNT"
-su -l "$HARNESS_USER" -c "mkdir -p $STORE_MNT/uv-cache $STORE_MNT/python $STORE_MNT/venvs $STORE_MNT/pnpm-store $STORE_MNT/pnpm-home $STORE_MNT/bun-cache"
+as_harness "mkdir -p $STORE_MNT/uv-cache $STORE_MNT/python $STORE_MNT/venvs $STORE_MNT/pnpm-store $STORE_MNT/pnpm-home $STORE_MNT/bun-cache"
 
 if [ "$WITH_TOOLS" = 1 ]; then
   # 4b. Toolchains for unpinned pnpm/bun runtimes (DECISIONS D10). Core mode does not
   # need them: it downloads its pinned node/pnpm itself (runtime.node).
-  su -l "$HARNESS_USER" -c "test -x $STORE_MNT/pnpm-home/bin/pnpm || (curl -fsSL https://get.pnpm.io/install.sh | env PNPM_HOME=$STORE_MNT/pnpm-home SHELL=/bin/bash sh -) >/dev/null"
-  su -l "$HARNESS_USER" -c 'test -x ~/.bun/bin/bun || (curl -fsSL https://bun.sh/install | BUN_INSTALL=$HOME/.bun bash) >/dev/null'
+  as_harness "test -x $STORE_MNT/pnpm-home/bin/pnpm || (curl -fsSL https://get.pnpm.io/install.sh | env PNPM_HOME=$STORE_MNT/pnpm-home SHELL=/bin/bash sh -) >/dev/null"
+  as_harness 'test -x ~/.bun/bin/bun || (curl -fsSL https://bun.sh/install | BUN_INSTALL=$HOME/.bun bash) >/dev/null'
   command -v node >/dev/null || log "WARNING: no system node; unpinned pnpm runtimes need one (or pin runtime.node)"
 
   # 4c. Pinned static Caddy binary for the gateway.
