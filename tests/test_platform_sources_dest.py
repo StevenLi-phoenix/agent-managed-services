@@ -58,7 +58,7 @@ def test_default_dest_is_byte_identical_to_the_old_repo_stage(
     assert explicit == root / "repo"
     assert [c for i, c in enumerate(recorder.calls) if i != 2] == [
         ["rm", "-rf", new, str(root / "repo.old")],
-        ["cp", "-a", "--reflink=auto", str(canonical), new],
+        ["cp", "-dR", "--preserve=timestamps,links", "--reflink=auto", str(canonical), new],
         ["chown", "-R", "1000:1000", new],
         ["mv", new, str(root / "repo")],
     ]
@@ -83,7 +83,7 @@ def test_a_nested_dest_creates_and_chowns_only_the_missing_parents(
         ["mkdir", "-p", str(root / "releases")],
         ["chown", "1000:1000", str(root / "releases")],
         ["rm", "-rf", new, old],
-        ["cp", "-a", "--reflink=auto", str(canonical), new],
+        ["cp", "-dR", "--preserve=timestamps,links", "--reflink=auto", str(canonical), new],
         marker_cp,
         ["chown", "-R", "1000:1000", new],
         ["mv", new, str(target)],

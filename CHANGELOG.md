@@ -12,6 +12,13 @@
 - `deploy/install-host.sh` 在 GitHub runner 上失败：runner 的 `/etc/environment` 设了
   `XDG_CONFIG_HOME=/home/runner/.config`，`su -l` 经 pam_env 带进 harness 会话，uv 安装器
   往别人的家目录写。以 harness 身份执行的命令现在先清掉 `XDG_*`（`as_harness`）。
+- **staging 在带 POSIX ACL 的宿主上失败**：admin namespace 里的 `cp -a` 会保留 ACL，
+  ACL 里点名的宿主用户在 namespace 中没有映射 → `preserving permissions: Invalid
+  argument`，core 根本无法 stage。改为 `cp -dR --preserve=timestamps,links`
+  （`sources.STAGE_CP_FLAGS`），不再复制 ACL/xattr；权限位仍来自源文件，属主由随后的
+  chown 设置。GitHub runner 上发现，在测试宿主上加一条默认 ACL 复现并验证。
+- 非阻塞探测的回归测试从 talker 打出第一行才开始计时（macOS runner 上解释器启动就超过
+  1 秒）；对旧的阻塞实现仍然失败（2.01 s）。
 - `test_lines_are_tagged_assembled_and_flushed_at_eof` 在慢 runner 上偶发失败：它等到进程
   被回收就返回，而管道按设计还要排空；改为等到 finalize。
 

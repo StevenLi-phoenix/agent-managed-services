@@ -15,7 +15,7 @@ the single XFS ``reflink=1`` store (D8/D13):
     service on that sha. ``gc(keep)`` prunes the least recently used.
 
 ``<service_root>/repo``
-    A per-service copy made with ``cp -a --reflink=auto`` *inside the admin user
+    A per-service copy made with ``cp -dR --reflink=auto`` *inside the admin user
     namespace*, then chowned to the service block. Same filesystem as the
     canonical tree, so the extents are shared and the second service on a sha
     costs metadata only. ``stage(dest=...)`` puts it elsewhere under the root
@@ -96,6 +96,14 @@ _DEST_PART_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
 
 _TOOL_PATH = "/usr/local/bin:/usr/bin:/bin"
 
+
+
+#: How a staged tree is copied inside the admin namespace. Not ``-a``: that
+#: preserves POSIX ACLs and xattrs, and an ACL naming a host user who is not
+#: mapped into the namespace fails with EINVAL ("preserving permissions ...
+#: Invalid argument") -- seen on GitHub's runners. Mode bits still come from
+#: the source (masked by the umask); ownership is set by the chown that follows.
+STAGE_CP_FLAGS: tuple[str, ...] = ("-dR", "--preserve=timestamps,links", "--reflink=auto")
 
 class SourceError(RuntimeError):
     """A git/tar/cp step failed, timed out, or the input was refused.
@@ -504,7 +512,7 @@ class SourceMirror:
             os.chmod(marker_src, 0o644)
             self._admin(["rm", "-rf", str(new), str(old)], what="clear stage dirs", **admin_kwargs)
             self._admin(
-                ["cp", "-a", "--reflink=auto", str(canonical), str(new)],
+                ["cp", *STAGE_CP_FLAGS, str(canonical), str(new)],
                 what=f"reflink copy {sha}",
                 **admin_kwargs,
             )

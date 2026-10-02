@@ -311,7 +311,7 @@ def test_stage_of_a_fresh_root_creates_it_and_runs_the_expected_admin_commands(
     marker_cp = recorder.calls[2]
     assert recorder.calls == [
         ["rm", "-rf", new, old],
-        ["cp", "-a", "--reflink=auto", str(canonical), new],
+        ["cp", "-dR", "--preserve=timestamps,links", "--reflink=auto", str(canonical), new],
         marker_cp,
         ["chown", "-R", "1000:1000", new],
         ["mv", new, str(repo)],

@@ -278,6 +278,15 @@ def test_a_silent_http_health_endpoint_never_stalls_the_loop(tmp_path):
     try:
         sup.start("silent")
         sup.start("talker")
+        # Measure from the talker's first line: interpreter start-up is slow on
+        # a loaded CI runner (macOS: well over a second) and is not the loop's
+        # fault. The silent probe is in flight throughout -- it times out
+        # after 2 s and the next one starts 0.05 s later.
+        pump(
+            sup,
+            lambda ev: any(isinstance(e, LogLine) and e.service_id == "talker" for e in ev),
+            seconds=20.0,
+        )
         worst = 0.0
         ticks = 0
         end = time.monotonic() + 1.5
