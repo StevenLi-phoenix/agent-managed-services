@@ -61,14 +61,16 @@ class EscalationJournal:
     """Append-only JSONL file shared by every ams process on one state dir.
 
     ``append`` never raises: a full disk or a broken logs dir must not take an
-    escalation down with it -- stdout still has the record.
+    escalation down with it -- stdout still has the record. It returns whether
+    the record reached the file, for the callers (``ams escalate``, ``ams intake``)
+    that have no other copy.
     """
 
     path: Path
     source: str
     max_bytes: int = MAX_BYTES
 
-    def append(self, record: Mapping[str, Any]) -> None:
+    def append(self, record: Mapping[str, Any]) -> bool:
         line = json.dumps(
             {"ts": utc_now(), "source": self.source, **record}, default=str, sort_keys=False
         )
@@ -83,6 +85,8 @@ class EscalationJournal:
                 os.close(fd)
         except OSError as e:
             log.warning("could not append to escalation journal %s: %s", self.path, e)
+            return False
+        return True
 
     def _rotate_if_needed(self) -> None:
         try:

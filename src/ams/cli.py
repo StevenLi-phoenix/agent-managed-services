@@ -54,6 +54,7 @@ log = logging.getLogger("ams.cli")
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_UNAVAILABLE = 2
+EXIT_USAGE = 2
 
 # How often ``run`` logs a one-line-per-service summary.
 SUMMARY_INTERVAL_S = 60.0
@@ -126,6 +127,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_esc.add_argument("--since", default=None, help="only records at or after this UTC ISO time")
     p_esc.add_argument("--json", action="store_true", help="raw JSON lines (untrusted content)")
 
+    p_esc2 = sub.add_parser(
+        "escalate",
+        help="hand the operator a warning from outside the supervisor (writes the journal)",
+    )
+    p_esc2.add_argument("title", help="one line: what is wrong")
+    p_esc2.add_argument(
+        "--source", required=True, help="who warns: dotted lowercase words, e.g. n8"
+    )
+    p_esc2.add_argument("--severity", default="warn", help="info|warn|error|crit (default warn)")
+    p_esc2.add_argument("--key", default=None, help="dedupe key for the sender's own use")
+    p_esc2.add_argument("--subject", default=None)
+    p_esc2.add_argument("--url", default=None)
+    p_esc2.add_argument("--text", default=None, help="detail; '-' reads stdin (untrusted data)")
+    p_esc2.add_argument("--state-dir", type=Path, default=None, help="overrides $AMS_STATE_DIR")
+
+    p_intake = sub.add_parser("intake", help="HTTP receiver for external escalations")
+    intake_sub = p_intake.add_subparsers(dest="intake_command", required=True)
+    p_serve = intake_sub.add_parser("serve", help="listen and append to the journal")
+    p_serve.add_argument("--state-dir", type=Path, default=None, help="overrides $AMS_STATE_DIR")
+    p_serve.add_argument("--bind", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=18090)
+    p_serve.add_argument(
+        "--token-file", type=Path, default=None, help="default: $AMS_INTAKE_TOKEN (ams secret)"
+    )
+    p_serve.add_argument("--log-level", default="INFO")
+
     # `ams secret set|rm|list|check`. Argument wiring and handlers live in
     # ams.secrets so that every line that can touch a value sits in one module.
     from ams.secrets import add_subparser as _add_secret_subparser
@@ -176,6 +203,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_check_host()
     if args.command == "escalations":
         return cmd_escalations(args)
+    if args.command == "escalate":
+        return cmd_escalate(args)
+    if args.command == "intake":
+        return cmd_intake(args)
     return EXIT_ERROR  # pragma: no cover - argparse enforces the choices
 
 
@@ -203,6 +234,47 @@ def cmd_escalations(args: argparse.Namespace) -> int:
     for rec in records:
         print(json.dumps(rec, default=str) if args.json else format_record(rec))
     return EXIT_OK
+
+
+def cmd_escalate(args: argparse.Namespace) -> int:
+    """Append one external escalation: 0 written, 1 journal unwritable, 2 bad input."""
+    from ams.escalations import EscalationJournal, journal_path
+    from ams.external import ExternalError, parse_payload, record_for
+
+    text = sys.stdin.read() if args.text == "-" else args.text
+    body = {"origin": args.source, "severity": args.severity, "title": args.title}
+    for name, value in (
+        ("key", args.key),
+        ("subject", args.subject),
+        ("url", args.url),
+        ("text", text),
+    ):
+        if value is not None:
+            body[name] = value
+    try:
+        event = parse_payload(body)
+    except ExternalError as e:
+        print(f"ams escalate: {e}", file=sys.stderr)
+        return EXIT_USAGE
+    journal = EscalationJournal(journal_path(_state_dir(args.state_dir)), source="escalate")
+    if not journal.append(record_for(event)):
+        print(f"ams escalate: could not write {journal.path}", file=sys.stderr)
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def cmd_intake(args: argparse.Namespace) -> int:
+    from ams.escalations import EscalationJournal, journal_path
+    from ams.intake import read_token, serve
+
+    _configure_logging(args.log_level)
+    try:
+        token = read_token(args.token_file)
+    except OSError as e:
+        print(f"ams intake: cannot read the token file: {e.strerror}", file=sys.stderr)
+        return EXIT_USAGE
+    journal = EscalationJournal(journal_path(_state_dir(args.state_dir)), source="intake")
+    return serve(journal, token, args.bind, args.port)
 
 
 # --------------------------------------------------------------------- validate
