@@ -2266,3 +2266,32 @@ still runs installs as inner root under the mask. Still open.)*
   container per service moves logs and lifecycle out of the loop). The cost is
   owning ~1k lines of fork/unshare/newuidmap code -- now exercised on a real
   host and in CI, but not externally audited.
+
+### D38. External escalations and the host watcher live in AMS; the model stays out (2026-10-31)
+
+- Problem: three escalation paths grew side by side -- the supervisor's journal (read by DSH's
+  ga-watch), a model-driven host watcher (mini-ops, reusing `LogLine`, `cause_key` and the journal
+  class), and a push channel into the operator's own event bus. One owner, one operator, three
+  gates.
+- Decision: everything that is wrong, wherever it happens, becomes a record of the one journal.
+  `ams escalate` (local) and `ams intake` (HTTP; other hosts and other users cannot write the
+  harness's journal) take the `warn` CLI's payload and write a record shaped like the
+  supervisor's own escalation, whose `event.text` is a JSON log line, so the existing watcher's
+  signature `(level, msg, src)` applies unchanged. `ams watch` is mini-ops without the model:
+  same observation and gates, fixes chosen by rules from the same closed list with the same guards
+  (cooldown, daily and hourly caps, freeze, the Kaorou guard), every incident escalated with the
+  outcome of the fix.
+- Why the model is not ported (D34 stands): the only thing an in-loop model adds over the rules is
+  *suppression*, the dangerous verdict, and log text is attacker-controlled. What mini-ops'
+  model decided -- "does the owner hear about it" -- belongs to the operator that reads the
+  journal, which already runs a deterministic gate (new / back / flap) in front of its model.
+- Why `ams watch` is a separate process from the harness: the jobs it observes and fixes belong to
+  a login user's launchd domain and home, which the harness user cannot reach (and should not).
+  It talks to the harness over loopback HTTP with a bearer token; its outbox survives an intake
+  restart. Why the intake is a declared service and not part of the harness loop: a blocking
+  socket server may not run in the single-threaded loop (`docs/event-loop.md`), and as a service
+  it is supervised and probed like any other.
+- Rejected: writing the journal from other users via file ACLs (rotation recreates the file
+  without the ACL); an SSH forced command per sender (a key and a user per host, and `tag:server`
+  hosts reach only port 22 -- an HTTP port needs one ACL line instead).
+

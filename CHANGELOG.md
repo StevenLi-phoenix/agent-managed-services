@@ -7,6 +7,24 @@
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-31
+
+### Added
+
+- **`ams escalate`**：本机程序把一条警告写进 escalation 日志（`--source`、`--severity`
+  info|warn|error|crit、`--key/--subject/--url`、`--text -` 读 stdin）。记录与 supervisor 自己的
+  escalation 同形，`event.text` 是一行 JSON 日志（`level/msg/src/error`），ga-watch 的
+  `(level, msg, src)` 签名直接适用。
+- **`ams intake serve`**：给其他主机和其他用户用的 HTTP 接收器（`POST /escalate`、
+  `GET /healthz`，Bearer token，64 KiB 上限，1 小时内相同 key 记为 `duplicate`），作为 harness 的
+  普通声明服务运行。载荷与 `warn` CLI 一致。`EscalationJournal.append` 现在返回是否写入成功。
+- **`ams watch`**（`ams.ops`）：mini-ops 并入 AMS，去掉模型。launchd 任务（任意域）、HTTP/unix
+  socket 探针、日志、Tailscale Services 的观察与门禁（NEW/BACK/FLAP、down、restart storm、探针连续
+  失败）不变；修复由规则选择（`ams.ops.policy`）、仍由原来的 `Executor` 把关（allow-list、freeze、
+  冷却、日/时限额、烤肉 daemon 永不 kickstart）；每个事件连同"做了什么"经 intake 升级。
+  `ams watch run|status|check|freeze|test`，示例配置 `examples/watch/watch.toml`。
+- `docs/watch.md`、`docs/design/DECISIONS.md` D38。
+
 ### Fixed
 
 - `deploy/install-host.sh` 在 GitHub runner 上失败：runner 的 `/etc/environment` 设了

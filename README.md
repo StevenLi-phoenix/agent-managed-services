@@ -90,6 +90,13 @@ uid 映射的进程里的模型，就是给任意一个被投毒的依赖开了 
 相对规则唯一能"多做"的判断是**抑制**——恰恰是最危险的那个。完整说明和操作流程：
 `docs/agent-loop.md`。
 
+## 来自外部的 escalation 和主机 watcher
+
+`ams escalate`（本机程序）和 `ams intake`（HTTP，给其他主机和其他用户）把"某处出了问题"写进
+同一个 escalation 日志；`ams watch` 是主机级 watcher（launchd 任务、探针、日志、Tailscale
+Services，规则选择的有限修复，每个事件带着"做了什么"升级）。操作者只看一个日志、用一套
+门禁。说明：`docs/watch.md`。
+
 ## 事件循环与慢操作
 
 harness 是单进程、单线程、一个 `selectors` 循环。单线程是硬约束：harness 会裸
