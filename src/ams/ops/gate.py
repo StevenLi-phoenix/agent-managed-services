@@ -44,8 +44,10 @@ class Incident:
 class LogGate:
     """Per-signature novelty tracking, persisted in ``store.data['sigs']``."""
 
-    def __init__(self, sigs: dict[str, Any], cfg: GateConfig) -> None:
-        self.sigs, self.cfg = sigs, cfg
+    def __init__(
+        self, sigs: dict[str, Any], cfg: GateConfig, hist_cap: int | None = HIST_CAP
+    ) -> None:
+        self.sigs, self.cfg, self.hist_cap = sigs, cfg, hist_cap
 
     def seed(self, service: str, sig: str, sample: str, now: float) -> None:
         """Baseline pass: remember the cause without reporting it."""
@@ -69,7 +71,9 @@ class LogGate:
             }
             return "NEW", 1
         gap = now - e["last_seen"]
-        hist = [h for h in e["hist"] if now - h < self.cfg.flap_window_s][-HIST_CAP:]
+        hist = [h for h in e["hist"] if now - h < self.cfg.flap_window_s]
+        if self.hist_cap is not None:
+            hist = hist[-self.hist_cap :]
         hist.append(now)
         e.update(hist=hist, last_seen=now, sample=sample[:300])
         if gap > self.cfg.new_window_s:

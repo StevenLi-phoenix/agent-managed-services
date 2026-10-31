@@ -1,0 +1,26 @@
+# ams watch journal: the operator's gate on the escalation journal (docs/watch.md).
+# Run it as a Monitor-style long-lived command; every line it prints is "worth a judgement":
+#   ams watch journal --journal-config journal.toml
+# Rules are data, scoped to a service; the gate (new / back after 12 h / flapping) is the same for all.
+ignore_raw_prefixes = ["repeated "]   # the supervisor's own "N times in window" roll-up lines
+
+[journal]
+# path = "…/logs/escalations.jsonl"   # default: $AMS_STATE_DIR/logs/escalations.jsonl
+state = "~/.local/state/ams-watch/journal-state.json"   # ga-watch's file format
+
+[health]
+interval_s = 300
+services = ["my-service"]             # polled with `ams ctl status`: down, restarted
+
+[[rule]]
+service = "my-service"                # omit to apply to every service
+level = "warn"
+msg = ["routine upstream hiccup"]
+msg_prefix = ["slot unavailable"]
+msg_contains = ["ADMIN_OPEN=1"]
+
+[[known_missing]]                     # a failure the owner already knows about
+service = "my-service"
+msg = "source failed"
+src_prefix = ["optional-source"]
+error_contains = ["unset", "KEY", "TOKEN"]

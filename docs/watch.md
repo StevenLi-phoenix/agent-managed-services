@@ -47,6 +47,27 @@ treats a repeat of the same title from the same origin as one cause: reported wh
 after a long silence, or when it flaps. Put the stable cause in `title` and the changing details in
 `text`. Every field is untrusted: it is clipped, never interpreted, and sits inside one JSON string.
 
+## `ams watch journal` -- the operator's gate
+
+The journal is noisy by nature (one service printed 13,900 escalations in 8 days). The operator does
+not read it line by line: a long-lived command signs each cause and prints one line when a cause is
+**new**, **back** after 12 hours of silence, or **flapping** (5 in an hour, at most one line per 6
+hours), plus the health of the services it is told to poll. DSH runs it as a Monitor (every printed
+line wakes the agent). It generalises DSH's ga-watch, which was written for one service:
+
+* the gate is `ams.ops.gate.LogGate`, the same one the host watcher uses (two copies of one
+  algorithm became one);
+* ignore rules are data (`[[rule]]`, `[[known_missing]]`), each scoped to a service, so a rule for
+  one service never hides the same words from another;
+* `[health] services` are polled with `ams ctl status` (down: once per 30 minutes while it stays
+  down; restarted; the query itself failing);
+* the state file is ga-watch's format, so swapping the script keeps what it already knew.
+
+With the original service's rules the output is line for line what ga-watch printed:
+`tests/ops/test_ops_journal.py` replays a frozen copy of ga-watch against it (randomised traffic
+included), and the same was run over a real 13,910-record journal (80 lines each, identical).
+Example: `examples/watch/journal.example.toml`.
+
 ## `tools/warn` -- the sender for other hosts
 
 `tools/warn/warn.py` is the client: a single-file, stdlib-only (Python 3.8+) CLI with a local spool

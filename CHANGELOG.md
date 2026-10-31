@@ -26,6 +26,11 @@
 - `tools/warn/`：给其他主机用的发送端（单文件、仅标准库、Python 3.8+）：失败落本地 spool 下次补发、
   curl 一行写法、systemd `OnFailure=warn@%n.service` 模板、Docker 健康变化采集器。地址和 token 在各机
   `~/.config/warn/`，仓库里不内置任何地址。
+- **`ams watch journal`**：DSH 里 ga-watch（只为一个服务写的 Monitor）的通用版本。同一个
+  `LogGate`（NEW / 12 小时后重现 / 1 小时 5 次 FLAP，每 6 小时最多一条），忽略清单改成按服务限定的
+  配置数据（`[[rule]]`、`[[known_missing]]`），`[health] services` 轮询 `ams ctl status`，状态文件沿用
+  ga-watch 的格式。用原服务的规则时输出与 ga-watch 逐行一致（冻结的原版在
+  `tests/ops/oracle_ga_watch.py`，随机流量回放 + 真实 13,910 条 journal 回放均一致）。
 - `docs/watch.md`、`docs/design/DECISIONS.md` D38。
 
 ### Fixed

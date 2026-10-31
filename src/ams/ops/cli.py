@@ -58,6 +58,14 @@ def add_subparser(sub: Any) -> None:
     t = ws.add_parser("test", help="send one info escalation through the intake")
     t.add_argument("text", nargs="?")
     ws.add_parser("check", help="validate the config and the credential file")
+    j = ws.add_parser(
+        "journal",
+        help="the operator's gate on the escalation journal: a line per new/back/flapping cause",
+    )
+    j.add_argument(
+        "--journal-config", type=Path, required=True, help="rules, state file, health list"
+    )
+    j.add_argument("--state-dir", type=Path, default=None, help="overrides $AMS_STATE_DIR")
 
 
 def _load(args: argparse.Namespace):  # noqa: ANN202
@@ -256,7 +264,25 @@ def _check(cfg, args) -> int:  # noqa: ANN001
     return 0
 
 
+def _journal(args: argparse.Namespace) -> int:
+    from ams.ops import journal
+    from ams.state import StateDir
+
+    try:
+        cfg = journal.load_config(args.journal_config)
+    except (OSError, ValueError) as e:
+        print(f"ams watch journal: {e}", file=sys.stderr)
+        return 2
+    state = StateDir(args.state_dir) if args.state_dir else StateDir.from_env()
+    logging.basicConfig(
+        level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s"
+    )
+    return journal.run(cfg, state.root)
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
+    if args.watch_command == "journal":
+        return _journal(args)
     cfg = _load(args)
     if cfg is None:
         return 2
