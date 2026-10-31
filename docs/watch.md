@@ -47,6 +47,13 @@ treats a repeat of the same title from the same origin as one cause: reported wh
 after a long silence, or when it flaps. Put the stable cause in `title` and the changing details in
 `text`. Every field is untrusted: it is clipped, never interpreted, and sits inside one JSON string.
 
+## `tools/warn` -- the sender for other hosts
+
+`tools/warn/warn.py` is the client: a single-file, stdlib-only (Python 3.8+) CLI with a local spool
+for failed deliveries, a curl one-liner, a `warn@.service` template (`OnFailure=warn@%n.service`)
+and a Docker health watcher. Token and endpoint live in `~/.config/warn/` on each host. See
+`tools/warn/README.md`.
+
 ## `ams watch` -- the host watcher
 
 What mini-ops did, minus the model. It runs as the owner of the things it watches (a user's

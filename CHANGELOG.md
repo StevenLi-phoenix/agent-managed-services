@@ -23,6 +23,9 @@
   失败）不变；修复由规则选择（`ams.ops.policy`）、仍由原来的 `Executor` 把关（allow-list、freeze、
   冷却、日/时限额、烤肉 daemon 永不 kickstart）；每个事件连同"做了什么"经 intake 升级。
   `ams watch run|status|check|freeze|test`，示例配置 `examples/watch/watch.toml`。
+- `tools/warn/`：给其他主机用的发送端（单文件、仅标准库、Python 3.8+）：失败落本地 spool 下次补发、
+  curl 一行写法、systemd `OnFailure=warn@%n.service` 模板、Docker 健康变化采集器。地址和 token 在各机
+  `~/.config/warn/`，仓库里不内置任何地址。
 - `docs/watch.md`、`docs/design/DECISIONS.md` D38。
 
 ### Fixed

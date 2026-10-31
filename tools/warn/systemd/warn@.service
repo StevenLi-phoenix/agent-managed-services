@@ -1,0 +1,10 @@
+# Template: OnFailure=warn@%n.service in a drop-in of any unit (see lsy/tools/warn/README.md).
+# Host name in the alert: Environment=WARN_HOST=<name> in /etc/systemd/system/warn@.service.d/host.conf (default: hostname -s).
+# Install: /etc/systemd/system/warn@.service, /usr/local/bin/warn and /usr/local/bin/warn-unit-failed (755).
+[Unit]
+Description=Hand the failure of %i to the operator (warn)
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/warn-unit-failed %i

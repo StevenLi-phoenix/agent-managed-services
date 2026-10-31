@@ -25,7 +25,7 @@ where = ["src"]
 "ams.platform" = ["assets/*.mjs"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "tools/warn"]
 pythonpath = ["src"]
 timeout = 60
 markers = [
@@ -37,7 +37,7 @@ log_cli_level = "DEBUG"
 line-length = 100
 target-version = "py312"
 # one-off probe scripts kept as evidence, not maintained code
-extend-exclude = ["docs/design/history"]
+extend-exclude = ["docs/design/history", "tools"]  # tools/ are py3.8 single-file scripts for other hosts
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

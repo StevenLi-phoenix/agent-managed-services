@@ -1,0 +1,11 @@
+#!/bin/sh
+# Hand a failed systemd unit to the operator through `warn`. Started by warn@.service (OnFailure=warn@%n.service).
+# usage: warn-unit-failed <unit>   (WARN_HOST overrides the host name used as the source)
+# Exit 0 even when warn fails: the spool replays it, and a failing handler must not make noise itself.
+unit="${1:?usage: warn-unit-failed <unit>}"
+host="${WARN_HOST:-$(hostname -s 2>/dev/null || hostname)}"
+{ systemctl status --no-pager -n 15 "$unit" 2>&1 | head -30; } |
+  warn --source "$host.systemd" --severity error \
+    --key "$host-$unit-$(date -u +%Y%m%d%H)" --subject "$host $unit" \
+    "systemd unit $unit failed on $host" --text - || true
+exit 0
