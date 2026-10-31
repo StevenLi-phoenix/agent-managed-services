@@ -24,7 +24,7 @@ written, 1 journal unwritable, 2 bad arguments. `--severity` is `info|warn|error
 
 `ams intake serve --state-dir … --bind 0.0.0.0 --port 18090` is an HTTP receiver, run as an ordinary
 declared service of the harness (same user as the journal, supervised, health-probed). Token:
-`$AMS_INTAKE_TOKEN`, set with `ams secret set intake AMS_INTAKE_TOKEN`, or `--token-file`.
+`$INTAKE_TOKEN`, set with `ams secret set intake INTAKE_TOKEN`, or `--token-file`.
 
 | Request | Answer |
 |---|---|

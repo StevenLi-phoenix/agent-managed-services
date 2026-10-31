@@ -149,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--bind", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=18090)
     p_serve.add_argument(
-        "--token-file", type=Path, default=None, help="default: $AMS_INTAKE_TOKEN (ams secret)"
+        "--token-file", type=Path, default=None, help="default: $INTAKE_TOKEN (ams secret)"
     )
     p_serve.add_argument("--log-level", default="INFO")
 

@@ -7,7 +7,7 @@ harness, so it shares the journal's owner and is kept alive and probed like any 
 
     argv = ["…/python", "-m", "ams", "intake", "serve", "--state-dir", "…",
             "--bind", "0.0.0.0", "--port", "18090"]
-    secrets = ["AMS_INTAKE_TOKEN"]
+    secrets = ["INTAKE_TOKEN"]
 
 Stdlib only. Bodies are capped at 64 KiB; a key seen in the last hour is a ``duplicate`` (the
 sender's retry or spool replay), and is not written twice.
@@ -35,7 +35,7 @@ log = logging.getLogger("ams.intake")
 MAX_BODY = 64 * 1024
 DEDUPE_S = 3600.0
 DEDUPE_CAP = 4096
-TOKEN_ENV = "AMS_INTAKE_TOKEN"
+TOKEN_ENV = "INTAKE_TOKEN"
 
 
 def _digest(value: str) -> bytes:
