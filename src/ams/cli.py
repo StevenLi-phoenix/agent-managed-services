@@ -153,6 +153,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_serve.add_argument("--log-level", default="INFO")
 
+    # `ams watch ...`: the host-level watcher (ams.ops). Import-light, like `secret`.
+    from ams.ops import cli as ops_cli
+
+    ops_cli.add_subparser(sub)
+
     # `ams secret set|rm|list|check`. Argument wiring and handlers live in
     # ams.secrets so that every line that can touch a value sits in one module.
     from ams.secrets import add_subparser as _add_secret_subparser
@@ -203,6 +208,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_check_host()
     if args.command == "escalations":
         return cmd_escalations(args)
+    if args.command == "watch":
+        from ams.ops import cli as ops_cli
+
+        return ops_cli.cmd_watch(args)
     if args.command == "escalate":
         return cmd_escalate(args)
     if args.command == "intake":

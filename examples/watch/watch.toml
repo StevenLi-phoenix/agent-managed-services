@@ -1,0 +1,55 @@
+# ams watch: install to ~/.config/ams-watch/watch.toml (run as the owner of the launchd jobs).
+# The intake token is a file next to it, mode 0600:
+#   ~/.config/ams-watch/intake-token   the value of the harness's `intake` service secret
+#
+# Incidents are escalated through `ams intake` (see docs/watch.md); the operator that reads the
+# escalation journal decides what the owner hears.
+
+[ops]
+state_dir = "~/.local/state/ams-watch"
+tick_s = 30
+mode = "live"            # "dry-run": observe and escalate, never run an action
+
+[forward]
+url = "http://127.0.0.1:18090/escalate"
+origin = "mini"          # incidents of service X are escalated as origin "mini.X"
+
+[actions]
+cooldown_s = 1800            # the same action on the same service: not twice within 30 min
+max_per_target_per_day = 3
+max_per_hour = 4             # across all services
+
+[actions.advertise_tailscale]
+services = ["svc:example"]
+
+[kaorou]
+api = "http://127.0.0.1:8096"
+env_script = "~/Codes/kaorou/service/kaorou-env.sh"
+
+[[service]]
+id = "kaorou-daemon"
+description = "Pipeline worker. Never kickstart: a hard kill loses the in-flight ffmpeg burn."
+launchd = "gui/501/app.example.kaorou.daemon"
+expect = "running"
+logs = ["~/.local/state/kaorou/logs/daemon.err.log"]
+actions = ["soft_restart_kaorou"]
+
+[[service]]
+id = "asr"
+description = "Speech recognition service"
+launchd = "gui/501/com.example.asr"
+expect = "running"
+health_url = "http://127.0.0.1:8099/health"
+logs = ["~/services/asr/logs/stderr.log"]
+actions = ["kickstart"]
+
+[[service]]
+id = "ams"
+description = "The AMS harness itself (system domain): observe only, nothing else notices it stopped"
+launchd = "system/app.example.ams"
+expect = "running"
+
+[[service]]
+id = "tailscale"
+description = "Tailscale Services this host must advertise (a reboot or update drops them)"
+actions = ["advertise_tailscale"]

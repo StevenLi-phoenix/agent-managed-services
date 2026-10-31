@@ -41,3 +41,6 @@ extend-exclude = ["docs/design/history"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/ops/*" = ["E501", "E702", "B011", "B017"]  # tests ported from mini-ops, long CJK/JSON fixtures
