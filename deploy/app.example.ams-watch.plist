@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- ams watch: the host watcher (docs/watch.md). LaunchAgent in the owner's GUI domain, because it
+     reads that user's launchd jobs and logs. Replace USER and the clone path, then
+       cp to ~/Library/LaunchAgents/app.example.ams-watch.plist
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.example.ams-watch.plist
+     Stop:  launchctl bootout gui/$(id -u)/app.example.ams-watch   (nothing depends on it) -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.example.ams-watch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/USER/Codes/agent-managed-services/.venv/bin/ams</string>
+        <string>watch</string>
+        <string>run</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/USER/.local/state/ams-watch/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/USER/.local/state/ams-watch/logs/launchd.err.log</string>
+</dict>
+</plist>
