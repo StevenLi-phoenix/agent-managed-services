@@ -276,7 +276,14 @@ def cmd_intake(args: argparse.Namespace) -> int:
     from ams.escalations import EscalationJournal, journal_path
     from ams.intake import read_token, serve
 
-    _configure_logging(args.log_level)
+    # Level-prefix lines (`INFO ams.intake: ...`): the supervisor classifies a service's lines by
+    # the stated level, so an accepted push whose title says "error" is not escalated as one.
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
     try:
         token = read_token(args.token_file)
     except OSError as e:
