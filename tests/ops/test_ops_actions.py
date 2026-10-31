@@ -33,13 +33,13 @@ def make(tmp_path, **over):
             },
             {
                 "id": "kaorou-daemon",
-                "launchd": "gui/501/app.lishuyu.kaorou.daemon",
+                "launchd": "gui/501/app.example.kaorou.daemon",
                 "expect": "running",
                 "actions": ["kickstart", "soft_restart_kaorou"],
             },
             {
                 "id": "dsh",
-                "launchd": "system/app.lishuyu.dsh-events",
+                "launchd": "system/app.example.dsh-events",
                 "expect": "running",
                 "actions": ["advertise_tailscale", "clean_tmp"],
             },

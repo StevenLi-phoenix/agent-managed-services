@@ -7,7 +7,7 @@ from ams.ops.config import parse
 from ams.ops.observe import health, launchd, logs
 from ams.ops.runner import CmdResult
 
-PRINT = """gui/501/app.lishuyu.chrome-cookie-proxy = {
+PRINT = """gui/501/app.example.chrome-cookie-proxy = {
 \tactive count = 1
 \tstate = running
 

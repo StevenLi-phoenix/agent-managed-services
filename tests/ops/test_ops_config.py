@@ -16,7 +16,7 @@ GOOD = {
             "health_url": "http://127.0.0.1:8099/health",
             "actions": ["kickstart"],
         },
-        {"id": "dsh", "launchd": "system/app.lishuyu.dsh-events", "expect": "running"},
+        {"id": "dsh", "launchd": "system/app.example.dsh-events", "expect": "running"},
     ],
 }
 

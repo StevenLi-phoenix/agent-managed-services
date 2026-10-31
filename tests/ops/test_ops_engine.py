@@ -150,7 +150,7 @@ def test_frozen_without_mute_still_escalates_but_never_acts(tmp_path):
 def test_kaorou_burn_blocks_the_soft_restart_and_the_daemon_is_never_kickstarted(
     tmp_path, monkeypatch
 ):
-    label = "gui/501/app.lishuyu.kaorou.daemon"
+    label = "gui/501/app.example.kaorou.daemon"
     svcs = [
         {
             "id": "kaorou-daemon",
@@ -176,7 +176,7 @@ def test_kaorou_burn_blocks_the_soft_restart_and_the_daemon_is_never_kickstarted
 
 
 def test_kaorou_idle_gets_the_soft_restart_not_a_kickstart(tmp_path, monkeypatch):
-    label = "gui/501/app.lishuyu.kaorou.daemon"
+    label = "gui/501/app.example.kaorou.daemon"
     svcs = [
         {
             "id": "kaorou-daemon",
