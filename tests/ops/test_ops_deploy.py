@@ -375,3 +375,16 @@ def test_deploy_defaults_and_expansion():
         3600,
     )
     assert d.env == (("A_B", "1"),) and d.command == ("scripts/install.sh",)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin's background band")
+def test_the_command_runs_outside_the_background_band(tmp_path, monkeypatch):
+    """ams watch is a Background LaunchAgent; a build it starts must not inherit the throttling."""
+    monkeypatch.setenv("PYTHONPATH", str(SRC))
+    probe = "import os; print('prio', os.getpriority(os.PRIO_DARWIN_PROCESS, 0))"
+    out = subprocess.run(
+        ["/usr/sbin/taskpolicy", "-b", sys.executable, "-m", "ams.ops.deploy",
+         "--rc-file", str(tmp_path / "x.rc"), "--", sys.executable, "-c", probe],
+        capture_output=True, text=True, check=True,
+    ).stdout  # fmt: skip
+    assert "left the background band" in out and "prio 0" in out

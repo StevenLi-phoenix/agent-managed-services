@@ -382,6 +382,22 @@ class Deployer:
         return out
 
 
+def _leave_background_band() -> None:
+    """A LaunchAgent with ``ProcessType = Background`` (as ``ams watch`` is) runs in Darwin's
+    background band, and its children inherit it: a build would get throttled CPU and I/O.
+    Leave the band for this process, so the command and everything it starts run at normal
+    priority (what ``taskpolicy -B`` does)."""
+    prio = getattr(os, "PRIO_DARWIN_PROCESS", None)
+    if prio is None:
+        return
+    try:
+        if os.getpriority(prio, 0):
+            os.setpriority(prio, 0, 0)
+            print("ams deploy: left the background band", flush=True)
+    except OSError as e:
+        print(f"ams deploy: still in the background band ({e})", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     """The wrapper: run the command, then write its exit code (atomically) to ``--rc-file``."""
     p = argparse.ArgumentParser(prog="python -m ams.ops.deploy")
@@ -391,6 +407,7 @@ def main(argv: list[str] | None = None) -> int:
     cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not cmd:
         p.error("no command")
+    _leave_background_band()
     try:
         rc = subprocess.run(cmd, stdin=subprocess.DEVNULL, check=False).returncode  # noqa: S603
     except OSError as e:

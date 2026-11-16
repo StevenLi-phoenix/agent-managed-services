@@ -138,7 +138,9 @@ count), then the command starts in a session of its own with `AMS_DEPLOY_SHA` se
 The command runs as the owner of `ams watch`, inside its GUI session when `ams watch` is a
 LaunchAgent, so a code-signing build reaches the login keychain (a process started over SSH gets
 `errSecInternalComponent`). The wrapper `python -m ams.ops.deploy --rc-file F -- argv...` writes the
-exit code to `F`, so a restart of `ams watch` neither kills a run nor loses its result. `freeze add
+exit code to `F`, so a restart of `ams watch` neither kills a run nor loses its result. It also
+leaves Darwin's background band first: the children of a `ProcessType = Background` LaunchAgent
+inherit it, and a build there gets throttled CPU and I/O. `freeze add
 <id> 2h "…"` stops new runs; `dry-run` mode fetches and reports but never merges or runs.
 `ams watch status` shows the last deployed, failed and running commit of each entry; `ams watch
 check` shows whether the repository and the key are there.

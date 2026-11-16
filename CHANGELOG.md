@@ -14,7 +14,8 @@
   升级一条结果：`deployed`（info）或 `deploy failed`（error，带日志末尾 15 行），失败的提交不重试，下一个
   push 再部署。工作副本在别的分支、有未提交改动或有远端没有的提交时不动它，每个提交和原因只升级一次。
   `ssh_key` 给拉取用只读 deploy key，`url` 换拉取地址；`freeze` 和 `dry-run` 同样适用；退出码由
-  `python -m ams.ops.deploy` 包装写进文件，`ams watch` 重启后照样读得到。`ams watch status|check`
+  `python -m ams.ops.deploy` 包装写进文件，`ams watch` 重启后照样读得到。包装进程先离开 Darwin 的 background band
+  （`ProcessType = Background` 的 LaunchAgent 的子进程会继承它，构建会被限速）。`ams watch status|check`
   列出部署项。`docs/watch.md`、`docs/design/DECISIONS.md` D39。
 
 ## [2.1.0] - 2026-10-31
