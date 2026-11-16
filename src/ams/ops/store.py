@@ -23,7 +23,6 @@ def _default() -> dict[str, Any]:
         "actions": [],  # [{ts,action,target,outcome}]
         "outbox": [],  # escalations waiting for the intake (durable, retried)
         "tailscale": {"last_report": 0},
-        "deploy": {},  # deploy id -> follower state (ams.ops.deploy)
     }
 
 

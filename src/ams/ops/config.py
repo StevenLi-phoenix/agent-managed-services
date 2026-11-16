@@ -98,23 +98,6 @@ class ServiceConfig:
 
 
 @dataclass(frozen=True)
-class DeployConfig:
-    """One ``[[deploy]]``: keep ``repo`` on ``branch`` and run ``command`` once per new commit."""
-
-    id: str
-    repo: Path
-    command: tuple[str, ...]
-    branch: str = "main"
-    remote: str = "origin"  # what is deployed is refs/remotes/<remote>/<branch> after the fetch
-    url: str | None = None  # fetch from this URL instead of the remote's own
-    ssh_key: Path | None = None  # a read-only deploy key, used by the fetch only
-    env: tuple[tuple[str, str], ...] = ()  # added to the command's environment
-    every_s: float = 300
-    timeout_s: float = 3600
-    description: str = ""
-
-
-@dataclass(frozen=True)
 class Config:
     state_dir: Path
     config_dir: Path
@@ -127,7 +110,6 @@ class Config:
     clean_tmp: CleanTmpConfig
     tailscale: TailscaleConfig
     services: tuple[ServiceConfig, ...] = field(default_factory=tuple)
-    deploys: tuple[DeployConfig, ...] = field(default_factory=tuple)
 
     def service(self, sid: str) -> ServiceConfig | None:
         return next((s for s in self.services if s.id == sid), None)
@@ -226,61 +208,8 @@ def _service(raw: dict[str, Any]) -> ServiceConfig:
     )
 
 
-_REF_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]{0,99}$")  # never starts with "-": argv to git
-_ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
-MIN_DEPLOY_EVERY_S = 60
-
-
-def _deploy(raw: Any) -> DeployConfig:
-    if not isinstance(raw, dict):
-        raise ConfigError("deploy: each entry is a [[deploy]] table")
-    did = raw.get("id")
-    if not isinstance(did, str) or not _ID_RE.match(did):
-        raise ConfigError(f"deploy.id: {did!r} must match {_ID_RE.pattern}")
-    where = f"deploy[{did}]"
-    _only(raw, set(DeployConfig.__dataclass_fields__), where)
-    repo = raw.get("repo")
-    if not isinstance(repo, str) or not _expand(repo).is_absolute():
-        raise ConfigError(f"{where}.repo: an absolute path (or ~/...) is required")
-    cmd = raw.get("command")
-    if not isinstance(cmd, list) or not cmd or not all(isinstance(c, str) and c for c in cmd):
-        raise ConfigError(f"{where}.command: a non-empty list of strings (argv, no shell)")
-    for key in ("branch", "remote"):
-        val = raw.get(key, DeployConfig.__dataclass_fields__[key].default)
-        if not isinstance(val, str) or not _REF_RE.match(val) or ".." in val:
-            raise ConfigError(f"{where}.{key}: {val!r} is not a plain git ref name")
-    url = raw.get("url")
-    if url is not None and (not isinstance(url, str) or not url or url.startswith("-")):
-        raise ConfigError(f"{where}.url: {url!r} must be a git URL")
-    env = raw.get("env", {})
-    if not isinstance(env, dict) or not all(
-        isinstance(k, str) and _ENV_RE.match(k) and isinstance(v, str) for k, v in env.items()
-    ):
-        raise ConfigError(f"{where}.env: a table of UPPER_CASE names to strings")
-    every = float(raw.get("every_s", 300))
-    timeout = float(raw.get("timeout_s", 3600))
-    if every < MIN_DEPLOY_EVERY_S:
-        raise ConfigError(f"{where}.every_s must be >= {MIN_DEPLOY_EVERY_S}")
-    if timeout < 60:
-        raise ConfigError(f"{where}.timeout_s must be >= 60")
-    key = raw.get("ssh_key")
-    return DeployConfig(
-        id=did,
-        repo=_expand(repo),
-        command=tuple(cmd),
-        branch=raw.get("branch", "main"),
-        remote=raw.get("remote", "origin"),
-        url=url,
-        ssh_key=_expand(key) if key else None,
-        env=tuple(sorted(env.items())),
-        every_s=every,
-        timeout_s=timeout,
-        description=raw.get("description", ""),
-    )
-
-
 def parse(raw: dict[str, Any], *, config_dir: Path | None = None) -> Config:
-    top = {"ops", "forward", "gate", "actions", "kaorou", "service", "deploy"}
+    top = {"ops", "forward", "gate", "actions", "kaorou", "service"}
     _only(raw, top, "config")
     ops = _section(raw, "ops")
     _only(ops, {"state_dir", "tick_s", "mode"}, "ops")
@@ -329,16 +258,10 @@ def parse(raw: dict[str, Any], *, config_dir: Path | None = None) -> Config:
             services=tuple(ts.get("services", ())),
         ),
         services=tuple(_service(s) for s in raw.get("service", ())),
-        deploys=tuple(_deploy(d) for d in raw.get("deploy", ())),
     )
     ids = [s.id for s in cfg.services]
     if len(set(ids)) != len(ids):
         raise ConfigError("service.id: duplicate ids")
-    dids = [d.id for d in cfg.deploys]
-    if len(set(dids)) != len(dids):
-        raise ConfigError("deploy.id: duplicate ids")
-    if set(ids) & set(dids):  # one namespace: escalation origins and freezes are keyed by id
-        raise ConfigError(f"deploy.id: {sorted(set(ids) & set(dids))} also a service id")
     for s in cfg.services:
         if "advertise_tailscale" in s.actions and not cfg.tailscale.services:
             raise ConfigError(

@@ -94,9 +94,8 @@ uid 映射的进程里的模型，就是给任意一个被投毒的依赖开了 
 
 `ams escalate`（本机程序）和 `ams intake`（HTTP，给其他主机和其他用户）把"某处出了问题"写进
 同一个 escalation 日志；`ams watch` 是主机级 watcher（launchd 任务、探针、日志、Tailscale
-Services，规则选择的有限修复，每个事件带着"做了什么"升级），还能跟随一个分支：推到 `main`
-的新提交由它快进工作副本、跑仓库自己的部署命令，每个提交升级一条结果（`[[deploy]]`）。操作者只看
-一个日志、用一套门禁。说明：`docs/watch.md`。
+Services，规则选择的有限修复，每个事件带着"做了什么"升级）。操作者只看一个日志、用一套
+门禁。说明：`docs/watch.md`。
 
 ## 事件循环与慢操作
 

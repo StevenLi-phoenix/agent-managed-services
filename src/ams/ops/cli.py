@@ -131,9 +131,8 @@ def _run(cfg, args) -> int:  # noqa: ANN001
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.__setitem__("now", True))
     log.info(
-        "ams watch started: %d services, %d deploys, tick %.0fs, mode=%s",
+        "ams watch started: %d services, tick %.0fs, mode=%s",
         len(cfg.services),
-        len(cfg.deploys),
         cfg.tick_s,
         cfg.mode,
     )
@@ -182,15 +181,6 @@ def _status(cfg, args) -> int:  # noqa: ANN001
         if hl is not None:
             bits.append(f"health={'ok' if hl['ok'] else hl['detail']}")
         print(f"  {sid:<18} {'  '.join(bits)}")
-    for did, dep in st.get("deploy", {}).items():
-        bits = [f"deployed={(dep.get('deployed') or '-')[:8]}"]
-        if dep.get("running"):
-            bits.append(f"running={dep['running'][:8]}")
-        if dep.get("failed"):
-            bits.append(f"failed={dep['failed'][:8]}")
-        if dep.get("blocked"):
-            bits.append(f"blocked={dep['blocked'][:8]}|{dep['blocked'].split('|', 1)[-1]}")
-        print(f"  deploy {did:<11} {'  '.join(bits)}")
     for fz in freeze_mod.load(cfg.config_dir / "freeze.json").values():
         left = int(fz.until - time.time())
         print(
@@ -262,21 +252,11 @@ def _test(cfg, args) -> int:  # noqa: ANN001
 
 
 def _check(cfg, args) -> int:  # noqa: ANN001
-    print(
-        f"ok: {len(cfg.services)} services, {len(cfg.deploys)} deploys, mode={cfg.mode}, "
-        f"state={cfg.state_dir}"
-    )
+    print(f"ok: {len(cfg.services)} services, mode={cfg.mode}, state={cfg.state_dir}")
     for s in cfg.services:
         print(
             f"  {s.id:<18} {s.launchd or '-':<48} expect={s.expect:<9} "
             f"actions={','.join(s.actions) or '-'}"
-        )
-    for d in cfg.deploys:
-        repo = "ok" if (d.repo / ".git").exists() else "NOT A GIT CHECKOUT"
-        key = "" if d.ssh_key is None else f" key={'present' if d.ssh_key.is_file() else 'MISSING'}"
-        print(
-            f"  deploy {d.id:<11} {d.repo} ({repo}) {d.remote}/{d.branch} "
-            f"every {d.every_s:.0f}s{key}: {' '.join(d.command)}"
         )
     tf = cfg.forward.token_file
     print(f"  intake token: {'present' if tf.is_file() else 'MISSING'} ({tf})")

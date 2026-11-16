@@ -2295,27 +2295,3 @@ still runs installs as inner root under the mask. Still open.)*
   without the ACL); an SSH forced command per sender (a key and a user per host, and `tag:server`
   hosts reach only port 22 -- an HTTP port needs one ACL line instead).
 
-### D39. A push is the end of the work: `ams watch` follows a branch and deploys it (2026-11-16)
-
-- Problem: an agent that changed an app the owner runs (a signed menu-bar app, built and run as the
-  owner) pushed a branch and handed the owner build-and-install commands, because the harness
-  user cannot sign and cannot write the owner's home. Several agents keep their own copies of the
-  same repository, so work that stops on a branch or waits for a hand-run deploy is stale for
-  everyone else.
-- Decision: `[[deploy]]` in `watch.toml`. `ams watch` already runs as the owner inside the owner's
-  GUI session (a LaunchAgent, so a code-signing build reaches the login keychain), already
-  escalates through the intake, and already has freeze and dry-run. It fetches the branch, fast-
-  forwards a clean working copy, runs the repository's own deploy command in a process of its own
-  (in its own session, so a restart of `ams watch` neither kills nor loses it: a wrapper writes the
-  exit code to a file), and escalates one result per commit. A failed commit is never retried
-  under unchanged conditions (the core release rule); the next push is.
-- Why this is not an action of the `Executor`: the closed list is what a rule may do *to a running
-  service* when something is wrong, and its guards (cooldown, daily caps) are about not repeating
-  a cure. A deploy is the owner's intent written down as a commit on a branch; its guards are
-  different -- one run per commit, never touch a working copy that is not a clean fast-forward,
-  never reset or stash. Code still never comes from a model or a log line: only from the branch.
-- Rejected: a CI runner on the mini (a second resident service with its own registration secret,
-  and its jobs do not run in the owner's GUI session); a webhook (the mini is not reachable from
-  GitHub, and polling every 5 minutes costs one `git fetch`); building as the harness user (no
-  signing identity, and the app's data lives in the owner's App Group container).
-
