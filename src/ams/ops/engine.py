@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import logging
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from typing import Any
 from ams.escalations import EscalationJournal
 from ams.events import Severity
 from ams.ops import actions as actions_mod
+from ams.ops import deploy as deploy_mod
 from ams.ops import freeze as freeze_mod
 from ams.ops import policy
 from ams.ops.actions import ActionRequest, ActionResult, Executor
@@ -51,6 +53,8 @@ class Env:
     socket_probe: Callable[[Path], health.Probe] = health.unix_socket
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.time
+    spawn: deploy_mod.Spawn = deploy_mod.spawn
+    kill: Callable[[int, int], None] = os.killpg
 
 
 @dataclass
@@ -59,6 +63,7 @@ class TickReport:
     muted: int = 0
     escalated: int = 0
     actions: list[ActionResult] = field(default_factory=list)
+    deploys: list[deploy_mod.Event] = field(default_factory=list)
 
 
 class Engine:
@@ -78,6 +83,14 @@ class Engine:
         self.jobs = JobGate(d["jobs"], cfg.gate)
         self.health = HealthGate(d["health"], cfg.gate)
         self.executor = Executor(cfg, d["actions"], runner=self.env.runner, sleep=self.env.sleep)
+        self.deployer = deploy_mod.Deployer(
+            cfg,
+            d.setdefault("deploy", {}),
+            runner=self.env.runner,
+            spawn=self.env.spawn,
+            sleep=self.env.sleep,
+            kill=self.env.kill,
+        )
         self._ticks = 0
         self._ts_last = 0.0
 
@@ -211,6 +224,28 @@ class Engine:
         if self.forwarder.enqueue(key, render(self.cfg.forward.origin, inc, result)):
             report.escalated += 1
 
+    def report_deploy(self, ev: deploy_mod.Event) -> None:
+        """A deploy result: journal it and escalate it (origin ``<origin>.<deploy id>``)."""
+        if self.journal is not None:
+            self.journal.append(
+                {
+                    "decision": ev.decision,
+                    "service": ev.deploy,
+                    "kind": "deploy",
+                    "sha": ev.sha,
+                    "headline": ev.title,
+                }
+            )
+        self.forwarder.enqueue(
+            ev.key,
+            {
+                "origin": f"{self.cfg.forward.origin}.{ev.deploy}",
+                "severity": ev.severity,
+                "title": clip(ev.title, 280),
+                "text": clip(ev.text, 7900),
+            },
+        )
+
     # ---- the loop body ------------------------------------------------------------------
     def tick(self) -> TickReport:
         now = self.env.clock()
@@ -225,6 +260,9 @@ class Engine:
         for inc in incidents:
             report.incidents += 1
             self.handle(inc, freezes, now, report)
+        for ev in self.deployer.tick(now, freezes):
+            report.deploys.append(ev)
+            self.report_deploy(ev)
         self.forwarder.flush()
         self._ticks += 1
         if self._ticks % 120 == 0:
@@ -234,6 +272,7 @@ class Engine:
             "services": status,
             "outbox": len(data["outbox"]),
             "freeze": sorted(freezes),
+            "deploy": self.deployer.status(),
         }
         self.store.save()
         return report

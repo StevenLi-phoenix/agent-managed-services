@@ -101,6 +101,48 @@ Per tick, for each `[[service]]` of `watch.toml` (`examples/watch/watch.toml`):
    origin `<origin>.<service>`, title = the stable cause, text = headline, up to three evidence
    lines (redacted), the action line, and "已自动处理，无需操作" or "需要人看一眼".
 
+### Following a branch: `[[deploy]]`
+
+Work on a repository ends with a push to its branch; the deploy is not a step anyone runs by hand.
+A `[[deploy]]` entry names a working copy, its branch and the repository's own deploy command:
+
+```toml
+[[deploy]]
+id = "menubar-app"
+repo = "~/Codes/menubar-app"             # a working copy on `branch`
+command = ["/bin/bash", "scripts/install.sh"]   # argv, run in `repo`; no shell
+branch = "main"                          # default
+remote = "origin"                        # deployed = refs/remotes/<remote>/<branch> after the fetch
+url = "git@github.com:owner/menubar-app.git"     # optional: fetch from here instead
+ssh_key = "~/.config/ams-watch/keys/menubar-app"  # optional: a read-only deploy key for the fetch
+every_s = 300                            # default; at least 60
+timeout_s = 3600                         # default; the run is killed after this
+env = { INSTALL_DIR = "/Applications" }  # optional, added to the command's environment
+```
+
+Every `every_s`, when no run is going: check that the working copy is on `branch`, fetch
+(`+refs/heads/<branch>:refs/remotes/<remote>/<branch>`), and compare that commit with the last one
+deployed and the last one that failed. A new commit is fast-forwarded into the working copy (only
+when the tracked files are clean and `HEAD` is an ancestor; untracked files such as `build/` do not
+count), then the command starts in a session of its own with `AMS_DEPLOY_SHA` set, its output in
+`<state_dir>/deploy/<id>.log`. Later ticks look at it; the tick is never blocked by the build.
+
+| What happened | Escalated (origin `<origin>.<id>`) | Then |
+|---|---|---|
+| the command exited 0 | `<id> deployed`, info, with the commit subject and the time it took | wait for the next commit |
+| it exited non-zero, or ran past `timeout_s` (process group killed) | `<id> deploy failed`, error, with the last 15 log lines | that commit is not tried again; the next push is |
+| it ended without an exit code (a reboot) | nothing, up to 3 times | retried; the third time is a failure |
+| another branch checked out, tracked files changed, local commits the remote lacks, the merge failed | `<id> deploy blocked <cause>`, warn, once per commit and cause | nothing is reset, stashed or checked out |
+| the fetch failed 6 times in a row | `<id> fetch failing`, warn, once | keeps trying |
+
+The command runs as the owner of `ams watch`, inside its GUI session when `ams watch` is a
+LaunchAgent, so a code-signing build reaches the login keychain (a process started over SSH gets
+`errSecInternalComponent`). The wrapper `python -m ams.ops.deploy --rc-file F -- argv...` writes the
+exit code to `F`, so a restart of `ams watch` neither kills a run nor loses its result. `freeze add
+<id> 2h "…"` stops new runs; `dry-run` mode fetches and reports but never merges or runs.
+`ams watch status` shows the last deployed, failed and running commit of each entry; `ams watch
+check` shows whether the repository and the key are there.
+
 `ams watch run|status|check|freeze|test`; `freeze add <service|*> 30m "reason"` stops actions and
 mutes escalation for planned maintenance (`--keep-alerts` only blocks actions).
 

@@ -53,3 +53,14 @@ expect = "running"
 id = "tailscale"
 description = "Tailscale Services this host must advertise (a reboot or update drops them)"
 actions = ["advertise_tailscale"]
+
+# Follow a branch: each new commit on main is fast-forwarded into the working copy and deployed by
+# the repository's own script; one result per commit is escalated (docs/watch.md).
+[[deploy]]
+id = "menubar-app"
+description = "A signed menu-bar app: built and installed as the owner, in the GUI session"
+repo = "~/Codes/menubar-app"
+command = ["/bin/bash", "scripts/install.sh"]
+url = "git@github.com:example/menubar-app.git"
+ssh_key = "~/.config/ams-watch/keys/menubar-app"   # read-only deploy key, 0600
+
